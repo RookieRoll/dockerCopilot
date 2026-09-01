@@ -12,15 +12,11 @@ jobs:
   build-frontend:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout frontend code
-        uses: actions/checkout@v3
-        with:
-          repository: dongshull/Docker-Copilot-React
-          path: './frontend'
-          ref: 'master'
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
       - name: Setup Node.js
-        uses: actions/setup-node@v3
+        uses: actions/setup-node@v4
         with:
           node-version: '22'
           cache: 'npm'
@@ -29,8 +25,8 @@ jobs:
             frontend/package.json
 
       - name: Build Frontend
+        working-directory: frontend
         run: |
-          cd frontend
           npm ci
           npm run build
 

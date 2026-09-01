@@ -1,24 +1,28 @@
-# 使用 Alpine 作为基础镜像
 FROM alpine
-LABEL authors="onlyLTY"
+
+LABEL authors="onlyLTY" \
+      org.opencontainers.image.title="Docker Copilot" \
+      org.opencontainers.image.ref.name="2807645688/dockercopilot"
+
 WORKDIR /app
 
-ARG TARGETPLATFORM
+# BuildKit provides TARGETARCH for each platform in a multi-platform build.
+ARG TARGETARCH
 
-COPY dc-back/dist/$TARGETPLATFORM/dockerCopilot ./dockerCopilot
-COPY dc-back/etc/. ./etc
-COPY start.sh ./start.sh
+COPY dc-back/dist/linux/${TARGETARCH}/dockerCopilot /app/dockerCopilot
+COPY dc-back/etc/. /app/etc/
+COPY start.sh /app/start.sh
 
 RUN apk add --no-cache tzdata \
-    && chmod +x start.sh \
-    && chmod +x dockerCopilot
+    && chmod +x /app/start.sh /app/dockerCopilot
 
-# 设置环境变量
-ENV secretKey="" \
+ENV WORKDIR="/app" \
+    secretKey="" \
     DOCKER_HOST="unix:///var/run/docker.sock" \
     BACKUP_DIR="/data/backups" \
     TZ="Asia/Shanghai"
 
 VOLUME ["/data"]
-# 设置启动命令
-CMD ["./start.sh"]
+EXPOSE 12712
+
+CMD ["/app/start.sh"]

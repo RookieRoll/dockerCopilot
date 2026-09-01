@@ -1,5 +1,9 @@
 name: docker-build-push-latest-dev
 
+env:
+  DOCKERHUB_USERNAME: "2807645688"
+  DOCKERHUB_IMAGE: "2807645688/dockercopilot"
+
 on:
   workflow_dispatch:
   push:
@@ -10,15 +14,11 @@ jobs:
   build-frontend:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout frontend code
-        uses: actions/checkout@v3
-        with:
-          repository: dongshull/Docker-Copilot-React
-          path: './frontend'
-          ref: 'master'
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
       - name: Setup Node.js
-        uses: actions/setup-node@v3
+        uses: actions/setup-node@v4
         with:
           node-version: '22'
           cache: 'npm'
@@ -27,8 +27,8 @@ jobs:
             frontend/package.json
 
       - name: Build Frontend
+        working-directory: frontend
         run: |
-          cd frontend
           npm ci
           npm run build
 
@@ -114,7 +114,7 @@ jobs:
       - name: Docker Login
         uses: docker/login-action@v3.0.0
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          username: ${{ env.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Build and push Docker images
@@ -124,5 +124,5 @@ jobs:
           file: ./docker/Dockerfile
           platforms: linux/amd64,linux/arm64
           tags: |
-            ${{ secrets.DOCKERHUB_USERNAME }}/dockercopilot:latest-dev
+            ${{ env.DOCKERHUB_IMAGE }}:latest-dev
           push: true

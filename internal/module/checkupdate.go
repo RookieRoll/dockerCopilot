@@ -30,9 +30,13 @@ func NewImageCheck() *ImageUpdateData {
 		Data: map[string]ImageCheckList{},
 	}
 }
+func isDockerCopilotImage(imageName string) bool {
+	return strings.Contains(imageName, "0nlylty/dockercopilot") ||
+		strings.Contains(imageName, "2807645688/dockercopilot")
+}
 func (i *ImageUpdateData) CheckUpdate(imageList []types.Image) {
 	for _, image := range imageList {
-		if strings.Contains(image.ImageName, "0nlylty/dockercopilot") {
+		if isDockerCopilotImage(image.ImageName) {
 			continue
 		}
 		i.checkSingleImage(image)

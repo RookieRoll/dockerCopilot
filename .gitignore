@@ -30,3 +30,7 @@ __pycache__/
 /db.sqlite3
 /front/
 /logs/
+/graphify-out/
+/openspec/
+/frontend/node_modules/
+/frontend/dist/
