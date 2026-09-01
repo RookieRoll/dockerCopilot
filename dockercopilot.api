@@ -82,6 +82,17 @@ type ContainerUpdateReq {
 	ContainerName   string `form:"containerName"`
 }
 
+type ConfiguredPort {
+	Port     int    `json:"port"`
+	Protocol string `json:"protocol"`
+	Label    string `json:"label,optional"`
+}
+
+type ContainerConfiguredPortsReq {
+	Id    string           `path:"id"`
+	Ports []ConfiguredPort `json:"ports"`
+}
+
 type VersionMsgResp {
 	Version   string `json:"version"`
 	BuildDate string `json:"build_date"`
@@ -138,6 +149,9 @@ service dockerCopilot {
 
 	@handler update
 	post /container/:id/update (ContainerUpdateReq) returns (Resp)
+
+	@handler configuredPorts
+	put /container/:id/configured-ports (ContainerConfiguredPortsReq) returns (Resp)
 
 	@handler backup
 	get /container/backup returns (Resp)

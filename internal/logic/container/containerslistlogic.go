@@ -2,10 +2,13 @@ package container
 
 import (
 	"context"
+	"fmt"
 	"sort"
+	"strings"
 	"time"
 
 	dockerTypes "github.com/docker/docker/api/types"
+	"github.com/docker/go-connections/nat"
 	"github.com/onlyLTY/dockerCopilot/internal/utiles"
 
 	"github.com/onlyLTY/dockerCopilot/internal/svc"
@@ -28,15 +31,49 @@ type PortInfo struct {
 }
 
 type Info struct {
-	Id          string     `json:"id"`
-	Status      string     `json:"status"`
-	Name        string     `json:"name"`
-	UsingImage  string     `json:"usingImage"`
-	CreateImage string     `json:"createImage"`
-	CreateTime  string     `json:"createTime"`
-	RunningTime string     `json:"runningTime"`
-	HaveUpdate  bool       `json:"haveUpdate"`
-	Ports       []PortInfo `json:"ports"`
+	Id              string                 `json:"id"`
+	Status          string                 `json:"status"`
+	Name            string                 `json:"name"`
+	UsingImage      string                 `json:"usingImage"`
+	CreateImage     string                 `json:"createImage"`
+	CreateTime      string                 `json:"createTime"`
+	RunningTime     string                 `json:"runningTime"`
+	HaveUpdate      bool                   `json:"haveUpdate"`
+	NetworkMode     string                 `json:"networkMode,omitempty"`
+	Ports           []PortInfo             `json:"ports"`
+	ConfiguredPorts []types.ConfiguredPort `json:"configuredPorts"`
+}
+
+func deduplicateAndSortPorts(ports []PortInfo) []PortInfo {
+	// Docker may return the same logical mapping once per bound host address
+	// (for example, both IPv4 and IPv6). HostIP is not part of the display
+	// mapping, so collapse those entries to avoid showing duplicate ports.
+	unique := make(map[string]PortInfo, len(ports))
+	for _, port := range ports {
+		port.Protocol = strings.ToLower(strings.TrimSpace(port.Protocol))
+		if port.Protocol == "" {
+			port.Protocol = "unknown"
+		}
+		key := fmt.Sprintf("%d:%d/%s", port.HostPort, port.ContainerPort, port.Protocol)
+		if _, exists := unique[key]; !exists {
+			unique[key] = port
+		}
+	}
+
+	mapped := make([]PortInfo, 0, len(unique))
+	for _, port := range unique {
+		mapped = append(mapped, port)
+	}
+	sort.SliceStable(mapped, func(i, j int) bool {
+		if mapped[i].HostPort != mapped[j].HostPort {
+			return mapped[i].HostPort < mapped[j].HostPort
+		}
+		if mapped[i].ContainerPort != mapped[j].ContainerPort {
+			return mapped[i].ContainerPort < mapped[j].ContainerPort
+		}
+		return mapped[i].Protocol < mapped[j].Protocol
+	})
+	return mapped
 }
 
 func mapContainerPorts(ports []dockerTypes.Port) []PortInfo {
@@ -49,21 +86,22 @@ func mapContainerPorts(ports []dockerTypes.Port) []PortInfo {
 			Protocol:      port.Type,
 		})
 	}
+	return deduplicateAndSortPorts(mapped)
+}
 
-	sort.SliceStable(mapped, func(i, j int) bool {
-		if mapped[i].HostPort != mapped[j].HostPort {
-			return mapped[i].HostPort < mapped[j].HostPort
+func mapHostNetworkPorts(exposedPorts nat.PortSet) []PortInfo {
+	mapped := make([]PortInfo, 0, len(exposedPorts))
+	for port := range exposedPorts {
+		containerPort := port.Int()
+		if containerPort <= 0 || containerPort > 65535 {
+			continue
 		}
-		if mapped[i].ContainerPort != mapped[j].ContainerPort {
-			return mapped[i].ContainerPort < mapped[j].ContainerPort
-		}
-		if mapped[i].Protocol != mapped[j].Protocol {
-			return mapped[i].Protocol < mapped[j].Protocol
-		}
-		return mapped[i].HostIP < mapped[j].HostIP
-	})
-
-	return mapped
+		mapped = append(mapped, PortInfo{
+			ContainerPort: uint16(containerPort),
+			Protocol:      port.Proto(),
+		})
+	}
+	return deduplicateAndSortPorts(mapped)
 }
 
 func NewContainersListLogic(ctx context.Context, svcCtx *svc.ServiceContext) *ContainersListLogic {
@@ -85,10 +123,26 @@ func (l *ContainersListLogic) ContainersList() (resp *types.Resp, err error) {
 		return resp, err
 	}
 	resp.Msg = "success"
+	activeContainerNames := make([]string, 0, len(list))
+	for _, container := range list {
+		if len(container.Names) > 0 {
+			activeContainerNames = append(activeContainerNames, strings.TrimPrefix(container.Names[0], "/"))
+		}
+	}
+	if removed, cleanupErr := utiles.CleanupContainerPortOverrides(activeContainerNames); cleanupErr != nil {
+		l.Errorf("cleanup configured container ports: %v", cleanupErr)
+	} else if removed > 0 {
+		l.Infof("removed %d stale configured container port entries", removed)
+	}
+	configuredPortOverrides, overridesErr := utiles.LoadContainerPortOverrides()
+	if overridesErr != nil {
+		l.Errorf("load configured container ports: %v", overridesErr)
+		configuredPortOverrides = map[string][]types.ConfiguredPort{}
+	}
 	var containerInfoList []Info
 	list = utiles.CheckImageUpdate(l.svcCtx, list)
 	for _, v := range list {
-		var containerInfo Info
+		containerInfo := Info{ConfiguredPorts: make([]types.ConfiguredPort, 0)}
 		containerInfo.Id = v.ID
 		containerInfo.Status = v.State
 		if len(v.Names) > 0 {
@@ -108,13 +162,31 @@ func (l *ContainersListLogic) ContainersList() (resp *types.Resp, err error) {
 		if err != nil {
 			containerInfo.CreateImage = ""
 			l.Error("get image name error" + v.ID)
+		} else {
+			if containerInspect.Config != nil {
+				containerInfo.CreateImage = containerInspect.Config.Image
+			}
+			if containerInspect.HostConfig != nil {
+				containerInfo.NetworkMode = string(containerInspect.HostConfig.NetworkMode)
+			}
 		}
-		containerInfo.CreateImage = containerInspect.Config.Image
 		t := time.Unix(v.Created, 0)
 		containerInfo.CreateTime = t.Format("2006-01-02 15:04:05")
 		containerInfo.RunningTime = v.Status
 		containerInfo.HaveUpdate = v.Update
 		containerInfo.Ports = mapContainerPorts(v.Ports)
+		if containerInfo.NetworkMode == "host" {
+			containerInfo.ConfiguredPorts = configuredPortOverrides[containerInfo.Name]
+			if containerInfo.ConfiguredPorts == nil {
+				containerInfo.ConfiguredPorts = make([]types.ConfiguredPort, 0)
+			}
+		}
+		if containerInfo.NetworkMode == "host" && len(containerInfo.Ports) == 0 && containerInspect.Config != nil {
+			// Host networking has no Docker port-publishing records. The only
+			// port metadata available from inspect is the image's exposed-port
+			// declaration; it is not a guarantee that a process is listening.
+			containerInfo.Ports = mapHostNetworkPorts(containerInspect.Config.ExposedPorts)
+		}
 		containerInfoList = append(containerInfoList, containerInfo)
 	}
 	resp.Data = containerInfoList

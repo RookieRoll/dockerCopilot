@@ -18,6 +18,17 @@ type ContainerUpdateReq struct {
 	ContainerName   string `form:"containerName"`
 }
 
+type ConfiguredPort struct {
+	Port     int    `json:"port"`
+	Protocol string `json:"protocol"`
+	Label    string `json:"label,omitempty"`
+}
+
+type ContainerConfiguredPortsReq struct {
+	Id    string           `path:"id"`
+	Ports []ConfiguredPort `json:"ports"`
+}
+
 type CreateContainerReq struct {
 	OldName         string `json:"old_name"`
 	NewName         string `json:"new_name"`

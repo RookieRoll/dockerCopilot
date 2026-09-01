@@ -10,14 +10,20 @@ import {
   Package,
   X,
   Info,
-  ExternalLink
+  ExternalLink,
+  ArrowRight,
+  Network,
+  Settings2,
+  Plus,
+  Trash2,
+  Save
 } from 'lucide-react'
 import { containerAPI, progressAPI, imageAPI } from '../api/client.js'
 import { cn } from '../utils/cn.js'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { getImageLogo } from '../config/imageLogos.js'
 import icons8Img from '../assets/icons8.png'
-import { formatContainerPort, getContainerPortTitle, getContainerPortUrl, normalizeContainerPorts, stopContainerPortEvent } from '../utils/containerPorts.js'
+import { formatContainerPort, getConfiguredPortUrl, getContainerPortTitle, getContainerPortUrl, isHostNetworkMode, normalizeConfiguredPorts, normalizeContainerPorts, stopContainerPortEvent } from '../utils/containerPorts.js'
 
 // 格式化运行时间为中文
 function formatRunningTime(runningTime) {
@@ -67,70 +73,179 @@ function formatRunningTime(runningTime) {
   return result.trim()
 }
 
-function ContainerPorts({ ports }) {
-  const normalizedPorts = normalizeContainerPorts(ports)
+const PORT_LABEL = '\u7aef\u53e3'
+const NETWORK_PORT_LABEL = '\u7f51\u7edc\u4e0e\u7aef\u53e3'
+const PORT_DIRECTION_LABEL = '\u5bbf\u4e3b\u7aef\u53e3 \u2192 \u5bb9\u5668\u7aef\u53e3'
+const CONFIGURE_PORTS_LABEL = '\u914d\u7f6e\u7aef\u53e3'
+const EDIT_PORTS_LABEL = '\u7f16\u8f91\u7aef\u53e3'
+const NO_PORTS_LABEL = '\u672a\u53d1\u73b0\u5df2\u53d1\u5e03\u6216\u58f0\u660e\u7684\u7aef\u53e3'
+const NO_CONFIGURED_PORTS_LABEL = '\u6682\u672a\u914d\u7f6e\u8bbf\u95ee\u7aef\u53e3'
+const DECLARED_PORTS_LABEL = '\u955c\u50cf\u58f0\u660e'
+const CONTAINER_LABEL = '\u5bb9\u5668'
+const MAX_VISIBLE_PORTS = 4
 
-  if (normalizedPorts.length === 0) {
-    return null
+function PortMappingTile({ port }) {
+  const targetUrl = getContainerPortUrl(port)
+  const label = formatContainerPort(port)
+  const title = getContainerPortTitle(port)
+  const hostPort = Number(port?.hostPort) > 0 ? String(port.hostPort) : null
+  const containerPort = `${port?.containerPort || 0}/${port?.protocol || 'unknown'}`
+  const content = (
+    <>
+      {hostPort ? (
+        <>
+          <span className="rounded bg-white/70 px-1.5 py-0.5 font-semibold dark:bg-gray-900/40">{hostPort}</span>
+          <ArrowRight className="h-3 w-3 flex-shrink-0 opacity-60" aria-hidden="true" />
+          <span className="truncate">{containerPort}</span>
+        </>
+      ) : (
+        <span className="truncate">{CONTAINER_LABEL} {containerPort}</span>
+      )}
+      {targetUrl && <ExternalLink className="ml-auto h-3 w-3 flex-shrink-0" aria-hidden="true" />}
+    </>
+  )
+
+  if (!targetUrl) {
+    return (
+      <span
+        title={title}
+        onClick={stopContainerPortEvent}
+        className="inline-flex min-w-0 items-center gap-1.5 rounded-md border border-gray-200 bg-gray-50 px-2 py-1.5 text-xs text-gray-500 dark:border-gray-700 dark:bg-gray-800/60 dark:text-gray-400"
+      >
+        {content}
+      </span>
+    )
   }
 
+  return (
+    <a
+      href={targetUrl}
+      target="_blank"
+      rel="noopener noreferrer"
+      title={title}
+      aria-label={`${label}\uff0c\u6253\u5f00\u670d\u52a1`}
+      onClick={stopContainerPortEvent}
+      onKeyDown={stopContainerPortEvent}
+      className="inline-flex min-w-0 items-center gap-1.5 rounded-md border border-primary-200 bg-primary-50 px-2 py-1.5 text-xs font-medium text-primary-700 transition-colors hover:border-primary-300 hover:bg-primary-100 dark:border-primary-800 dark:bg-primary-900/30 dark:text-primary-300 dark:hover:bg-primary-900/50"
+    >
+      {content}
+    </a>
+  )
+}
+
+function ConfiguredPortTile({ port }) {
+  const targetUrl = getConfiguredPortUrl(port)
+  const label = `${port.port}/${port.protocol}`
+  const content = (
+    <>
+      {port.label && <span className="min-w-0 truncate text-gray-600 dark:text-gray-300">{port.label}</span>}
+      <span className="rounded bg-white/70 px-1.5 py-0.5 font-semibold dark:bg-gray-900/40">{label}</span>
+      {targetUrl && <ExternalLink className="ml-auto h-3 w-3 flex-shrink-0" aria-hidden="true" />}
+    </>
+  )
+
+  if (!targetUrl) {
+    return (
+      <span
+        title={port.protocol === 'udp' ? 'UDP \u7aef\u53e3\u4e0d\u80fd\u901a\u8fc7\u6d4f\u89c8\u5668\u6253\u5f00' : label}
+        onClick={stopContainerPortEvent}
+        className="inline-flex min-w-0 items-center gap-1.5 rounded-md border border-gray-200 bg-gray-50 px-2 py-1.5 text-xs text-gray-500 dark:border-gray-700 dark:bg-gray-800/60 dark:text-gray-400"
+      >
+        {content}
+      </span>
+    )
+  }
 
   return (
-    <div className="mt-3 pt-3 border-t border-gray-100 dark:border-gray-700/50">
+    <a
+      href={targetUrl}
+      target="_blank"
+      rel="noopener noreferrer"
+      title={`${label} \u2192 \u6253\u5f00\u670d\u52a1`}
+      aria-label={`${label}\uff0c\u6253\u5f00\u670d\u52a1`}
+      onClick={stopContainerPortEvent}
+      onKeyDown={stopContainerPortEvent}
+      className="inline-flex min-w-0 items-center gap-1.5 rounded-md border border-emerald-200 bg-emerald-50 px-2 py-1.5 text-xs font-medium text-emerald-700 transition-colors hover:border-emerald-300 hover:bg-emerald-100 dark:border-emerald-800 dark:bg-emerald-900/30 dark:text-emerald-300 dark:hover:bg-emerald-900/50"
+    >
+      {content}
+    </a>
+  )
+}
+
+function ContainerPorts({ ports, configuredPorts, networkMode, onConfigure }) {
+  const detectedPorts = normalizeContainerPorts(ports)
+  const manualPorts = normalizeConfiguredPorts(configuredPorts)
+  const hostNetwork = isHostNetworkMode(networkMode)
+  const displayPorts = hostNetwork ? manualPorts : detectedPorts
+  const visiblePorts = displayPorts.slice(0, MAX_VISIBLE_PORTS)
+  const hiddenPortCount = Math.max(0, displayPorts.length - visiblePorts.length)
+  const declaration = hostNetwork && detectedPorts.length > 0
+    ? detectedPorts.slice(0, 3).map(formatContainerPort).join(' \u00b7 ')
+    : ''
+
+  return (
+    <div className="mt-3 min-h-[118px] pt-3 border-t border-gray-100 dark:border-gray-700/50">
       <div className="flex items-center justify-between gap-2 mb-2">
-        <span className="text-xs font-medium text-gray-500 dark:text-gray-400">端口</span>
-        <span className="text-[10px] text-gray-400 dark:text-gray-500">TCP 端口可打开</span>
+        <div className="flex min-w-0 items-center gap-2">
+          {hostNetwork && <Network className="h-3.5 w-3.5 flex-shrink-0 text-amber-500" aria-hidden="true" />}
+          <span className="text-xs font-medium text-gray-600 dark:text-gray-300">
+            {hostNetwork ? NETWORK_PORT_LABEL : PORT_LABEL}
+          </span>
+          <span className="rounded-full bg-gray-100 px-1.5 py-0.5 text-[10px] text-gray-500 dark:bg-gray-700 dark:text-gray-300">
+            {displayPorts.length}
+          </span>
+        </div>
+        {hostNetwork ? (
+          <button
+            type="button"
+            onClick={(event) => { stopContainerPortEvent(event); onConfigure?.() }}
+            className="inline-flex flex-shrink-0 items-center gap-1 rounded-md border border-amber-200 px-1.5 py-1 text-[10px] font-medium text-amber-700 transition-colors hover:bg-amber-50 dark:border-amber-800 dark:text-amber-300 dark:hover:bg-amber-900/20"
+            title={manualPorts.length > 0 ? EDIT_PORTS_LABEL : CONFIGURE_PORTS_LABEL}
+          >
+            <Settings2 className="h-3 w-3" aria-hidden="true" />
+            {manualPorts.length > 0 ? EDIT_PORTS_LABEL : CONFIGURE_PORTS_LABEL}
+          </button>
+        ) : (
+          <span className="truncate text-[10px] text-gray-400 dark:text-gray-500">{PORT_DIRECTION_LABEL}</span>
+        )}
       </div>
-      <div className="flex flex-wrap gap-1.5">
-        {normalizedPorts.map((port, index) => {
-          const targetUrl = getContainerPortUrl(port)
-          const label = formatContainerPort(port)
-          const title = getContainerPortTitle(port)
-          const key = `${port?.hostIp || ''}-${port?.hostPort || 0}-${port?.containerPort || 0}-${port?.protocol || ''}-${index}`
-          const content = (
-            <>
-              <span className="truncate">{label}</span>
-              {targetUrl && <ExternalLink className="h-3 w-3 flex-shrink-0" aria-hidden="true" />}
-            </>
-          )
 
-          if (!targetUrl) {
-            return (
-              <span
-                key={key}
-                title={title}
-                onClick={stopContainerPortEvent}
-                className="inline-flex max-w-full items-center gap-1 rounded-md border border-gray-200 bg-gray-50 px-2 py-1 text-xs text-gray-500 dark:border-gray-700 dark:bg-gray-800/60 dark:text-gray-400"
-              >
-                {content}
-              </span>
-            )
-          }
+      <div className="h-[68px]">
+        {visiblePorts.length > 0 ? (
+          <div className="grid h-full grid-cols-2 content-start gap-1.5">
+            {visiblePorts.map((port) => hostNetwork ? (
+              <ConfiguredPortTile key={`${port.port}-${port.protocol}`} port={port} />
+            ) : (
+              <PortMappingTile key={`${port.hostPort}-${port.containerPort}-${port.protocol}`} port={port} />
+            ))}
+          </div>
+        ) : hostNetwork ? (
+          <button
+            type="button"
+            onClick={(event) => { stopContainerPortEvent(event); onConfigure?.() }}
+            className="flex h-[68px] w-full items-center rounded-md border border-dashed border-amber-200 px-2.5 text-left text-xs text-amber-700 transition-colors hover:bg-amber-50 dark:border-amber-800 dark:text-amber-300 dark:hover:bg-amber-900/20"
+          >
+            <Plus className="mr-1.5 h-3.5 w-3.5 flex-shrink-0" aria-hidden="true" />
+            {NO_CONFIGURED_PORTS_LABEL}
+          </button>
+        ) : (
+          <div className="flex h-[68px] items-center rounded-md border border-dashed border-gray-200 px-2.5 text-xs text-gray-400 dark:border-gray-700 dark:text-gray-500">
+            {NO_PORTS_LABEL}
+          </div>
+        )}
+      </div>
 
-          return (
-            <a
-              key={key}
-              href={targetUrl}
-              target="_blank"
-              rel="noopener noreferrer"
-              title={title}
-              aria-label={`${label}，打开服务`}
-              onClick={stopContainerPortEvent}
-              onKeyDown={stopContainerPortEvent}
-              className="inline-flex max-w-full items-center gap-1 rounded-md border border-primary-200 bg-primary-50 px-2 py-1 text-xs font-medium text-primary-700 transition-colors hover:border-primary-300 hover:bg-primary-100 dark:border-primary-800 dark:bg-primary-900/30 dark:text-primary-300 dark:hover:bg-primary-900/50"
-            >
-              {content}
-            </a>
-          )
-        })}
+      <div className="mt-1.5 flex h-4 items-center justify-between gap-2 text-[10px] text-gray-400 dark:text-gray-500">
+        <span className="min-w-0 truncate">{hostNetwork && declaration ? `${DECLARED_PORTS_LABEL}\uff1a${declaration}` : ''}</span>
+        {hiddenPortCount > 0 && <span className="flex-shrink-0">+{hiddenPortCount}</span>}
       </div>
     </div>
   )
 }
-
 export function Containers() {
   const queryClient = useQueryClient()
   const [selectedContainer, setSelectedContainer] = useState(null)
+  const [portConfigContainer, setPortConfigContainer] = useState(null)
   // 添加批量操作相关的状态
   const [selectedContainers, setSelectedContainers] = useState([])
   const [isBatchMode, setIsBatchMode] = useState(false)
@@ -162,6 +277,7 @@ export function Containers() {
         return (response.data.data || []).map(container => ({
           ...container,
           ports: normalizeContainerPorts(container.ports),
+          configuredPorts: normalizeConfiguredPorts(container.configuredPorts),
         }))
       } else {
         throw new Error(response.data.msg)
@@ -1022,7 +1138,7 @@ export function Containers() {
               .map((container) => {
                 const isSelected = selectedContainers.includes(container.id)
                 return (
-                  <div key={container.id} className="group">
+                  <div key={container.id} className="group h-full">
                     {/* 容器卡片 - 简化设计，点击调起详情 */}
                     <div
                       onClick={(e) => {
@@ -1035,7 +1151,7 @@ export function Containers() {
                         }
                       }}
                       className={cn(
-                        "card relative overflow-hidden transition-all duration-200 hover:shadow-lg border rounded-2xl p-4 cursor-pointer active:scale-98",
+                        "card relative flex h-full flex-col overflow-hidden transition-all duration-200 hover:shadow-lg border rounded-2xl p-4 cursor-pointer active:scale-98",
                         isSelected
                           ? "border-primary-500 bg-primary-50 dark:bg-primary-900/20 shadow-md"
                           : "border-gray-200 dark:border-gray-700 hover:border-primary-300 dark:hover:border-primary-600"
@@ -1170,11 +1286,16 @@ export function Containers() {
                         </div>
                       </div>
 
-                      <ContainerPorts ports={container.ports} />
+                      <ContainerPorts
+                        ports={container.ports}
+                        configuredPorts={container.configuredPorts}
+                        networkMode={container.networkMode}
+                        onConfigure={() => setPortConfigContainer(container)}
+                      />
 
                       {/* 操作按钮栏 - 底部水平排列 */}
                       {!isBatchMode && (
-                        <div className="flex gap-1 mt-3 pt-3 border-t border-gray-100 dark:border-gray-700/50">
+                        <div className="mt-auto flex gap-1 pt-3 border-t border-gray-100 dark:border-gray-700/50">
                           {containerActions[container.id]?.loading ? (
                             <div className="flex-1 flex items-center justify-center space-x-2 px-1 py-1.5 bg-primary-50 dark:bg-primary-900/20 rounded-lg border border-primary-200 dark:border-primary-800 whitespace-nowrap">
                               <RefreshCw className="h-4 w-4 animate-spin text-primary-600 dark:text-primary-400" />
@@ -1251,6 +1372,17 @@ export function Containers() {
       </div>
 
       {/* 容器详情弹窗 */}
+      {portConfigContainer && (
+        <ConfiguredPortsModal
+          container={portConfigContainer}
+          onClose={() => setPortConfigContainer(null)}
+          onSaved={() => {
+            setPortConfigContainer(null)
+            queryClient.invalidateQueries(['containers'])
+          }}
+        />
+      )}
+
       {
         selectedContainer && (
           <ContainerDetailModal
@@ -1267,6 +1399,212 @@ export function Containers() {
 }
 
 // 容器详情弹窗组件
+function ConfiguredPortsModal({ container, onClose, onSaved }) {
+  const existingPortCount = normalizeConfiguredPorts(container.configuredPorts).length
+  const initialPorts = () => normalizeConfiguredPorts(container.configuredPorts).map((port) => ({
+    label: port.label,
+    port: String(port.port),
+    protocol: port.protocol,
+  }))
+  const [ports, setPorts] = useState(initialPorts)
+  const [error, setError] = useState('')
+  const [isSaving, setIsSaving] = useState(false)
+
+  React.useEffect(() => {
+    setPorts(initialPorts())
+    setError('')
+  }, [container.id])
+
+  const updatePort = (index, field, value) => {
+    setPorts((currentPorts) => currentPorts.map((port, portIndex) => (
+      portIndex === index ? { ...port, [field]: value } : port
+    )))
+    setError('')
+  }
+
+  const removePort = (index) => {
+    setPorts((currentPorts) => currentPorts.filter((_, portIndex) => portIndex !== index))
+    setError('')
+  }
+
+  const addPort = () => {
+    if (ports.length >= 32) {
+      setError('\u6700\u591a\u53ef\u914d\u7f6e 32 \u4e2a\u7aef\u53e3')
+      return
+    }
+    setPorts((currentPorts) => [...currentPorts, { label: '', port: '', protocol: 'tcp' }])
+  }
+
+  const savePorts = async () => {
+    const normalized = []
+    const seen = new Set()
+    for (const port of ports) {
+      const portNumber = Number(port.port)
+      const protocol = String(port.protocol || '').toLowerCase()
+      const label = String(port.label || '').trim()
+      if (!Number.isInteger(portNumber) || portNumber < 1 || portNumber > 65535) {
+        setError('\u7aef\u53e3\u5fc5\u987b\u662f 1 \u81f3 65535 \u4e4b\u95f4\u7684\u6574\u6570')
+        return
+      }
+      if (!['tcp', 'udp'].includes(protocol)) {
+        setError('\u534f\u8bae\u53ea\u80fd\u9009\u62e9 TCP \u6216 UDP')
+        return
+      }
+      if ([...label].length > 64) {
+        setError('\u540d\u79f0\u4e0d\u80fd\u8d85\u8fc7 64 \u4e2a\u5b57\u7b26')
+        return
+      }
+      const key = `${portNumber}/${protocol}`
+      if (seen.has(key)) {
+        setError('\u4e0d\u5141\u8bb8\u91cd\u590d\u914d\u7f6e\u76f8\u540c\u7684\u7aef\u53e3\u548c\u534f\u8bae')
+        return
+      }
+      seen.add(key)
+      normalized.push({ port: portNumber, protocol, label })
+    }
+
+    setIsSaving(true)
+    setError('')
+    try {
+      const response = await containerAPI.saveConfiguredPorts(container.id, normalized)
+      if (response.data.code === 200 || response.data.code === 0) {
+        onSaved()
+        return
+      }
+      setError(response.data.msg || '\u4fdd\u5b58\u7aef\u53e3\u914d\u7f6e\u5931\u8d25')
+    } catch (saveError) {
+      setError(saveError.response?.data?.msg || saveError.message || '\u4fdd\u5b58\u7aef\u53e3\u914d\u7f6e\u5931\u8d25')
+    } finally {
+      setIsSaving(false)
+    }
+  }
+
+  return (
+    <div
+      className="fixed inset-0 z-[60] flex items-center justify-center bg-black/50 p-4"
+      onMouseDown={onClose}
+      role="presentation"
+    >
+      <div
+        className="w-full max-w-2xl overflow-hidden rounded-2xl bg-white shadow-xl dark:bg-gray-800"
+        onMouseDown={(event) => event.stopPropagation()}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="configured-ports-title"
+      >
+        <div className="border-b border-gray-200 px-5 py-4 dark:border-gray-700">
+          <div className="flex items-start justify-between gap-4">
+            <div>
+              <h3 id="configured-ports-title" className="text-lg font-semibold text-gray-900 dark:text-white">
+                {existingPortCount > 0 ? '\u7f16\u8f91 host \u7f51\u7edc\u7aef\u53e3' : '\u914d\u7f6e host \u7f51\u7edc\u7aef\u53e3'}
+              </h3>
+              <p className="mt-1 text-xs text-gray-500 dark:text-gray-400">
+                {container.name} \u00b7 {'Docker \u65e0\u6cd5\u81ea\u52a8\u786e\u8ba4\u5b9e\u9645\u76d1\u542c\u7aef\u53e3'}
+              </p>
+            </div>
+            <button
+              type="button"
+              onClick={onClose}
+              className="rounded-lg p-1 text-gray-400 transition-colors hover:bg-gray-100 hover:text-gray-700 dark:hover:bg-gray-700 dark:hover:text-gray-200"
+              aria-label={'\u5173\u95ed'}
+            >
+              <X className="h-5 w-5" />
+            </button>
+          </div>
+        </div>
+
+        <div className="max-h-[60vh] overflow-y-auto px-5 py-4">
+          <div className="mb-3 grid grid-cols-[minmax(0,1fr)_88px_76px_32px] gap-2 px-1 text-[10px] font-medium text-gray-400 dark:text-gray-500">
+            <span>{'\u540d\u79f0\uff08\u53ef\u9009\uff09'}</span>
+            <span>{'\u7aef\u53e3'}</span>
+            <span>{'\u534f\u8bae'}</span>
+            <span aria-hidden="true" />
+          </div>
+
+          {ports.length > 0 ? (
+            <div className="space-y-2">
+              {ports.map((port, index) => (
+                <div key={`${index}-${port.port}-${port.protocol}`} className="grid grid-cols-[minmax(0,1fr)_88px_76px_32px] gap-2">
+                  <input
+                    value={port.label}
+                    onChange={(event) => updatePort(index, 'label', event.target.value)}
+                    maxLength={64}
+                    placeholder="Web / API"
+                    className="min-w-0 rounded-lg border border-gray-200 bg-white px-2.5 py-2 text-sm text-gray-900 outline-none transition-colors focus:border-primary-400 focus:ring-2 focus:ring-primary-100 dark:border-gray-600 dark:bg-gray-900 dark:text-white dark:focus:ring-primary-900"
+                  />
+                  <input
+                    value={port.port}
+                    onChange={(event) => updatePort(index, 'port', event.target.value.replace(/[^0-9]/g, ''))}
+                    inputMode="numeric"
+                    placeholder="8080"
+                    className="min-w-0 rounded-lg border border-gray-200 bg-white px-2.5 py-2 text-sm text-gray-900 outline-none transition-colors focus:border-primary-400 focus:ring-2 focus:ring-primary-100 dark:border-gray-600 dark:bg-gray-900 dark:text-white dark:focus:ring-primary-900"
+                  />
+                  <select
+                    value={port.protocol}
+                    onChange={(event) => updatePort(index, 'protocol', event.target.value)}
+                    className="rounded-lg border border-gray-200 bg-white px-2 py-2 text-sm text-gray-900 outline-none transition-colors focus:border-primary-400 focus:ring-2 focus:ring-primary-100 dark:border-gray-600 dark:bg-gray-900 dark:text-white dark:focus:ring-primary-900"
+                  >
+                    <option value="tcp">TCP</option>
+                    <option value="udp">UDP</option>
+                  </select>
+                  <button
+                    type="button"
+                    onClick={() => removePort(index)}
+                    className="inline-flex items-center justify-center rounded-lg border border-gray-200 text-gray-400 transition-colors hover:border-red-200 hover:bg-red-50 hover:text-red-600 dark:border-gray-600 dark:hover:border-red-900 dark:hover:bg-red-900/20"
+                    aria-label={'\u5220\u9664\u7aef\u53e3'}
+                  >
+                    <Trash2 className="h-3.5 w-3.5" />
+                  </button>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <div className="rounded-lg border border-dashed border-gray-200 px-3 py-6 text-center text-sm text-gray-500 dark:border-gray-700 dark:text-gray-400">
+              {'\u5c1a\u672a\u914d\u7f6e\u7aef\u53e3\uff0c\u8bf7\u6dfb\u52a0\u5b9e\u9645\u76d1\u542c\u7684\u5bbf\u4e3b\u673a\u7aef\u53e3'}
+            </div>
+          )}
+
+          <button
+            type="button"
+            onClick={addPort}
+            disabled={ports.length >= 32}
+            className="mt-3 inline-flex items-center gap-1.5 rounded-lg border border-dashed border-primary-300 px-3 py-2 text-xs font-medium text-primary-700 transition-colors hover:bg-primary-50 disabled:cursor-not-allowed disabled:opacity-50 dark:border-primary-700 dark:text-primary-300 dark:hover:bg-primary-900/20"
+          >
+            <Plus className="h-3.5 w-3.5" />
+            {'\u6dfb\u52a0\u7aef\u53e3'}
+          </button>
+
+          {error && (
+            <div role="alert" className="mt-3 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700 dark:border-red-900 dark:bg-red-900/20 dark:text-red-300">
+              {error}
+            </div>
+          )}
+        </div>
+
+        <div className="flex justify-end gap-2 border-t border-gray-200 px-5 py-4 dark:border-gray-700">
+          <button
+            type="button"
+            onClick={onClose}
+            disabled={isSaving}
+            className="rounded-lg border border-gray-200 px-3 py-2 text-sm font-medium text-gray-600 transition-colors hover:bg-gray-50 disabled:opacity-50 dark:border-gray-600 dark:text-gray-300 dark:hover:bg-gray-700"
+          >
+            {'\u53d6\u6d88'}
+          </button>
+          <button
+            type="button"
+            onClick={savePorts}
+            disabled={isSaving}
+            className="inline-flex items-center gap-1.5 rounded-lg bg-primary-600 px-3 py-2 text-sm font-medium text-white transition-colors hover:bg-primary-700 disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            {isSaving ? <RefreshCw className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
+            {isSaving ? '\u4fdd\u5b58\u4e2d' : '\u4fdd\u5b58\u914d\u7f6e'}
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
 function ContainerDetailModal({ container, onClose, onRename, onUpdate, onAction }) {
   const queryClient = useQueryClient()
   const [name, setName] = useState(container.name)

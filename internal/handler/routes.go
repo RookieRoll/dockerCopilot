@@ -92,6 +92,11 @@ func RegisterHandlers(server *rest.Server, serverCtx *svc.ServiceContext) {
 				Handler: container.ListBackupsHandler(serverCtx),
 			},
 			{
+				Method:  http.MethodPut,
+				Path:    "/container/:id/configured-ports",
+				Handler: container.ConfiguredPortsHandler(serverCtx),
+			},
+			{
 				Method:  http.MethodGet,
 				Path:    "/containers",
 				Handler: container.ContainersListHandler(serverCtx),
