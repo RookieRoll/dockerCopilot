@@ -1401,7 +1401,9 @@ export function Containers() {
 // 容器详情弹窗组件
 function ConfiguredPortsModal({ container, onClose, onSaved }) {
   const existingPortCount = normalizeConfiguredPorts(container.configuredPorts).length
-  const initialPorts = () => normalizeConfiguredPorts(container.configuredPorts).map((port) => ({
+  const nextPortKey = React.useRef(0)
+  const initialPorts = () => normalizeConfiguredPorts(container.configuredPorts).map((port, index) => ({
+    id: `configured-${container.id}-${index}`,
     label: port.label,
     port: String(port.port),
     protocol: port.protocol,
@@ -1432,7 +1434,8 @@ function ConfiguredPortsModal({ container, onClose, onSaved }) {
       setError('\u6700\u591a\u53ef\u914d\u7f6e 32 \u4e2a\u7aef\u53e3')
       return
     }
-    setPorts((currentPorts) => [...currentPorts, { label: '', port: '', protocol: 'tcp' }])
+    const id = `configured-${container.id}-new-${nextPortKey.current++}`
+    setPorts((currentPorts) => [...currentPorts, { id, label: '', port: '', protocol: 'tcp' }])
   }
 
   const savePorts = async () => {
@@ -1524,7 +1527,7 @@ function ConfiguredPortsModal({ container, onClose, onSaved }) {
           {ports.length > 0 ? (
             <div className="space-y-2">
               {ports.map((port, index) => (
-                <div key={`${index}-${port.port}-${port.protocol}`} className="grid grid-cols-[minmax(0,1fr)_88px_76px_32px] gap-2">
+                <div key={port.id} className="grid grid-cols-[minmax(0,1fr)_88px_76px_32px] gap-2">
                   <input
                     value={port.label}
                     onChange={(event) => updatePort(index, 'label', event.target.value)}

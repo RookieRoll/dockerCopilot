@@ -4,7 +4,7 @@
 
 ![Docker](https://img.shields.io/badge/Docker-2496ED?style=flat-square&logo=docker&logoColor=white)
 ![React](https://img.shields.io/badge/React-18-61DAFB?style=flat-square&logo=react&logoColor=white)
-![Vite](https://img.shields.io/badge/Vite-5-646CFF?style=flat-square&logo=vite&logoColor=white)
+![Vite](https://img.shields.io/badge/Vite-7-646CFF?style=flat-square&logo=vite&logoColor=white)
 ![Tailwind CSS](https://img.shields.io/badge/Tailwind_CSS-3-06B6D4?style=flat-square&logo=tailwindcss&logoColor=white)
 ![License](https://img.shields.io/badge/License-MIT-green.svg?style=flat-square)
 
@@ -24,7 +24,7 @@
 
 ### 前置要求
 
-- Node.js 16+ 💻
+- Node.js 20.19+ or 22.12+ 💻
 - npm 或 yarn 📦
 - 运行中的 Docker Copilot 后端服务 🐳
 
@@ -80,12 +80,12 @@ npm run dev
 
 | 技术 | 版本 | 说明 |
 |------|------|------|
-| **React** | 18.2 | UI框架，构建交互式界面 |
-| **Vite** | 5.0 | 极速构建工具，开发体验顶级 |
-| **Tailwind CSS** | 3.3 | 原子化CSS框架，快速构建样式 |
-| **React Query** | 5.8 | 服务端状态管理，智能缓存 |
-| **Axios** | 1.6 | HTTP客户端，简洁的API请求 |
-| **Lucide React** | 0.553 | 精美图标库，超过450个图标 |
+| **React** | 18.3 | UI框架，构建交互式界面 |
+| **Vite** | 7.3 | 极速构建工具，开发体验顶级 |
+| **Tailwind CSS** | 3.4 | 原子化CSS框架，快速构建样式 |
+| **React Query** | 5.102 | 服务端状态管理，智能缓存 |
+| **Axios** | 1.20 | HTTP客户端，简洁的API请求 |
+| **Lucide React** | 0.577 | 精美图标库，超过450个图标 |
 
 ## 📁 项目结构
 

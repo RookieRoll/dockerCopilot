@@ -13,12 +13,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
-          node-version: '22'
+          node-version: '24'
           cache: 'npm'
           cache-dependency-path: |
             frontend/package-lock.json
@@ -31,7 +31,7 @@ jobs:
           npm run build
 
       - name: Upload Frontend Artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: my-artifact-front-dist
           path: frontend/dist
@@ -44,10 +44,10 @@ jobs:
         arch: [ amd64, arm64 ]
     steps:
       - name: Checkout code back end
-        uses: actions/checkout@v3
+        uses: actions/checkout@v7
 
       - name: Download Frontend Artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: my-artifact-front-*
           merge-multiple: true
@@ -60,19 +60,12 @@ jobs:
         run: |
           echo "version=$(cat version)" >> $GITHUB_ENV
 
-      - name: Cache Go Modules
-        uses: actions/cache@v3
-        with:
-          path: ${{ github.workspace }}/msaber-back/pkg/mod
-          key: go-mod-${{ hashFiles('**/go.sum') }}
-          restore-keys: |
-            go-mod-
-
       - name: Set up Go
-        uses: actions/setup-go@v4
+        uses: actions/setup-go@v7
         with:
-          go-version: '1.23.4'
-          cache: false
+          go-version: '1.27.0'
+          cache: true
+          cache-dependency-path: go.sum
 
       - name: Build for ${{ matrix.arch }}
         run: |

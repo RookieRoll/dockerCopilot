@@ -1,5 +1,5 @@
 # 构建阶段 - Build Stage
-FROM node:18-alpine AS builder
+FROM node:22-alpine AS builder
 
 # 设置工作目录
 WORKDIR /app
@@ -8,7 +8,7 @@ WORKDIR /app
 COPY package*.json ./
 
 # 安装依赖
-RUN npm install
+RUN npm ci
 
 # 复制项目文件
 COPY . .
@@ -18,10 +18,10 @@ RUN VITE_BASE_PATH=/ npm run build
 
 # ============================================
 # 运行阶段 - Production Stage
-FROM node:18-alpine
+FROM node:22-alpine
 
 # 安装轻量级HTTP服务器和必要工具（使用 sh 而非 bash）
-RUN npm install -g serve && apk add --no-cache gawk
+RUN npm install -g serve@14.2.6 && apk add --no-cache gawk
 
 # 设置工作目录
 WORKDIR /app

@@ -1,4 +1,4 @@
-const CACHE_NAME = 'docker-copilot-v1';
+const CACHE_NAME = 'docker-copilot-v2';
 const BASE_PATH = new URL('.', self.registration.scope).pathname;
 const urlsToCache = [
   BASE_PATH,
@@ -39,40 +39,34 @@ self.addEventListener('activate', event => {
 
 // 获取事件
 self.addEventListener('fetch', event => {
-  // 只缓存 GET 请求
   if (event.request.method !== 'GET') {
+    return;
+  }
+
+  const fetchAndCache = () => fetch(event.request).then(response => {
+    if (!response || response.status !== 200 || response.type !== 'basic') {
+      return response;
+    }
+
+    const responseToCache = response.clone();
+    caches.open(CACHE_NAME).then(cache => {
+      cache.put(event.request, responseToCache);
+    });
+
+    return response;
+  });
+
+  // Always refresh HTML so a new frontend bundle is not hidden by an old cache.
+  if (event.request.mode === 'navigate') {
+    event.respondWith(
+      fetchAndCache().catch(() => caches.match(`${BASE_PATH}index.html`))
+    );
     return;
   }
 
   event.respondWith(
     caches.match(event.request)
-      .then(response => {
-        // 如果缓存中有，返回缓存
-        if (response) {
-          return response;
-        }
-
-        return fetch(event.request).then(response => {
-          // 检查是否有效的响应
-          if (!response || response.status !== 200 || response.type !== 'basic') {
-            return response;
-          }
-
-          // 克隆响应
-          const responseToCache = response.clone();
-
-          // 缓存新的响应（仅缓存成功的响应）
-          caches.open(CACHE_NAME)
-            .then(cache => {
-              cache.put(event.request, responseToCache);
-            });
-
-          return response;
-        });
-      })
-      .catch(() => {
-        // 离线时的备选方案
-        return caches.match(`${BASE_PATH}index.html`);
-      })
+      .then(response => response || fetchAndCache())
+      .catch(() => caches.match(`${BASE_PATH}index.html`))
   );
 });
