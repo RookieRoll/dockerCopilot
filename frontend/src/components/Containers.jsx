@@ -1608,6 +1608,15 @@ function ConfiguredPortsModal({ container, onClose, onSaved }) {
   )
 }
 
+// 建议的更新目标镜像:版本号 tag 存在更高版本时返回 name:新版本
+function suggestedImageRef(container) {
+  if (!container.latestVersion) return container.usingImage
+  const ref = container.usingImage
+  const sep = ref.lastIndexOf(':')
+  const base = sep > 0 && !ref.slice(sep + 1).includes('/') ? ref.slice(0, sep) : ref
+  return base + ':' + container.latestVersion
+}
+
 function ContainerDetailModal({ container, onClose, onRename, onUpdate, onAction }) {
   const queryClient = useQueryClient()
   const [name, setName] = useState(container.name)
@@ -1636,7 +1645,7 @@ function ContainerDetailModal({ container, onClose, onRename, onUpdate, onAction
   // 当容器切换时，更新表单字段的值
   React.useEffect(() => {
     setName(container.name)
-    setImageNameAndTag(container.usingImage)
+    setImageNameAndTag(suggestedImageRef(container))
     setCurrentContainer(container)
   }, [container])
 
