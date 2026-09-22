@@ -1,5 +1,8 @@
 name: latest
 
+permissions:
+  contents: write
+
 on:
   workflow_dispatch:
   push:
@@ -97,12 +100,13 @@ jobs:
         run: |
           gh release create ${{ env.version }} \
             --title "${{ env.version }}" \
-            --notes "Release of version ${{ env.version }}"
+            --notes "Release of version ${{ env.version }}" \
+            || gh release view ${{ env.version }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Upload Asset for ${{ matrix.arch }}
         run: |
-          gh release upload ${{ env.version }} dockerCopilot-${{ matrix.arch }}.tar.gz
+          gh release upload ${{ env.version }} dockerCopilot-${{ matrix.arch }}.tar.gz --clobber
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
