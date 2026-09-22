@@ -72,6 +72,9 @@ func RestoreContainer(ctx *svc.ServiceContext, filename string, taskID string) e
 			continue
 		}
 		err = decodePullResp(reader, ctx, taskID)
+		if closeErr := reader.Close(); closeErr != nil {
+			logx.Error("关闭镜像拉取响应失败: " + closeErr.Error())
+		}
 		if err != nil {
 			backupList = append(backupList, containerInfo.Config.Image+"拉取镜像出现错误"+err.Error())
 			logx.Errorf("Failed to pull image: %v", err)

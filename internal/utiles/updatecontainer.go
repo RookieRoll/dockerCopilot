@@ -53,6 +53,9 @@ func UpdateContainer(serviceContext *svc.ServiceContext, id string, name string,
 		return err
 	}
 	err = decodePullResp(reader, serviceContext, taskID)
+	if closeErr := reader.Close(); closeErr != nil {
+		logx.Error("关闭镜像拉取响应失败: " + closeErr.Error())
+	}
 	if err != nil {
 		oldTaskProgress.Message = "拉取镜像失败"
 		oldTaskProgress.DetailMsg = err.Error()

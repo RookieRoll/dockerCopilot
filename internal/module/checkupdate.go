@@ -12,6 +12,7 @@ import (
 	"net/http"
 	url2 "net/url"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -20,6 +21,7 @@ type ImageCheckList struct {
 	NeedUpdate bool
 }
 type ImageUpdateData struct {
+	mu   sync.RWMutex
 	Data map[string]ImageCheckList
 }
 
@@ -78,7 +80,17 @@ func (i *ImageUpdateData) checkSingleImage(image types.Image) {
 			needUpdate = false
 		}
 	}
+	i.mu.Lock()
 	i.Data[image.ID] = ImageCheckList{NeedUpdate: needUpdate}
+	i.mu.Unlock()
+}
+
+// Get 返回单个镜像的更新检查结果,并发安全。
+func (i *ImageUpdateData) Get(id string) (ImageCheckList, bool) {
+	i.mu.RLock()
+	defer i.mu.RUnlock()
+	v, ok := i.Data[id]
+	return v, ok
 }
 
 func BuildManifestURL(image types.Image) (string, error) {
