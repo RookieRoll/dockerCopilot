@@ -76,7 +76,7 @@ func TestCleanupContainerPortOverridesRemovesStaleEntries(t *testing.T) {
 		t.Fatalf("save stale configured ports: %v", err)
 	}
 
-	removed, err := CleanupContainerPortOverrides([]string{"/active-service"})
+	removed, _, err := CleanupContainerPortOverrides([]string{"/active-service"})
 	if err != nil {
 		t.Fatalf("cleanup stale configured ports: %v", err)
 	}

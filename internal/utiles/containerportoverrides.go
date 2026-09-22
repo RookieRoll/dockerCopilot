@@ -117,9 +117,9 @@ func RemoveContainerPortOverrides(containerName string) error {
 }
 
 // CleanupContainerPortOverrides removes entries whose container names are not
-// present in the latest successful Docker container list. The returned count
-// is the number of removed stale entries.
-func CleanupContainerPortOverrides(activeContainerNames []string) (int, error) {
+// present in the latest successful Docker container list and returns the
+// cleaned, normalized overrides from the same single file read.
+func CleanupContainerPortOverrides(activeContainerNames []string) (int, map[string][]types.ConfiguredPort, error) {
 	activeNames := make(map[string]struct{}, len(activeContainerNames))
 	for _, name := range activeContainerNames {
 		if normalizedName := normalizeContainerName(name); normalizedName != "" {
@@ -132,7 +132,7 @@ func CleanupContainerPortOverrides(activeContainerNames []string) (int, error) {
 
 	config, err := readContainerPortOverridesFileLocked()
 	if err != nil {
-		return 0, err
+		return 0, nil, err
 	}
 	removed := 0
 	for name := range config.Containers {
@@ -142,10 +142,21 @@ func CleanupContainerPortOverrides(activeContainerNames []string) (int, error) {
 		delete(config.Containers, name)
 		removed++
 	}
-	if removed == 0 {
-		return 0, nil
+	if removed > 0 {
+		if err := writeContainerPortOverridesFileLocked(config); err != nil {
+			return removed, nil, err
+		}
 	}
-	return removed, writeContainerPortOverridesFileLocked(config)
+
+	overrides := make(map[string][]types.ConfiguredPort, len(config.Containers))
+	for name, entry := range config.Containers {
+		ports, err := NormalizeConfiguredPorts(entry.Ports)
+		if err != nil {
+			return removed, nil, fmt.Errorf("invalid saved ports for container %q: %w", name, err)
+		}
+		overrides[name] = ports
+	}
+	return removed, overrides, nil
 }
 
 func SaveContainerPortOverrides(containerName string, ports []types.ConfiguredPort) error {

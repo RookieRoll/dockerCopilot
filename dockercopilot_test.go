@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -467,6 +468,130 @@ func TestConfiguredPortsAPIPersistsHostNetworkPorts(t *testing.T) {
 	}
 	if bytes.Contains(contentAfterCleanup, []byte(`"host-service"`)) {
 		t.Fatalf("stale configured ports remain after container deletion: %s", contentAfterCleanup)
+	}
+}
+
+func TestContainersAPIInspectsContainersInParallel(t *testing.T) {
+	var inFlight, maxInFlight atomic.Int32
+
+	dockerServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.URL.Path == "/v1.45/containers/json":
+			items := make([]string, 0, 10)
+			for i := 0; i < 10; i++ {
+				id := fmt.Sprintf("container-%d", i)
+				items = append(items, fmt.Sprintf(
+					`{"Id":%q,"Names":[%q],"Image":"example:latest","ImageID":"sha256:image-%d","Created":1700000000,"Ports":[],"State":"running","Status":"Up 1 minute"}`,
+					id, "/"+id, i))
+			}
+			fmt.Fprintf(w, "[%s]", strings.Join(items, ","))
+		case strings.HasPrefix(r.URL.Path, "/v1.45/containers/") && strings.HasSuffix(r.URL.Path, "/json"):
+			cur := inFlight.Add(1)
+			defer inFlight.Add(-1)
+			for {
+				old := maxInFlight.Load()
+				if cur <= old || maxInFlight.CompareAndSwap(old, cur) {
+					break
+				}
+			}
+			time.Sleep(50 * time.Millisecond)
+			id := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/v1.45/containers/"), "/json")
+			fmt.Fprintf(w, `{"Id":%q,"Name":%q,"Config":{"Image":"example:latest"},"HostConfig":{"NetworkMode":"bridge"}}`, id, "/"+id)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer dockerServer.Close()
+
+	docker, err := dockerClient.NewClientWithOpts(
+		dockerClient.WithHost(dockerServer.URL),
+		dockerClient.WithVersion("1.45"),
+	)
+	if err != nil {
+		t.Fatalf("failed to create Docker API client: %v", err)
+	}
+	defer docker.Close()
+
+	port := getEmbeddedTestPort(t)
+	cfg := config.Config{}
+	cfg.Host = "127.0.0.1"
+	cfg.Port = port
+	cfg.Auth.AccessSecret = "perf-test-secret"
+	cfg.Auth.AccessExpire = 3600
+
+	serviceContext := &svc.ServiceContext{
+		Config:        cfg,
+		DockerClient:  docker,
+		HubImageInfo:  module.NewImageCheck(),
+		ProgressStore: make(svc.ProgressStoreType),
+	}
+	server := rest.MustNewServer(cfg.RestConf)
+	apphandler.RegisterHandlers(server, serviceContext)
+	defer server.Stop()
+
+	go server.Start()
+	waitForEmbeddedServer(t, port, "/api/auth")
+
+	baseURL := fmt.Sprintf("http://127.0.0.1:%d", port)
+
+	loginResponse, err := http.PostForm(baseURL+"/api/auth", url.Values{"secretKey": []string{cfg.Auth.AccessSecret}})
+	if err != nil {
+		t.Fatalf("failed to authenticate against API: %v", err)
+	}
+	loginBody, err := io.ReadAll(loginResponse.Body)
+	loginResponse.Body.Close()
+	if err != nil {
+		t.Fatalf("failed to read authentication response: %v", err)
+	}
+	var login struct {
+		Code int `json:"code"`
+		Data struct {
+			JWT string `json:"jwt"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(loginBody, &login); err != nil {
+		t.Fatalf("failed to decode authentication response: %v", err)
+	}
+	if login.Data.JWT == "" {
+		t.Fatalf("authentication response did not contain a JWT: %s", loginBody)
+	}
+
+	request, err := http.NewRequest(http.MethodGet, baseURL+"/api/containers", nil)
+	if err != nil {
+		t.Fatalf("failed to create containers request: %v", err)
+	}
+	request.Header.Set("Authorization", "Bearer "+login.Data.JWT)
+	containersResponse, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatalf("failed to request containers API: %v", err)
+	}
+	containersBody, err := io.ReadAll(containersResponse.Body)
+	containersResponse.Body.Close()
+	if err != nil {
+		t.Fatalf("failed to read containers response: %v", err)
+	}
+	if containersResponse.StatusCode != http.StatusOK {
+		t.Fatalf("expected containers status 200, got %d: %s", containersResponse.StatusCode, containersBody)
+	}
+
+	var containers struct {
+		Code int              `json:"code"`
+		Data []map[string]any `json:"data"`
+	}
+	if err := json.Unmarshal(containersBody, &containers); err != nil {
+		t.Fatalf("failed to decode containers response: %v", err)
+	}
+	if containers.Code != http.StatusOK {
+		t.Fatalf("expected success code 200, got %d: %s", containers.Code, containersBody)
+	}
+	if len(containers.Data) != 10 {
+		t.Fatalf("expected 10 containers, got %d: %s", len(containers.Data), containersBody)
+	}
+	if max := maxInFlight.Load(); max < 2 {
+		t.Fatalf("container inspects ran serially (max in-flight %d)", max)
+	} else if max > 8 {
+		t.Fatalf("inspect concurrency exceeded bound 8 (max in-flight %d)", max)
 	}
 }
 

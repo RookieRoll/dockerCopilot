@@ -1640,44 +1640,41 @@ function ContainerDetailModal({ container, onClose, onRename, onUpdate, onAction
     setCurrentContainer(container)
   }, [container])
 
-  // 实时更新容器状态
+  // 实时更新容器状态(复用 React Query ['containers'] 的 queryFn 与缓存)
   React.useEffect(() => {
     const interval = setInterval(async () => {
       try {
-        const response = await containerAPI.getContainers();
-        if (response.data.code === 0) {
-          const containers = response.data.data;
-          const updatedContainer = containers.find(c => c.id === container.id);
-          if (updatedContainer) {
-            // 检查是否有镜像图标
-            const imageLogos = JSON.parse(localStorage.getItem('docker_copilot_image_logos') || '{}');
+        const containers = await queryClient.fetchQuery({ queryKey: ['containers'] });
+        const updatedContainer = containers.find(c => c.id === container.id);
+        if (updatedContainer) {
+          // 检查是否有镜像图标
+          const imageLogos = JSON.parse(localStorage.getItem('docker_copilot_image_logos') || '{}');
 
-            // 如果容器没有自定义图标，则查找镜像图标
-            if (!updatedContainer.iconUrl) {
-              // 使用完整的镜像名称和标签进行匹配
-              const imageFullName = updatedContainer.usingImage;
+          // 如果容器没有自定义图标，则查找镜像图标
+          if (!updatedContainer.iconUrl) {
+            // 使用完整的镜像名称和标签进行匹配
+            const imageFullName = updatedContainer.usingImage;
 
-              // 首先尝试精确匹配（包含tag）
-              if (imageLogos[imageFullName]) {
-                updatedContainer.iconUrl = imageLogos[imageFullName];
-              } else {
-                // 如果精确匹配失败，尝试镜像名称匹配（不包含tag部分）
-                const imageName = updatedContainer.usingImage.split(':')[0];
+            // 首先尝试精确匹配（包含tag）
+            if (imageLogos[imageFullName]) {
+              updatedContainer.iconUrl = imageLogos[imageFullName];
+            } else {
+              // 如果精确匹配失败，尝试镜像名称匹配（不包含tag部分）
+              const imageName = updatedContainer.usingImage.split(':')[0];
 
-                // 遍历所有镜像图标，查找匹配的镜像名称
-                for (const [imageId, logoUrl] of Object.entries(imageLogos)) {
-                  // 检查镜像名称是否匹配（不包含tag部分）
-                  const logoImageName = imageId.split(':')[0];
-                  if (imageName === logoImageName) {
-                    updatedContainer.iconUrl = logoUrl;
-                    break;
-                  }
+              // 遍历所有镜像图标，查找匹配的镜像名称
+              for (const [imageId, logoUrl] of Object.entries(imageLogos)) {
+                // 检查镜像名称是否匹配（不包含tag部分）
+                const logoImageName = imageId.split(':')[0];
+                if (imageName === logoImageName) {
+                  updatedContainer.iconUrl = logoUrl;
+                  break;
                 }
               }
             }
-
-            setCurrentContainer(updatedContainer);
           }
+
+          setCurrentContainer(updatedContainer);
         }
       } catch (error) {
         console.error('获取容器状态失败:', error);
@@ -1685,7 +1682,7 @@ function ContainerDetailModal({ container, onClose, onRename, onUpdate, onAction
     }, 3000); // 每3秒获取一次最新状态
 
     return () => clearInterval(interval);
-  }, [container.id]);
+  }, [container.id, queryClient]);
 
   const handleIconUpload = async (event) => {
     const file = event.target.files[0]

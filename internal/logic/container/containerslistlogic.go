@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	dockerTypes "github.com/docker/docker/api/types"
@@ -122,6 +123,7 @@ func (l *ContainersListLogic) ContainersList() (resp *types.Resp, err error) {
 		resp.Data = map[string]interface{}{}
 		return resp, err
 	}
+	resp.Code = 200
 	resp.Msg = "success"
 	activeContainerNames := make([]string, 0, len(list))
 	for _, container := range list {
@@ -129,19 +131,37 @@ func (l *ContainersListLogic) ContainersList() (resp *types.Resp, err error) {
 			activeContainerNames = append(activeContainerNames, strings.TrimPrefix(container.Names[0], "/"))
 		}
 	}
-	if removed, cleanupErr := utiles.CleanupContainerPortOverrides(activeContainerNames); cleanupErr != nil {
+	removed, configuredPortOverrides, cleanupErr := utiles.CleanupContainerPortOverrides(activeContainerNames)
+	if cleanupErr != nil {
 		l.Errorf("cleanup configured container ports: %v", cleanupErr)
+		configuredPortOverrides = map[string][]types.ConfiguredPort{}
 	} else if removed > 0 {
 		l.Infof("removed %d stale configured container port entries", removed)
 	}
-	configuredPortOverrides, overridesErr := utiles.LoadContainerPortOverrides()
-	if overridesErr != nil {
-		l.Errorf("load configured container ports: %v", overridesErr)
-		configuredPortOverrides = map[string][]types.ConfiguredPort{}
-	}
 	var containerInfoList []Info
 	list = utiles.CheckImageUpdate(l.svcCtx, list)
-	for _, v := range list {
+
+	// 并行预取 inspect 结果(8 路限流),消除逐容器串行往返。
+	inspects := make([]dockerTypes.ContainerJSON, len(list))
+	sem := make(chan struct{}, 8)
+	var wg sync.WaitGroup
+	for idx := range list {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			inspected, inspectErr := utiles.GetContainerInspect(l.svcCtx, list[idx].ID)
+			if inspectErr != nil {
+				l.Error("get container inspect error: " + list[idx].ID)
+				return
+			}
+			inspects[idx] = inspected
+		}(idx)
+	}
+	wg.Wait()
+
+	for i, v := range list {
 		containerInfo := Info{ConfiguredPorts: make([]types.ConfiguredPort, 0)}
 		containerInfo.Id = v.ID
 		containerInfo.Status = v.State
@@ -158,17 +178,15 @@ func (l *ContainersListLogic) ContainersList() (resp *types.Resp, err error) {
 			containerInfo.UsingImage = v.ImageID
 			l.Error("image dont have name" + v.ID)
 		}
-		containerInspect, err := utiles.GetContainerInspect(l.svcCtx, v.ID)
-		if err != nil {
+		containerInspect := inspects[i]
+		if containerInspect.Config != nil {
+			containerInfo.CreateImage = containerInspect.Config.Image
+		} else {
 			containerInfo.CreateImage = ""
 			l.Error("get image name error" + v.ID)
-		} else {
-			if containerInspect.Config != nil {
-				containerInfo.CreateImage = containerInspect.Config.Image
-			}
-			if containerInspect.HostConfig != nil {
-				containerInfo.NetworkMode = string(containerInspect.HostConfig.NetworkMode)
-			}
+		}
+		if containerInspect.HostConfig != nil {
+			containerInfo.NetworkMode = string(containerInspect.HostConfig.NetworkMode)
 		}
 		t := time.Unix(v.Created, 0)
 		containerInfo.CreateTime = t.Format("2006-01-02 15:04:05")
