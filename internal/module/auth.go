@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -38,7 +39,7 @@ func GetToken(image types.Image, registryAuth string) (string, error) {
 		return "", err
 	}
 
-	client := &http.Client{}
+	client := &http.Client{Timeout: 15 * time.Second}
 	var res *http.Response
 	if res, err = client.Do(req); err != nil {
 		return "", err
@@ -77,7 +78,7 @@ func GetChallengeRequest(URL url.URL) (*http.Request, error) {
 }
 
 func GetBearerHeader(challenge string, imageRef ref.Named, registryAuth string) (string, error) {
-	client := http.Client{}
+	client := http.Client{Timeout: 15 * time.Second}
 	authURL, err := GetAuthURL(challenge, imageRef)
 
 	if err != nil {
@@ -163,21 +164,40 @@ func GetRegistryAddress(imageRef string) (string, error) {
 	address := ref.Domain(normalizedRef)
 
 	if address == DefaultRegistryDomain {
-		if checkHost(DefaultRegistryHost) {
-			address = DefaultRegistryHost
-		} else {
-			for _, host := range DefaultAcceleratorHostList {
-				if checkHost(host) {
-					address = host
-					break
-				}
-			}
-		}
-		if address == DefaultRegistryDomain {
-			address = DefaultRegistryHost
-		}
+		address = resolveDockerHubHost()
 	}
 	return address, nil
+}
+
+var (
+	resolvedDockerHubMu sync.Mutex
+	resolvedDockerHub   string
+	resolvedDockerHubAt time.Time
+)
+
+const dockerHubResolveTTL = 30 * time.Minute
+
+// resolveDockerHubHost 返回可用的 Docker Hub 访问地址。
+// 探测(最多 11 个加速站、各 5s 超时)结果缓存 30 分钟;
+// 全部失败时返回并缓存 DefaultRegistryHost,避免故障期间重复探测。
+func resolveDockerHubHost() string {
+	resolvedDockerHubMu.Lock()
+	defer resolvedDockerHubMu.Unlock()
+	if resolvedDockerHub != "" && time.Since(resolvedDockerHubAt) < dockerHubResolveTTL {
+		return resolvedDockerHub
+	}
+	host := DefaultRegistryHost
+	if !checkHost(DefaultRegistryHost) {
+		for _, candidate := range DefaultAcceleratorHostList {
+			if checkHost(candidate) {
+				host = candidate
+				break
+			}
+		}
+	}
+	resolvedDockerHub = host
+	resolvedDockerHubAt = time.Now()
+	return host
 }
 
 func checkHost(host string) bool {

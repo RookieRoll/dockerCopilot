@@ -118,8 +118,10 @@ func BuildManifestURL(image types.Image) (string, error) {
 	return url.String(), nil
 }
 
-func GetDigest(url string, token string) (string, error) {
-	tr := &http.Transport{
+// digestHTTPClient 共享 Transport,复用到 registry 的 TLS 连接。
+var digestHTTPClient = &http.Client{
+	Timeout: 30 * time.Second,
+	Transport: &http.Transport{
 		Proxy: http.ProxyFromEnvironment,
 		DialContext: (&net.Dialer{
 			Timeout:   30 * time.Second,
@@ -131,9 +133,10 @@ func GetDigest(url string, token string) (string, error) {
 		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
 		TLSClientConfig:       &tls.Config{InsecureSkipVerify: true},
-	}
-	client := &http.Client{Transport: tr}
+	},
+}
 
+func GetDigest(url string, token string) (string, error) {
 	req, _ := http.NewRequest("HEAD", url, nil)
 
 	if token != "" {
@@ -144,7 +147,7 @@ func GetDigest(url string, token string) (string, error) {
 	req.Header.Add("Accept", "application/vnd.docker.distribution.manifest.v1+json")
 	req.Header.Add("Accept", "application/vnd.oci.image.index.v1+json")
 
-	res, err := client.Do(req)
+	res, err := digestHTTPClient.Do(req)
 	if err != nil {
 		return "", err
 	}

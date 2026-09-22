@@ -11,6 +11,7 @@ import (
 	"os"
 	"runtime"
 	"strings"
+	"time"
 )
 
 func UpdateProgram(ctx *svc.ServiceContext) error {
@@ -21,7 +22,8 @@ func UpdateProgram(ctx *svc.ServiceContext) error {
 	versionURL := githubProxy + "https://raw.githubusercontent.com/onlyLTY/dockerCopilot/latest/version"
 	releaseBaseURL := githubProxy + "https://github.com/onlyLTY/dockerCopilot/releases/download"
 	logx.Infof("versionURL: %s", versionURL)
-	resp, err := http.Get(versionURL)
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Get(versionURL)
 	if err != nil {
 		logx.Info("没有获取到最新版本信息:", err)
 		return nil
@@ -63,7 +65,8 @@ func UpdateProgram(ctx *svc.ServiceContext) error {
 }
 
 func downloadFile(url string, dest string) error {
-	resp, err := http.Get(url)
+	client := &http.Client{Timeout: 10 * time.Minute}
+	resp, err := client.Get(url)
 	if err != nil {
 		return err
 	}

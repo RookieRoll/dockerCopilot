@@ -5,6 +5,8 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/onlyLTY/dockerCopilot/internal/config"
 	"github.com/zeromicro/go-zero/core/logx"
@@ -36,8 +38,22 @@ func GetRemoteVersion() (remoteVersion string, err error) {
 
 }
 
+var (
+	remoteVersionMu sync.Mutex
+	cachedRemoteVer string
+	cachedRemoteAt  time.Time
+)
+
+const remoteVersionTTL = 5 * time.Minute
+
 func fetchVersionFromURL(url string) (string, error) {
+	remoteVersionMu.Lock()
+	defer remoteVersionMu.Unlock()
+	if cachedRemoteVer != "" && time.Since(cachedRemoteAt) < remoteVersionTTL {
+		return cachedRemoteVer, nil
+	}
 	client := &http.Client{
+		Timeout: 15 * time.Second,
 		Transport: &http.Transport{
 			Proxy: http.ProxyFromEnvironment,
 		},
@@ -59,5 +75,8 @@ func fetchVersionFromURL(url string) (string, error) {
 		return "", err
 	}
 
-	return strings.TrimSpace(string(versionData)), nil
+	remoteVersion := strings.TrimSpace(string(versionData))
+	cachedRemoteVer = remoteVersion
+	cachedRemoteAt = time.Now()
+	return remoteVersion, nil
 }
