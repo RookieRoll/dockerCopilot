@@ -34,3 +34,4 @@ __pycache__/
 /openspec/
 /frontend/node_modules/
 /frontend/dist/
+.pi
