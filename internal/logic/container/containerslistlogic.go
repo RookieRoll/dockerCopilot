@@ -40,7 +40,6 @@ type Info struct {
 	CreateTime      string                 `json:"createTime"`
 	RunningTime     string                 `json:"runningTime"`
 	HaveUpdate      bool                   `json:"haveUpdate"`
-	LatestVersion   string                 `json:"latestVersion,omitempty"`
 	NetworkMode     string                 `json:"networkMode,omitempty"`
 	Ports           []PortInfo             `json:"ports"`
 	ConfiguredPorts []types.ConfiguredPort `json:"configuredPorts"`
@@ -193,7 +192,6 @@ func (l *ContainersListLogic) ContainersList() (resp *types.Resp, err error) {
 		containerInfo.CreateTime = t.Format("2006-01-02 15:04:05")
 		containerInfo.RunningTime = v.Status
 		containerInfo.HaveUpdate = v.Update
-		containerInfo.LatestVersion = v.LatestVersion
 		containerInfo.Ports = mapContainerPorts(v.Ports)
 		if containerInfo.NetworkMode == "host" {
 			containerInfo.ConfiguredPorts = configuredPortOverrides[containerInfo.Name]

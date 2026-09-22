@@ -6,6 +6,5 @@ import (
 
 type Container struct {
 	docker.Container
-	Update        bool   `json:"Update"`
-	LatestVersion string `json:"latestVersion,omitempty"`
+	Update bool `json:"Update"`
 }

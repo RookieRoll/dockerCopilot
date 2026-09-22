@@ -31,7 +31,6 @@ func CheckImageUpdate(ctx *svc.ServiceContext, containerListData []MyType.Contai
 	for idx := range containerListData {
 		if result, ok := ctx.HubImageInfo.Get(containerListData[idx].ImageID); ok && result.NeedUpdate {
 			containerListData[idx].Update = true
-			containerListData[idx].LatestVersion = result.LatestVersion
 		}
 	}
 	return containerListData
