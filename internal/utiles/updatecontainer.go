@@ -224,7 +224,7 @@ func decodePullResp(reader io.Reader, ctx *svc.ServiceContext, taskID string) (e
 			oldTaskProgress.DetailMsg = formattedMsg
 			oldTaskProgress.Percentage = 25
 			ctx.UpdateProgress(taskID, oldTaskProgress)
-			logx.Infof("拉取镜像进度\t %s: %s\n", msg.Status, msg.Progress)
+			logx.Debugf("拉取镜像进度\t %s: %s\n", msg.Status, msg.Progress)
 		}
 	}
 }

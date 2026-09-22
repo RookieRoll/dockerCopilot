@@ -53,18 +53,14 @@ func RestoreContainer(ctx *svc.ServiceContext, filename string, taskID string) e
 		ctx.UpdateProgress(taskID, oldProgress)
 		return err
 	}
+	ctx.DockerClient.NegotiateAPIVersion(context.TODO())
+
 	for i, containerInfo := range configList {
 		info := "正在恢复第" + strconv.Itoa(i+1) + "个容器"
 		oldProgress.Percentage = int(float64(i) / float64(len(configList)) * 100)
 		oldProgress.Message = info
 		oldProgress.DetailMsg = info
 		ctx.UpdateProgress(taskID, oldProgress)
-		ctx.DockerClient.NegotiateAPIVersion(context.TODO())
-		if err != nil {
-			backupList = append(backupList, "出现错误"+err.Error())
-			logx.Errorf("Failed to inspect container: %v", err)
-			return err
-		}
 		reader, err := ctx.DockerClient.ImagePull(context.TODO(), containerInfo.Config.Image, image.PullOptions{})
 		if err != nil {
 			backupList = append(backupList, containerInfo.Config.Image+"拉取镜像出现错误"+err.Error())

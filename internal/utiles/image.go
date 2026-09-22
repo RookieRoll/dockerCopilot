@@ -54,13 +54,13 @@ func checkImageInUsed(svc *svc.ServiceContext, imageList []MyType.Image) ([]MyTy
 	if err != nil {
 		return imageList, err
 	}
-	// 这里可以用mapreduce 我懒等pr
+	used := make(map[string]struct{}, len(list))
 	for _, v := range list {
-		for i, imageInfo := range imageList {
-			if v.ImageID == imageInfo.ID {
-				imageList[i].InUsed = true
-				break
-			}
+		used[v.ImageID] = struct{}{}
+	}
+	for i := range imageList {
+		if _, ok := used[imageList[i].ID]; ok {
+			imageList[i].InUsed = true
 		}
 	}
 	return imageList, nil
