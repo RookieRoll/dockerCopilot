@@ -37,8 +37,14 @@ func GetImagesList(ctx *svc.ServiceContext) ([]MyType.Image, error) {
 func splitImageNameAndTag(imagesList []MyType.Image) []MyType.Image {
 	for i, imageInfo := range imagesList {
 		if len(imageInfo.RepoTags) != 0 {
-			imagesList[i].ImageName = strings.Split(imageInfo.RepoTags[0], ":")[0]
-			imagesList[i].ImageTag = strings.Split(imageInfo.RepoTags[0], ":")[1]
+			// 从最后一个 ":" 切分,registry 带端口(如 localhost:5000/app:v1)时不会切错
+			if idx := strings.LastIndex(imageInfo.RepoTags[0], ":"); idx != -1 && !strings.Contains(imageInfo.RepoTags[0][idx+1:], "/") {
+				imagesList[i].ImageName = imageInfo.RepoTags[0][:idx]
+				imagesList[i].ImageTag = imageInfo.RepoTags[0][idx+1:]
+			} else {
+				imagesList[i].ImageName = imageInfo.RepoTags[0]
+				imagesList[i].ImageTag = "None"
+			}
 		} else if len(imageInfo.RepoDigests) != 0 {
 			imagesList[i].ImageName = strings.Split(imageInfo.RepoDigests[0], "@")[0]
 			imagesList[i].ImageTag = "None"

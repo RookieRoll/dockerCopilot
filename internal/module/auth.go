@@ -101,6 +101,12 @@ func GetBearerHeader(challenge string, imageRef ref.Named, registryAuth string) 
 	if authResponse, err = client.Do(r); err != nil {
 		return "", err
 	}
+	defer func(Body io.ReadCloser) {
+		err := Body.Close()
+		if err != nil {
+			logx.Error("GetBearerHeader关闭Body失败" + err.Error())
+		}
+	}(authResponse.Body)
 
 	body, _ := io.ReadAll(authResponse.Body)
 	tokenResponse := &types.TokenResponse{}

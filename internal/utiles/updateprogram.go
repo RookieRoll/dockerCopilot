@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"time"
@@ -126,7 +127,11 @@ func decompressTarGz(gzFilePath string, dest string) error {
 			return err
 		}
 
-		target := dest + "/" + header.Name
+		name := filepath.Clean(header.Name)
+		if !filepath.IsLocal(name) {
+			return fmt.Errorf("非法归档路径: %s", header.Name)
+		}
+		target := filepath.Join(dest, name)
 
 		switch header.Typeflag {
 		case tar.TypeDir:
@@ -134,6 +139,9 @@ func decompressTarGz(gzFilePath string, dest string) error {
 				return err
 			}
 		case tar.TypeReg:
+			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+				return err
+			}
 			outFile, err := os.Create(target)
 			if err != nil {
 				return err

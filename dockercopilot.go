@@ -92,8 +92,8 @@ export const customImageLogos = {
 	_, err = corndanmu.AddFunc("30 * * * *", func() {
 		list, err := utiles.GetImagesList(ctx)
 		if err != nil {
-			logx.Errorf("panic获取镜像列表出错: %v", err)
-			panic(err)
+			logx.Errorf("定时检查镜像更新失败: %v", err)
+			return
 		}
 		ctx.HubImageInfo.CheckUpdate(list)
 	})
