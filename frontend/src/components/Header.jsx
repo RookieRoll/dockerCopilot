@@ -10,9 +10,8 @@ import { ThemeToggle } from './ThemeToggle.jsx'
 import { UpdatePrompt } from './UpdatePrompt.jsx'
 import { cn } from '../utils/cn.js'
 import logoImg from '../assets/DockerCopilot-logo.png'
-import { useVersionCheck } from '../hooks/useVersionCheck.js'
 
-export function Sidebar({ activeTab, onTabChange, onLogout, isCollapsed = false, onToggleCollapse, windowWidth = 1024 }) {
+export function Sidebar({ activeTab, onTabChange, onLogout, isCollapsed = false, onToggleCollapse, windowWidth = 1024, versionState = {} }) {
   const [isMobileMenuOpen, setIsMobileMenuOpen] = React.useState(false)
 
   // 时间格式转换函数 - 将UTC时间转换为北京时间
@@ -40,7 +39,6 @@ export function Sidebar({ activeTab, onTabChange, onLogout, isCollapsed = false,
     }
   }
 
-  // 使用版本检查 Hook
   const {
     showUpdatePrompt,
     setShowUpdatePrompt,
@@ -49,8 +47,12 @@ export function Sidebar({ activeTab, onTabChange, onLogout, isCollapsed = false,
     buildDate,
     hasBackendUpdate,
     updateBackend,
-    checkForUpdates
-  } = useVersionCheck()
+    checkForUpdates,
+    programTask,
+    programUpdateState,
+    isSubmittingUpdate,
+    versionCheckError,
+  } = versionState
 
   // 智能判断是否可以手动切换侧边栏
   const canToggleSidebar = windowWidth >= 1024
@@ -348,6 +350,12 @@ export function Sidebar({ activeTab, onTabChange, onLogout, isCollapsed = false,
         remoteVersion={remoteVersion}
         hasBackendUpdate={hasBackendUpdate}
         onUpdateBackend={updateBackend}
+        isUpdating={programUpdateState === 'submitting' || programUpdateState === 'active' || programUpdateState === 'uncertain'}
+        programTask={programTask}
+        programUpdateState={programUpdateState}
+        isSubmittingUpdate={isSubmittingUpdate}
+        versionCheckError={versionCheckError}
+        onCheckVersions={checkForUpdates}
       />
     </>
   )

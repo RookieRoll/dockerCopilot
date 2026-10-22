@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { QueryClient } from '@tanstack/react-query'
 import { ApiError } from '../api/errors.js'
 import { createTaskPollingController } from './taskPolling.js'
-import { acceptedTaskId, createTaskScopeGuard, createTaskTerminalHandler, findActiveTaskByContainer, requestTaskAcceptance, taskSessionScopeKey, taskStorageKeyForScope } from './useTask.js'
+import { acceptedTaskId, createTaskScopeGuard, createTaskTerminalHandler, findActiveTaskByContainer, findRecentTaskByType, requestTaskAcceptance, taskSessionScopeKey, taskStorageKeyForScope } from './useTask.js'
 
 function fakeTimers() {
   let nextId = 1
@@ -47,6 +47,34 @@ test('task acceptance supports legacy envelopes and never replays a failed submi
     throw new ApiError('submission outcome unknown', { status: 503, requestId: 'request-1' })
   }), (error) => error.status === 503 && error.requestId === 'request-1')
   assert.equal(calls, 1)
+})
+
+test('unknown program update acceptance requires the exact request identity even for recent terminal tasks', async () => {
+  const requestId = '123e4567-e89b-42d3-a456-426614174000'
+  const calls = []
+  const found = await findRecentTaskByType({
+    type: 'program-update',
+    requestId,
+    listTasks: async (params) => {
+      calls.push(params)
+      return { data: { code: 0, data: { items: [
+        { taskID: 'old-task', type: 'program-update', status: 'succeeded', createdAt: '2026-10-22T10:00:09.000Z', requestID: 'another-request' },
+        { taskID: 'new-task', type: 'program-update', status: 'interrupted', createdAt: '2026-10-22T10:00:10.000Z', requestID: requestId },
+      ] } } }
+    },
+  })
+  assert.equal(found.taskID, 'new-task')
+  assert.deepEqual(calls, [{ type: 'program-update', page: 1, limit: 100 }])
+
+  const noMatch = await findRecentTaskByType({
+    type: 'program-update',
+    requestId,
+    listTasks: async () => ({ data: { code: 0, data: { items: [
+      { taskID: 'old-task', type: 'program-update', status: 'succeeded', createdAt: '2026-10-22T10:00:10.000Z', requestID: 'another-request' },
+    ] } } }),
+  })
+  assert.equal(noMatch, null)
+  assert.equal(await findRecentTaskByType({ type: 'program-update', listTasks: () => { throw new Error('must not search without identity') } }), null)
 })
 
 test('polling runs beyond 60 attempts and treats failed/interrupted as task results', async () => {
@@ -287,4 +315,15 @@ test('terminal handling invalidates related query caches once and clears persist
   assert.equal(values.has('current-task'), false)
   assert.equal(queryClient.getQueryState(['containers']).isInvalidated, true)
   queryClient.clear()
+})
+
+test('backup discovery without a request identity finds only active tasks', async () => {
+  const task = await findRecentTaskByType({
+    type: 'backup-export',
+    listTasks: async () => ({ data: { code: 200, data: { items: [
+      { taskID: 'completed', type: 'backup-export', status: 'succeeded', createdAt: '2026-10-22T12:00:02Z' },
+      { taskID: 'active', type: 'backup-export', status: 'running', createdAt: '2026-10-22T12:00:01Z' },
+    ] } } }),
+  })
+  assert.equal(task.taskID, 'active')
 })

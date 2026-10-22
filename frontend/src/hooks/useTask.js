@@ -88,13 +88,33 @@ export async function findActiveTaskByContainer({ listTasks, containerId, contai
   return candidates[0] ?? null
 }
 
+export async function findRecentTaskByType({ listTasks, type, requestId, signal }) {
+  // Time proximity cannot establish ownership: an earlier successful task
+  // must never acknowledge a later request whose response was lost.
+  if (!type || (type === 'program-update' && !requestId)) return null
+  const response = await listTasks({ type, page: 1, limit: 100 }, { signal })
+  const candidates = taskListPayload(response)
+    .map((candidate) => validateTaskRecord(candidate, response))
+    .filter((candidate) => requestId ? candidate.requestID === requestId : (candidate.status === 'queued' || candidate.status === 'running'))
+  candidates.sort((a, b) => {
+    const timeDifference = Date.parse(b.createdAt || '') - Date.parse(a.createdAt || '')
+    if (Number.isFinite(timeDifference) && timeDifference !== 0) return timeDifference
+    return (b.taskID ?? b.taskId).localeCompare(a.taskID ?? a.taskId)
+  })
+  return candidates[0] ?? null
+}
+
 export function useTask({
   taskId: initialTaskId,
   containerId,
   containerName,
+  taskType,
+  discoverTaskType = false,
+  taskRequestId = '',
   storageKey = ACTIVE_TASK_STORAGE_KEY,
   invalidateKeys = [],
   onTerminal,
+  enabled = true,
 } = {}) {
   const queryClient = useQueryClient()
   const keysRef = useRef(invalidateKeys)
@@ -118,6 +138,7 @@ export function useTask({
   callbacksRef.current = { onTerminal }
 
   const track = useCallback((id) => {
+    if (!enabled) return
     if (!id) return
     if (!scopeGuardRef.current.isCurrent(sessionScopeKey)) {
       writeStoredTaskId(scopedStorageKey, id)
@@ -133,7 +154,7 @@ export function useTask({
     setSubmitError(null)
     setIsTracking(true)
     controllerRef.current?.start(id)
-  }, [scopedStorageKey, sessionScopeKey])
+  }, [enabled, scopedStorageKey, sessionScopeKey])
 
   useEffect(() => {
     const terminalHandler = createTaskTerminalHandler({
@@ -147,12 +168,16 @@ export function useTask({
     const controller = createTaskPollingController({
       getTask: (id, config) => taskAPI.getTask(id, config),
       findTask: async ({ signal } = {}) => {
-        if (!containerId && !containerName) return null
+        if (!containerId && !containerName && !taskType) return null
+        if (taskType && !containerId && !containerName) {
+          return findRecentTaskByType({ listTasks: (params, config) => taskAPI.listTasks(params, config), type: taskType, requestId: taskRequestId, signal })
+        }
         return findActiveTaskByContainer({ listTasks: (params, config) => taskAPI.listTasks(params, config), containerId, containerName, signal })
       },
       isCurrentScope: () => scopeGuardRef.current.isCurrent(sessionScopeKey),
       onUpdate: (value) => {
         if (!scopeGuardRef.current.isCurrent(sessionScopeKey)) return
+        setSubmitError(null)
         setTask(value)
         const id = value.taskID ?? value.taskId
         if (id && id !== taskIdRef.current) {
@@ -185,7 +210,7 @@ export function useTask({
     setConnectionError(null)
     setUnauthorized(false)
     setSubmitError(null)
-    if (id || containerId || containerName) {
+    if (enabled && (id || containerId || containerName || (taskType && discoverTaskType))) {
       setIsTracking(true)
       controller.start(id)
     } else {
@@ -195,9 +220,10 @@ export function useTask({
       controller.stop()
       if (controllerRef.current === controller) controllerRef.current = null
     }
-  }, [containerId, containerName, initialTaskId, queryClient, scopedStorageKey, sessionScopeKey, track])
+  }, [containerId, containerName, discoverTaskType, enabled, initialTaskId, queryClient, scopedStorageKey, sessionScopeKey, taskType, taskRequestId, track])
 
   const submit = useCallback(async (request) => {
+    if (!enabled) throw new ApiError('Task tracking is unavailable until the user is authenticated')
     if (!scopeGuardRef.current.isCurrent(sessionScopeKey)) return requestTaskAcceptance(request)
     setSubmitError(null)
     setConnectionError(null)
@@ -216,7 +242,7 @@ export function useTask({
       if (scopeGuardRef.current.isCurrent(sessionScopeKey)) setSubmitError(error)
       throw error
     }
-  }, [scopedStorageKey, sessionScopeKey, track])
+  }, [enabled, scopedStorageKey, sessionScopeKey, track])
 
   const clear = useCallback(() => {
     if (!scopeGuardRef.current.isCurrent(sessionScopeKey)) return
@@ -229,7 +255,7 @@ export function useTask({
     setUnauthorized(false)
     setSubmitError(null)
     setIsTracking(false)
-  }, [scopedStorageKey, sessionScopeKey])
+  }, [enabled, scopedStorageKey, sessionScopeKey])
 
   const currentScope = stateScopeKey === sessionScopeKey
   return {

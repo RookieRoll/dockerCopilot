@@ -9,6 +9,7 @@ import { About } from './components/About.jsx'
 import { ThemeProvider } from './hooks/useTheme.jsx'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { cn } from './utils/cn.js'
+import { useVersionCheck } from './hooks/useVersionCheck.js'
 
 
 // 创建一个全局的QueryClient实例
@@ -26,6 +27,7 @@ function AppContent() {
   const [activeTab, setActiveTab] = useState('#containers')
   const [windowWidth, setWindowWidth] = useState(typeof window !== 'undefined' ? window.innerWidth : 1024)
   const [userPreferredCollapsed, setUserPreferredCollapsed] = useState(false)
+  const versionState = useVersionCheck({ enabled: isAuthenticated })
 
   // 智能计算侧边栏是否应该收缩
   const getSmartCollapsedState = (width, userPreference) => {
@@ -124,7 +126,7 @@ function AppContent() {
       case '#backups':
         return <Backups />
       case '#about':
-        return <About />
+        return <About versionState={versionState} />
       default:
         return <Containers />
     }
@@ -143,6 +145,7 @@ function AppContent() {
         isCollapsed={isSidebarCollapsed}
         onToggleCollapse={handleToggleCollapse}
         windowWidth={windowWidth}
+        versionState={versionState}
       />
       <main className={cn(
         "flex-1 flex flex-col transition-all duration-300",

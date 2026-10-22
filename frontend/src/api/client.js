@@ -102,7 +102,7 @@ export const versionAPI = {
     }
     return apiClient.get(`/api/version?type=${type}`)
   },
-  updateProgram: () => apiClient.put('/api/program'),
+  updateProgram: (requestId) => apiClient.put('/api/program', undefined, requestId ? { headers: { 'X-Request-ID': requestId } } : undefined),
 }
 
 // 容器相关API
