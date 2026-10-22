@@ -38,14 +38,15 @@ func main() {
 	flag.Parse()
 	c, err := config.LoadFile(*configFile, true)
 	if err != nil {
-		log.Printf("无法加载配置文件出错: %v", err)
+		log.Printf("无法加载配置文件: %s", observability.RedactText(err.Error()))
 		log.Printf("请确认secretKey设置正确，要求非纯数字且大于八位")
 		os.Exit(1)
 	}
 	if err := SetupLogWithOptions(c.LogOptions()); err != nil {
-		log.Printf("failed to setup log: %v", err)
+		log.Printf("failed to setup log: %s", observability.RedactText(err.Error()))
 		os.Exit(1)
 	}
+	disableDefaultRequestLogging(&c)
 	server := rest.MustNewServer(c.RestConf, rest.WithCors("*"), rest.WithUnauthorizedCallback(
 		func(w http.ResponseWriter, r *http.Request, err error) {
 			response := UnauthorizedResponse{
@@ -118,6 +119,14 @@ export const customImageLogos = {
 	logx.Info("程序版本" + config.Version)
 	server.Start()
 }
+
+// disableDefaultRequestLogging leaves HTTP diagnostics to the redacted
+// application middleware so go-zero cannot dump full requests or bodies.
+func disableDefaultRequestLogging(c *config.Config) {
+	c.Middlewares.Log = false
+	c.Verbose = false
+}
+
 func RegisterHandlers(engine *rest.Server) {
 	frontFS, err := fs.Sub(embeddedFront, "front")
 	if err != nil {

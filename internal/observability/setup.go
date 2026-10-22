@@ -43,11 +43,12 @@ func (w *managedWriter) Close() error {
 func (w *fanoutWriter) Write(p []byte) (int, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	safe := RedactLogJSON(p)
 	if w.stdout != nil {
-		_, _ = w.stdout.Write(p)
+		_, _ = w.stdout.Write(safe)
 	}
 	if w.file != nil {
-		_, _ = w.file.Write(p)
+		_, _ = w.file.Write(safe)
 	}
 	return len(p), nil
 }

@@ -4,7 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
-	"fmt"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -204,11 +204,23 @@ func TestLogPipelineSetupInSubprocess(t *testing.T) {
 			t.Fatalf("stdout/file record differ: %v / %v", stdoutEntries[i], fileEntries[i])
 		}
 	}
-	if stdoutEntries[0]["content"] != "pipeline-info" || stdoutEntries[1]["content"] != "pipeline-error" {
+	if stdoutEntries[0]["content"] != "pipeline-info" || !strings.Contains(stdoutEntries[1]["content"].(string), "daemon TLS handshake failed") {
 		t.Fatalf("unexpected records: %#v", stdoutEntries)
 	}
 	if stdoutEntries[0]["probe"] != "field" {
 		t.Fatalf("structured field missing: %#v", stdoutEntries[0])
+	}
+	for _, output := range []string{string(stdout), string(fileContent)} {
+		for _, secret := range []string{"HEADERSECRET", "URLUSERSECRET", "URLPASSWORDSECRET", "URLTOKENSECRET", "NESTEDTOKENSECRET", "ENVSECRET", "INSPECTSECRET", "BACKUPSECRET", "JSONPASSWORDSECRET", "COOKIESECRET", "PANICBEARERSECRET", "BADURLUSERSECRET", "BADURLPASSWORDSECRET", "PARTIALENVSECRET", "DOCKERAUTHSECRET"} {
+			if strings.Contains(output, secret) {
+				t.Fatalf("log output leaked %q: %s", secret, output)
+			}
+		}
+		for _, category := range []string{"example.test", "DNS lookup failed", "daemon TLS handshake failed", "invalid URL escape", "nginx", "daemon:"} {
+			if !strings.Contains(output, category) {
+				t.Fatalf("log output lost diagnostic context %q: %s", category, output)
+			}
+		}
 	}
 	if _, err := os.Stat(secondDir); !os.IsNotExist(err) {
 		t.Fatalf("second Setup unexpectedly changed the pipeline: %v", err)
@@ -243,9 +255,22 @@ func TestLogPipelineHelper(t *testing.T) {
 		if err := Setup(os.Getenv("DOCKERCOPILOT_TEST_SECOND_DIR"), "debug", 7, 1<<20, 2<<20); err != nil {
 			panic(err)
 		}
-		logx.Infow("pipeline-info", logx.Field("probe", "field"))
+		logx.Infow("pipeline-info",
+			logx.Field("probe", "field"),
+			logx.Field("authorization", "Bearer HEADERSECRET"),
+			logx.Field("target", "https://URLUSERSECRET:URLPASSWORDSECRET@example.test/v2?token=URLTOKENSECRET"),
+			logx.Field("cause", errors.New("DNS lookup failed at https://user:pass@example.test/v2?access_token=NESTEDTOKENSECRET")),
+			logx.Field("env", []string{"DB_PASSWORD=ENVSECRET"}),
+			logx.Field("inspect", map[string]any{"container": "INSPECTSECRET"}),
+			logx.Field("backup", map[string]any{"config": "BACKUPSECRET"}),
+			logx.Field("embeddedJson", `{"password":"JSONPASSWORDSECRET"}`),
+			logx.Field("panicText", "panic: Bearer PANICBEARERSECRET"),
+			logx.Field("badURL", `Get "http://BADURLUSERSECRET:BADURLPASSWORDSECRET@example.test/%zz": invalid URL escape`),
+			logx.Field("partialEnv", `daemon: {"Env":["CUSTOM_ENV=PARTIALENVSECRET"],"Image":"nginx"}`),
+			logx.Field("dockerAuth", `DOCKER_AUTH_CONFIG={"auths":{"registry.test":{"auth":"DOCKERAUTHSECRET"}}}`),
+		)
 		logx.Debug("filtered-debug")
-		logx.Error("pipeline-error")
+		logx.ErrorStack("daemon TLS handshake failed; Cookie: session=COOKIESECRET")
 	} else {
 		badDir := filepath.Join(os.Getenv("DOCKERCOPILOT_TEST_ROOT"), "not-a-directory")
 		if err := os.WriteFile(badDir, []byte("file"), 0600); err != nil {
@@ -304,7 +329,7 @@ func parseLogEntries(t *testing.T, content string) []map[string]any {
 		entries = append(entries, entry)
 	}
 	if err := scanner.Err(); err != nil {
-		t.Fatal(fmt.Errorf("scan log lines: %w", err))
+		t.Fatal(err)
 	}
 	return entries
 }

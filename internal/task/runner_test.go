@@ -596,7 +596,7 @@ func TestRunnerReportsFinalPersistenceFailure(t *testing.T) {
 	store := newRunnerMemoryStore()
 	store.saveErr = func(r Record, _ int) error {
 		if r.Status.Terminal() {
-			return errors.New("final disk fault")
+			return errors.New("final disk fault Authorization: Bearer runner-fake-jwt")
 		}
 		return nil
 	}
@@ -618,6 +618,9 @@ func TestRunnerReportsFinalPersistenceFailure(t *testing.T) {
 	}
 	if !strings.Contains(output.String(), "not durably saved") || !strings.Contains(output.String(), id) {
 		t.Fatalf("missing stdout durability warning: %q", output.String())
+	}
+	if strings.Contains(output.String(), "runner-fake-jwt") || !strings.Contains(output.String(), "[REDACTED]") {
+		t.Fatalf("runner output did not redact persistence error: %q", output.String())
 	}
 }
 

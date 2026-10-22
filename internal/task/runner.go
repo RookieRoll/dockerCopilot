@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/onlyLTY/dockerCopilot/internal/observability"
 )
 
 var (
@@ -102,6 +103,9 @@ func NewRunner(store RecordStore, opts RunnerOptions) (*Runner, error) {
 	if opts.Output == nil {
 		opts.Output = os.Stdout
 	}
+	// Runner diagnostics may contain upstream errors. Always sanitize at the
+	// final output boundary, including caller-provided writers.
+	opts.Output = observability.NewRedactingTextWriter(opts.Output)
 	r := &Runner{
 		store: store, maxConcurrent: opts.MaxConcurrent, queueCapacity: opts.QueueCapacity,
 		taskTimeout: opts.TaskTimeout, recoveryTimeout: opts.RecoveryTimeout,
