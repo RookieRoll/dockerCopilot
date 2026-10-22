@@ -52,6 +52,13 @@ func BadRequest(err error) error {
 	return classifiedHTTPError{status: http.StatusBadRequest, code: "INVALID_REQUEST", cause: err}
 }
 
+func Unauthorized(err error) error {
+	if err == nil {
+		err = errors.New("unauthorized")
+	}
+	return classifiedHTTPError{status: http.StatusUnauthorized, code: "UNAUTHORIZED", cause: err}
+}
+
 func ServiceUnavailable(err error) error {
 	if err == nil {
 		err = errors.New("service dependency is unavailable")

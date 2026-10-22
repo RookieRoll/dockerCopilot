@@ -2,14 +2,18 @@ package handler
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"net/url"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/onlyLTY/dockerCopilot/internal/config"
+	"github.com/onlyLTY/dockerCopilot/internal/observability"
 	"github.com/onlyLTY/dockerCopilot/internal/svc"
 	"github.com/zeromicro/go-zero/rest"
 )
@@ -164,6 +168,57 @@ func TestAuthRouteDoesNotRequireJWT(t *testing.T) {
 
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("expected 200 from auth route without JWT, got %d with body %s", resp.StatusCode, string(body))
+	}
+}
+
+func TestAuthWrongSecretReturnsUnauthorizedEnvelope(t *testing.T) {
+	port := getFreePort(t)
+	cfg := config.Config{}
+	cfg.Host = "127.0.0.1"
+	cfg.Port = port
+	cfg.Auth.AccessSecret = "configured-login-secret"
+
+	server := rest.MustNewServer(cfg.RestConf)
+	server.Use(observability.RequestIDMiddleware)
+	RegisterHandlers(server, &svc.ServiceContext{Config: cfg})
+	defer server.Stop()
+
+	go server.Start()
+	waitForServer(t, port)
+
+	const requestID = "d249424d-97d8-437e-9c46-c68eb666d5a6"
+	const submittedSecret = "attacker-supplied-secret-value"
+	form := url.Values{"secretKey": []string{submittedSecret}}
+	req, err := http.NewRequest(http.MethodPost, fmt.Sprintf("http://127.0.0.1:%d/api/auth", port), strings.NewReader(form.Encode()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("X-Request-ID", requestID)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("failed to call auth route: %v", err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("failed to read auth response: %v", err)
+	}
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("wrong secret HTTP status = %d, want 401; body=%s", resp.StatusCode, body)
+	}
+	var envelope observability.HTTPErrorResponse
+	if err := json.Unmarshal(body, &envelope); err != nil {
+		t.Fatalf("decode auth error envelope: %v; body=%s", err, body)
+	}
+	if envelope.Code != http.StatusUnauthorized || envelope.Msg != "无效的secretKey" || envelope.ErrorCode != "UNAUTHORIZED" {
+		t.Fatalf("unexpected auth error envelope: %#v", envelope)
+	}
+	if envelope.RequestID != requestID || resp.Header.Get("X-Request-ID") != requestID {
+		t.Fatalf("auth request ID mismatch: body=%q header=%q", envelope.RequestID, resp.Header.Get("X-Request-ID"))
+	}
+	if strings.Contains(string(body), submittedSecret) {
+		t.Fatalf("auth error response echoed submitted secret: %s", body)
 	}
 }
 

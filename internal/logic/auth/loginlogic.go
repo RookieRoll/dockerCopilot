@@ -3,11 +3,13 @@ package auth
 import (
 	"context"
 	"errors"
+	"time"
+
 	"github.com/golang-jwt/jwt/v4"
+	"github.com/onlyLTY/dockerCopilot/internal/observability"
 	"github.com/onlyLTY/dockerCopilot/internal/svc"
 	"github.com/onlyLTY/dockerCopilot/internal/types"
 	"github.com/zeromicro/go-zero/core/logx"
-	"time"
 )
 
 type LoginLogic struct {
@@ -36,7 +38,7 @@ func (l *LoginLogic) Login(req *types.LoginReq) (resp *types.Resp, err error) {
 		resp.Code = 401
 		resp.Msg = "无效的secretKey"
 		resp.Data = JwtResponse{Jwt: ""}
-		return resp, errors.New("无效的secretKey")
+		return resp, observability.Unauthorized(errors.New("无效的secretKey"))
 	}
 	jwtToken, err := l.getJwtToken(l.secret,
 		time.Now().Unix(),
