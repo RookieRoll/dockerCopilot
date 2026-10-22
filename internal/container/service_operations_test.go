@@ -31,7 +31,20 @@ func newOperationTestService(t *testing.T, handler http.HandlerFunc) *Service {
 
 func writeInspectedContainer(w http.ResponseWriter) {
 	w.Header().Set("Content-Type", "application/json")
-	fmt.Fprint(w, `{"Id":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","Name":"/web","Config":{"Image":"old:image"},"HostConfig":{},"NetworkSettings":{"Networks":{}}}`)
+	fmt.Fprint(w, `{"Id":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","Name":"/web","State":{"Running":true},"Config":{"Image":"old:image"},"HostConfig":{},"NetworkSettings":{"Networks":{}}}`)
+}
+
+func testUpdateCallbacks(onCreated func(string) error) UpdateCallbacks {
+	return UpdateCallbacks{
+		SaveSnapshot: func(snapshot []byte) error {
+			if len(snapshot) == 0 {
+				return errors.New("empty snapshot")
+			}
+			return nil
+		},
+		Checkpoint: func(UpdateCheckpoint) error { return nil },
+		OnCreated:  onCreated,
+	}
 }
 
 func TestBasicMutationsShareIDAndNameLeaseWhileReadOnlyListContinues(t *testing.T) {
@@ -133,6 +146,9 @@ func TestUpdateAddsNewContainerIDAliasBeforeStartingIt(t *testing.T) {
 		case r.Method == http.MethodPost && r.URL.Path == "/v1.45/images/create":
 			w.Header().Set("Content-Type", "application/json")
 			fmt.Fprintln(w, `{"status":"Downloaded newer image"}`)
+		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/v1.45/images/") && strings.HasSuffix(r.URL.Path, "/json"):
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprint(w, `{"Id":"sha256:resolved-image"}`)
 		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/stop"):
 			w.WriteHeader(http.StatusNoContent)
 		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/rename"):
@@ -154,10 +170,10 @@ func TestUpdateAddsNewContainerIDAliasBeforeStartingIt(t *testing.T) {
 	if err := lease.Confirm(); err != nil {
 		t.Fatal(err)
 	}
-	if err := service.UpdateWithCallbacks(context.Background(), "short-id", "web", "nginx:latest", false, "task-owner", func(newID string) error {
+	if err := service.UpdateWithOptions(context.Background(), "short-id", "web", "nginx:latest", false, "task-owner", testUpdateCallbacks(func(newID string) error {
 		checkpointedID = newID
 		return nil
-	}); err != nil {
+	})); err != nil {
 		t.Fatal(err)
 	}
 	if !startSawAlias {
@@ -185,6 +201,9 @@ func TestUpdateCallsCreatedCheckpointEvenWhenNewIDAliasFails(t *testing.T) {
 		case r.Method == http.MethodPost && r.URL.Path == "/v1.45/images/create":
 			w.Header().Set("Content-Type", "application/json")
 			fmt.Fprintln(w, `{"status":"Downloaded newer image"}`)
+		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/v1.45/images/") && strings.HasSuffix(r.URL.Path, "/json"):
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprint(w, `{"Id":"sha256:resolved-image"}`)
 		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/stop"):
 			w.WriteHeader(http.StatusNoContent)
 		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/rename"):
@@ -214,10 +233,10 @@ func TestUpdateCallsCreatedCheckpointEvenWhenNewIDAliasFails(t *testing.T) {
 		t.Fatal(err)
 	}
 	createdID := ""
-	err = service.UpdateWithCallbacks(context.Background(), "short-id", "web", "nginx:latest", false, "task-owner", func(newID string) error {
+	err = service.UpdateWithOptions(context.Background(), "short-id", "web", "nginx:latest", false, "task-owner", testUpdateCallbacks(func(newID string) error {
 		createdID = newID
 		return nil
-	})
+	}))
 	var conflict *operation.ConflictError
 	if !errors.As(err, &conflict) || createdID != "colliding-new-id" {
 		t.Fatalf("created fact was lost after alias conflict: id=%q err=%v", createdID, err)

@@ -12,6 +12,7 @@ import (
 	imageService "github.com/onlyLTY/dockerCopilot/internal/image"
 	"github.com/onlyLTY/dockerCopilot/internal/legacyprogress"
 	"github.com/onlyLTY/dockerCopilot/internal/module"
+	"github.com/onlyLTY/dockerCopilot/internal/operation"
 	"github.com/onlyLTY/dockerCopilot/internal/settings"
 	"github.com/onlyLTY/dockerCopilot/internal/task"
 	"github.com/onlyLTY/dockerCopilot/internal/types"
@@ -40,6 +41,7 @@ type ServiceContext struct {
 	TaskStore                  *task.Store
 	TaskRunner                 *task.Runner
 	TaskQuery                  *task.QueryService
+	Mutations                  *operation.MutationGate
 	mu                         sync.Mutex
 }
 
@@ -95,6 +97,7 @@ func newServiceContext(c config.Config, cli *client.Client) (*ServiceContext, er
 		ProgressStore:  progressStore,
 		LegacyProgress: progress,
 		DockerClient:   cli,
+		Mutations:      operation.NewMutationGate(),
 		Containers:     containerService.NewService(cli, updates),
 		Images:         imageService.NewService(cli),
 		Backups:        backupService.NewService(cli, c.BackupDirectory()),
@@ -108,6 +111,20 @@ func newServiceContext(c config.Config, cli *client.Client) (*ServiceContext, er
 	ctx.Backups.SetProgressCallbacks(backupService.ProgressCallbacks{Update: progress.Update, Get: progress.Get})
 	ctx.Containers.SetProgressCallbacks(containerService.ProgressCallbacks{Update: progress.Update, Get: progress.Get})
 	return ctx, nil
+}
+
+// MutationGate returns the process-wide gate used to coordinate writes with a
+// program handoff. Legacy literal contexts get one lazily under the context lock.
+func (ctx *ServiceContext) MutationGate() *operation.MutationGate {
+	if ctx == nil {
+		return nil
+	}
+	ctx.mu.Lock()
+	defer ctx.mu.Unlock()
+	if ctx.Mutations == nil {
+		ctx.Mutations = operation.NewMutationGate()
+	}
+	return ctx.Mutations
 }
 
 func (ctx *ServiceContext) UpdateProgress(taskID string, progress TaskProgress) {

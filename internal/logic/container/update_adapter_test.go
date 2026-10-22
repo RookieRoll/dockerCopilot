@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -34,6 +35,8 @@ func TestUpdateLogicDeduplicatesEquivalentQueuedTaskAndRejectsDifferentOptions(t
 			<-releasePull
 			w.Header().Set("Content-Type", "application/json")
 			fmt.Fprintln(w, `{"status":"pulled"}`)
+		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/v1.45/images/") && strings.HasSuffix(r.URL.Path, "/json"):
+			writeUpdateImageInspect(w)
 		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/stop"):
 			w.WriteHeader(http.StatusNoContent)
 		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/rename"):
@@ -59,8 +62,9 @@ func TestUpdateLogicDeduplicatesEquivalentQueuedTaskAndRejectsDifferentOptions(t
 	firstID := firstResp.Data.(map[string]string)["taskID"]
 	select {
 	case <-pullEntered:
-	case <-time.After(3 * time.Second):
-		t.Fatal("first update never entered image pull")
+	case <-time.After(10 * time.Second):
+		record, getErr := ctx.TaskStore.Get(firstID)
+		t.Fatalf("first update never entered image pull: record=%+v readError=%v", record, getErr)
 	}
 
 	queued := NewUpdateLogic(context.Background(), ctx)
@@ -81,6 +85,25 @@ func TestUpdateLogicDeduplicatesEquivalentQueuedTaskAndRejectsDifferentOptions(t
 	var conflict interface{ HTTPStatus() int }
 	if !errors.As(err, &conflict) || conflict.HTTPStatus() != http.StatusConflict {
 		t.Fatalf("different effective options should conflict with queued owner, got %v", err)
+	}
+}
+
+func TestUpdateLogicDeleteOldRequestOverrideAndGlobalDefault(t *testing.T) {
+	logic := &UpdateLogic{deleteOldDefault: true}
+	if !logic.effectiveDeleteOld(nil) {
+		t.Fatal("omitted request option must use the enabled global default")
+	}
+	no := false
+	if logic.effectiveDeleteOld(&no) {
+		t.Fatal("explicit false request must override the enabled global default")
+	}
+	yes := true
+	if !logic.effectiveDeleteOld(&yes) {
+		t.Fatal("explicit true request must remain enabled")
+	}
+	logic.deleteOldDefault = false
+	if logic.effectiveDeleteOld(nil) {
+		t.Fatal("omitted request option must also respect a disabled global default")
 	}
 }
 
@@ -123,6 +146,8 @@ func TestUpdateLogicPersistsCreatedContainerCheckpoint(t *testing.T) {
 		case r.Method == http.MethodPost && r.URL.Path == "/v1.45/images/create":
 			w.Header().Set("Content-Type", "application/json")
 			fmt.Fprintln(w, `{"status":"pulled"}`)
+		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/v1.45/images/") && strings.HasSuffix(r.URL.Path, "/json"):
+			writeUpdateImageInspect(w)
 		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/stop"), r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/rename"), r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/start"):
 			w.WriteHeader(http.StatusNoContent)
 		case r.Method == http.MethodPost && r.URL.Path == "/v1.45/containers/create":
@@ -147,12 +172,78 @@ func TestUpdateLogicPersistsCreatedContainerCheckpoint(t *testing.T) {
 			if record.NewContainerID != "new-container-id" {
 				t.Fatalf("new container ID was not durably checkpointed: %+v", record)
 			}
+			if record.BackupContainerName == "" {
+				t.Fatalf("planned and completed backup name was not persisted: %+v", record)
+			}
+			if !containsTaskID(record.ImageIDs, "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa") {
+				t.Fatalf("resolved image ID was not persisted: %+v", record.ImageIDs)
+			}
+			if !containsTaskID(record.ImageIDs, "sha256:old-image") {
+				t.Fatalf("previous image ID was not persisted: %+v", record.ImageIDs)
+			}
 			return
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
 	record, _ := ctx.TaskStore.Get(taskID)
 	t.Fatalf("update did not finish with persisted checkpoint: %+v", record)
+}
+
+func TestUpdateStartFailureRetainsSnapshotAndObjectFactsForManualReview(t *testing.T) {
+	var removes atomic.Int32
+	daemon := newUpdateAdapterDaemon(t, func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/v1.45/containers/") && strings.HasSuffix(r.URL.Path, "/json"):
+			writeUpdateInspect(w, "c1")
+		case r.Method == http.MethodPost && r.URL.Path == "/v1.45/images/create":
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprintln(w, `{"status":"pulled"}`)
+		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/v1.45/images/") && strings.HasSuffix(r.URL.Path, "/json"):
+			writeUpdateImageInspect(w)
+		case r.Method == http.MethodPost && (strings.HasSuffix(r.URL.Path, "/stop") || strings.HasSuffix(r.URL.Path, "/rename")):
+			w.WriteHeader(http.StatusNoContent)
+		case r.Method == http.MethodPost && r.URL.Path == "/v1.45/containers/create":
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprint(w, `{"Id":"new-container-id","Warnings":[]}`)
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/start"):
+			http.Error(w, "start failed", http.StatusInternalServerError)
+		case r.Method == http.MethodDelete && strings.HasPrefix(r.URL.Path, "/v1.45/containers/"):
+			removes.Add(1)
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			http.NotFound(w, r)
+		}
+	})
+	defer daemon.Close()
+	ctx := newUpdateAdapterContext(t, daemon.URL, 1, 1)
+	defer func() { ctx.TaskRuntime.Close(); _ = ctx.DockerClient.Close() }()
+	resp, err := NewUpdateLogic(context.Background(), ctx).Update(updateReq("c1", "one", "nginx:latest", true))
+	if err != nil {
+		t.Fatal(err)
+	}
+	taskID := resp.Data.(map[string]string)["taskID"]
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		record, getErr := ctx.TaskStore.Get(taskID)
+		if getErr == nil && record.Status.Terminal() {
+			if record.Status != task.StatusFailed || !record.RequiresAttention || record.Recovery.Status != "unknown" {
+				t.Fatalf("start failure was not kept as an uncertain failed update: %+v", record)
+			}
+			if record.SnapshotRef == "" || record.BackupContainerName == "" || record.NewContainerID != "new-container-id" {
+				t.Fatalf("recovery facts were not persisted before start: %+v", record)
+			}
+			if !containsTaskID(record.ContainerIDs, "c1") || !containsTaskID(record.ContainerIDs, "new-container-id") {
+				t.Fatalf("old/new container identities are missing: %+v", record.ContainerIDs)
+			}
+			if removes.Load() != 0 {
+				t.Fatal("old container was removed after new container failed to start")
+			}
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	record, _ := ctx.TaskStore.Get(taskID)
+	t.Fatalf("failed update did not settle with recovery facts: %+v", record)
 }
 
 func newUpdateAdapterDaemon(t *testing.T, handler http.HandlerFunc) *httptest.Server {
@@ -194,11 +285,26 @@ func writeUpdateInspect(w http.ResponseWriter, id string) {
 		name = "two"
 	}
 	_ = json.NewEncoder(w).Encode(map[string]any{
-		"Id": id, "Name": "/" + name,
+		"Id": id, "Image": "sha256:old-image", "Name": "/" + name,
+		"State":           map[string]any{"Running": true},
 		"Config":          map[string]any{"Image": "old:image", "Hostname": "host"},
 		"HostConfig":      map[string]any{},
 		"NetworkSettings": map[string]any{"Networks": map[string]any{}},
 	})
+}
+
+func containsTaskID(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
+}
+
+func writeUpdateImageInspect(w http.ResponseWriter) {
+	w.Header().Set("Content-Type", "application/json")
+	fmt.Fprint(w, `{"Id":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}`)
 }
 
 func updateReq(id, name, image string, deleteOld bool) *types.ContainerUpdateReq {

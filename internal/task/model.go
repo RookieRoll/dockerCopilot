@@ -73,74 +73,76 @@ type TaskOptions struct {
 }
 
 type Record struct {
-	SchemaVersion     int                    `json:"schemaVersion"`
-	TaskID            string                 `json:"taskID"`
-	Type              string                 `json:"type"`
-	Status            Status                 `json:"status"`
-	Stage             string                 `json:"stage,omitempty"`
-	Percentage        int                    `json:"percentage,omitempty"`
-	Message           string                 `json:"message,omitempty"`
-	Name              string                 `json:"name,omitempty"`
-	DetailMsg         string                 `json:"detailMsg,omitempty"`
-	IsDone            bool                   `json:"isDone,omitempty"`
-	ImageRef          string                 `json:"imageRef,omitempty"`
-	OldContainerID    string                 `json:"oldContainerID,omitempty"`
-	NewContainerID    string                 `json:"newContainerID,omitempty"`
-	CreatedAt         time.Time              `json:"createdAt"`
-	StartedAt         *time.Time             `json:"startedAt,omitempty"`
-	UpdatedAt         time.Time              `json:"updatedAt"`
-	FinishedAt        *time.Time             `json:"finishedAt,omitempty"`
-	ContainerIDs      []string               `json:"containerIDs,omitempty"`
-	ProtectedNames    []string               `json:"protectedNames,omitempty"`
-	ImageIDs          []string               `json:"imageIDs,omitempty"`
-	Options           TaskOptions            `json:"options,omitempty"`
-	RequestID         string                 `json:"requestID,omitempty"`
-	RequiresAttention bool                   `json:"requiresAttention,omitempty"`
-	Recovery          Recovery               `json:"recovery,omitempty"`
-	Items             []Item                 `json:"items,omitempty"`
-	SuccessCount      int                    `json:"successCount"`
-	FailedCount       int                    `json:"failedCount"`
-	SkippedCount      int                    `json:"skippedCount"`
-	ContainerChecks   []ContainerCheck       `json:"containerChecks,omitempty"`
-	PendingInstall    *PendingInstallHandoff `json:"pendingInstall,omitempty"`
-	Error             string                 `json:"error,omitempty"`
-	Warnings          []string               `json:"warnings,omitempty"`
-	SnapshotRef       string                 `json:"snapshotRef,omitempty"`
+	SchemaVersion       int                    `json:"schemaVersion"`
+	TaskID              string                 `json:"taskID"`
+	Type                string                 `json:"type"`
+	Status              Status                 `json:"status"`
+	Stage               string                 `json:"stage,omitempty"`
+	Percentage          int                    `json:"percentage,omitempty"`
+	Message             string                 `json:"message,omitempty"`
+	Name                string                 `json:"name,omitempty"`
+	DetailMsg           string                 `json:"detailMsg,omitempty"`
+	IsDone              bool                   `json:"isDone,omitempty"`
+	ImageRef            string                 `json:"imageRef,omitempty"`
+	OldContainerID      string                 `json:"oldContainerID,omitempty"`
+	NewContainerID      string                 `json:"newContainerID,omitempty"`
+	BackupContainerName string                 `json:"backupContainerName,omitempty"`
+	CreatedAt           time.Time              `json:"createdAt"`
+	StartedAt           *time.Time             `json:"startedAt,omitempty"`
+	UpdatedAt           time.Time              `json:"updatedAt"`
+	FinishedAt          *time.Time             `json:"finishedAt,omitempty"`
+	ContainerIDs        []string               `json:"containerIDs,omitempty"`
+	ProtectedNames      []string               `json:"protectedNames,omitempty"`
+	ImageIDs            []string               `json:"imageIDs,omitempty"`
+	Options             TaskOptions            `json:"options,omitempty"`
+	RequestID           string                 `json:"requestID,omitempty"`
+	RequiresAttention   bool                   `json:"requiresAttention,omitempty"`
+	Recovery            Recovery               `json:"recovery,omitempty"`
+	Items               []Item                 `json:"items,omitempty"`
+	SuccessCount        int                    `json:"successCount"`
+	FailedCount         int                    `json:"failedCount"`
+	SkippedCount        int                    `json:"skippedCount"`
+	ContainerChecks     []ContainerCheck       `json:"containerChecks,omitempty"`
+	PendingInstall      *PendingInstallHandoff `json:"pendingInstall,omitempty"`
+	Error               string                 `json:"error,omitempty"`
+	Warnings            []string               `json:"warnings,omitempty"`
+	SnapshotRef         string                 `json:"snapshotRef,omitempty"`
 }
 
 // PublicRecord is the deliberately restricted task view. It is an explicit
 // projection; private snapshot content and arbitrary record fields never enter it.
 type PublicRecord struct {
-	TaskID            string           `json:"taskID"`
-	Type              string           `json:"type"`
-	Status            Status           `json:"status"`
-	Stage             string           `json:"stage,omitempty"`
-	Percentage        int              `json:"percentage,omitempty"`
-	Message           string           `json:"message,omitempty"`
-	Name              string           `json:"name,omitempty"`
-	DetailMsg         string           `json:"detailMsg,omitempty"`
-	IsDone            bool             `json:"isDone"`
-	ImageRef          string           `json:"imageRef,omitempty"`
-	OldContainerID    string           `json:"oldContainerID,omitempty"`
-	NewContainerID    string           `json:"newContainerID,omitempty"`
-	CreatedAt         time.Time        `json:"createdAt"`
-	StartedAt         *time.Time       `json:"startedAt,omitempty"`
-	UpdatedAt         time.Time        `json:"updatedAt"`
-	FinishedAt        *time.Time       `json:"finishedAt,omitempty"`
-	ContainerIDs      []string         `json:"containerIDs,omitempty"`
-	ProtectedNames    []string         `json:"protectedNames,omitempty"`
-	ImageIDs          []string         `json:"imageIDs,omitempty"`
-	Options           TaskOptions      `json:"options,omitempty"`
-	RequestID         string           `json:"requestID,omitempty"`
-	RequiresAttention bool             `json:"requiresAttention,omitempty"`
-	Recovery          Recovery         `json:"recovery,omitempty"`
-	Items             []PublicItem     `json:"items,omitempty"`
-	SuccessCount      int              `json:"successCount"`
-	FailedCount       int              `json:"failedCount"`
-	SkippedCount      int              `json:"skippedCount"`
-	ContainerChecks   []ContainerCheck `json:"containerChecks,omitempty"`
-	Error             string           `json:"error,omitempty"`
-	Warnings          []string         `json:"warnings,omitempty"`
+	TaskID              string           `json:"taskID"`
+	Type                string           `json:"type"`
+	Status              Status           `json:"status"`
+	Stage               string           `json:"stage,omitempty"`
+	Percentage          int              `json:"percentage,omitempty"`
+	Message             string           `json:"message,omitempty"`
+	Name                string           `json:"name,omitempty"`
+	DetailMsg           string           `json:"detailMsg,omitempty"`
+	IsDone              bool             `json:"isDone"`
+	ImageRef            string           `json:"imageRef,omitempty"`
+	OldContainerID      string           `json:"oldContainerID,omitempty"`
+	NewContainerID      string           `json:"newContainerID,omitempty"`
+	BackupContainerName string           `json:"backupContainerName,omitempty"`
+	CreatedAt           time.Time        `json:"createdAt"`
+	StartedAt           *time.Time       `json:"startedAt,omitempty"`
+	UpdatedAt           time.Time        `json:"updatedAt"`
+	FinishedAt          *time.Time       `json:"finishedAt,omitempty"`
+	ContainerIDs        []string         `json:"containerIDs,omitempty"`
+	ProtectedNames      []string         `json:"protectedNames,omitempty"`
+	ImageIDs            []string         `json:"imageIDs,omitempty"`
+	Options             TaskOptions      `json:"options,omitempty"`
+	RequestID           string           `json:"requestID,omitempty"`
+	RequiresAttention   bool             `json:"requiresAttention,omitempty"`
+	Recovery            Recovery         `json:"recovery,omitempty"`
+	Items               []PublicItem     `json:"items,omitempty"`
+	SuccessCount        int              `json:"successCount"`
+	FailedCount         int              `json:"failedCount"`
+	SkippedCount        int              `json:"skippedCount"`
+	ContainerChecks     []ContainerCheck `json:"containerChecks,omitempty"`
+	Error               string           `json:"error,omitempty"`
+	Warnings            []string         `json:"warnings,omitempty"`
 }
 
 type PublicItem struct {
@@ -156,8 +158,8 @@ func Public(r Record) PublicRecord {
 		TaskID: r.TaskID, Type: r.Type, Status: r.Status, Stage: r.Stage,
 		Percentage: r.Percentage, Message: observability.RedactText(r.Message), Name: r.Name, DetailMsg: observability.RedactText(r.DetailMsg),
 		IsDone: r.Status.Terminal(), ImageRef: r.ImageRef, OldContainerID: r.OldContainerID,
-		NewContainerID: r.NewContainerID,
-		CreatedAt:      r.CreatedAt, StartedAt: cloneTime(r.StartedAt), UpdatedAt: r.UpdatedAt,
+		NewContainerID: r.NewContainerID, BackupContainerName: r.BackupContainerName,
+		CreatedAt: r.CreatedAt, StartedAt: cloneTime(r.StartedAt), UpdatedAt: r.UpdatedAt,
 		FinishedAt: cloneTime(r.FinishedAt), ContainerIDs: cloneStrings(r.ContainerIDs),
 		ProtectedNames: cloneStrings(r.ProtectedNames), ImageIDs: cloneStrings(r.ImageIDs),
 		Options: cloneOptions(r.Options), RequestID: r.RequestID, RequiresAttention: r.RequiresAttention,
@@ -209,6 +211,7 @@ func cloneRecord(r Record) Record {
 }
 
 var safeID = regexp.MustCompile(`^[0-9a-fA-F-]{36}$`)
+var safeContainerName = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]{0,254}$`)
 
 func (r Record) validate() error {
 	if r.SchemaVersion != SchemaVersion {
@@ -226,6 +229,9 @@ func (r Record) validate() error {
 	}
 	if r.SnapshotRef != "" && r.SnapshotRef != r.TaskID+".snapshot" {
 		return errors.New("invalid snapshot reference")
+	}
+	if r.BackupContainerName != "" && !safeContainerName.MatchString(r.BackupContainerName) {
+		return errors.New("backup container name must be a valid Docker name without a leading slash")
 	}
 	return nil
 }

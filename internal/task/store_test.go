@@ -327,6 +327,22 @@ func TestPublicClonesPointerOptions(t *testing.T) {
 	}
 }
 
+func TestPublicIncludesValidatedBackupContainerName(t *testing.T) {
+	record := sampleRecord()
+	record.BackupContainerName = "copilot-old-42"
+	view := Public(record)
+	if view.BackupContainerName != record.BackupContainerName {
+		t.Fatalf("public backup container name = %q, want %q", view.BackupContainerName, record.BackupContainerName)
+	}
+	if _, err := encodeRecord(record); err != nil {
+		t.Fatalf("valid backup container name rejected: %v", err)
+	}
+	record.BackupContainerName = "/copilot-old-42"
+	if _, err := encodeRecord(record); err == nil {
+		t.Fatal("backup container name with leading slash was accepted")
+	}
+}
+
 func TestStoreRejectsSymlinkRecord(t *testing.T) {
 	s, err := Open(Options{Dir: t.TempDir()})
 	if err != nil {

@@ -8,9 +8,11 @@ import (
 	"errors"
 	"net/http"
 	"strings"
+	"sync"
 
 	"github.com/google/uuid"
 	containerService "github.com/onlyLTY/dockerCopilot/internal/container"
+	"github.com/onlyLTY/dockerCopilot/internal/operation"
 	"github.com/onlyLTY/dockerCopilot/internal/svc"
 	"github.com/onlyLTY/dockerCopilot/internal/task"
 	"github.com/onlyLTY/dockerCopilot/internal/types"
@@ -21,7 +23,9 @@ type UpdateLogic struct {
 	logx.Logger
 	ctx              context.Context
 	taskRunner       *task.Runner
+	taskStore        *task.Store
 	service          *containerService.Service
+	mutationGate     *operation.MutationGate
 	deleteOldDefault bool
 }
 
@@ -30,7 +34,9 @@ func NewUpdateLogic(ctx context.Context, svcCtx *svc.ServiceContext) *UpdateLogi
 		Logger:           logx.WithContext(ctx),
 		ctx:              ctx,
 		taskRunner:       svcCtx.TaskRunner,
+		taskStore:        svcCtx.TaskStore,
 		service:          serviceFromContext(svcCtx),
+		mutationGate:     svcCtx.MutationGate(),
 		deleteOldDefault: svcCtx.Config.ResolveDeleteOldContainer(nil),
 	}
 }
@@ -72,10 +78,7 @@ func (l *UpdateLogic) Update(req *types.ContainerUpdateReq) (resp *types.Resp, e
 	if req == nil || req.Id == "" || req.ContainerName == "" || req.ImageNameAndTag == "" {
 		return &types.Resp{Code: http.StatusBadRequest, Msg: "container id, name, and image are required", Data: map[string]any{}}, requestError("container id, name, and image are required")
 	}
-	delOldContainer := l.deleteOldDefault
-	if req.DelOldContainer != nil {
-		delOldContainer = *req.DelOldContainer
-	}
+	delOldContainer := l.effectiveDeleteOld(req.DelOldContainer)
 	deleteOption := delOldContainer
 	imageNameAndTag := req.ImageNameAndTag
 	taskID := uuid.NewString()
@@ -91,29 +94,101 @@ func (l *UpdateLogic) Update(req *types.ContainerUpdateReq) (resp *types.Resp, e
 	if lease == nil {
 		return nil, errors.New("container update reservation did not return a lease")
 	}
-	taskID, err = l.taskRunner.Submit(task.TaskSpec{
+	var gateMu sync.Mutex
+	var gateLease *operation.MutationLease
+	var settled sync.Once
+	acceptedTaskID, err := l.taskRunner.Submit(task.TaskSpec{
 		Record: task.Record{
 			Type: "container-update", Name: req.ContainerName, ImageRef: imageNameAndTag,
 			OldContainerID: req.Id, ContainerIDs: []string{req.Id},
 			TaskID: taskID, Options: task.TaskOptions{Image: imageNameAndTag, DeleteOldContainer: &deleteOption},
 		},
-		OnAccepted: lease.Confirm,
-		OnSettled:  lease.Release,
+		OnAccepted: func() error {
+			gate, acquireErr := l.mutationGate.Acquire(context.Background(), taskID)
+			if acquireErr != nil {
+				return acquireErr
+			}
+			if confirmErr := lease.Confirm(); confirmErr != nil {
+				gate.Release()
+				return confirmErr
+			}
+			gateMu.Lock()
+			gateLease = gate
+			gateMu.Unlock()
+			return nil
+		},
+		OnSettled: func() {
+			settled.Do(func() {
+				gateMu.Lock()
+				gate := gateLease
+				gateLease = nil
+				gateMu.Unlock()
+				if gate != nil {
+					gate.Release()
+				}
+				lease.Release()
+			})
+		},
 		Run: func(ctx context.Context, execution *task.Execution) error {
 			if err := execution.Progress("updating", 0, "容器更新已开始"); err != nil {
 				return err
 			}
-			err := l.service.UpdateWithCallbacks(ctx, req.Id, req.ContainerName, imageNameAndTag, delOldContainer, execution.TaskID(), func(newID string) error {
-				return execution.Critical("created-new-container", func(record *task.Record) {
-					record.NewContainerID = newID
-					record.ContainerIDs = appendTaskIdentity(record.ContainerIDs, req.Id, newID)
-					record.ProtectedNames = appendTaskIdentity(record.ProtectedNames, req.ContainerName)
-				})
+			err := l.service.UpdateWithOptions(ctx, req.Id, req.ContainerName, imageNameAndTag, delOldContainer, execution.TaskID(), containerService.UpdateCallbacks{
+				Progress: execution.Progress,
+				SaveSnapshot: func(snapshot []byte) error {
+					if l.taskStore == nil {
+						return errors.New("private task snapshot store is unavailable")
+					}
+					return l.taskStore.SaveSnapshot(execution.TaskID(), snapshot)
+				},
+				Checkpoint: func(checkpoint containerService.UpdateCheckpoint) error {
+					return execution.Critical(checkpoint.Stage, func(record *task.Record) {
+						if checkpoint.SnapshotRef != "" {
+							record.SnapshotRef = checkpoint.SnapshotRef
+						}
+						if checkpoint.OldContainerID != "" {
+							record.OldContainerID = checkpoint.OldContainerID
+							record.ContainerIDs = appendTaskIdentity(record.ContainerIDs, checkpoint.OldContainerID)
+						}
+						if checkpoint.ResolvedImageID != "" {
+							record.ImageIDs = appendTaskIdentity(record.ImageIDs, checkpoint.ResolvedImageID)
+						}
+						if checkpoint.PreviousImageID != "" {
+							record.ImageIDs = appendTaskIdentity(record.ImageIDs, checkpoint.PreviousImageID)
+						}
+						if checkpoint.BackupName != "" {
+							record.BackupContainerName = checkpoint.BackupName
+						}
+						record.ProtectedNames = appendTaskIdentity(record.ProtectedNames, req.ContainerName)
+					})
+				},
+				OnCreated: func(newID string) error {
+					return execution.Critical("created-new-container", func(record *task.Record) {
+						record.NewContainerID = newID
+						record.ContainerIDs = appendTaskIdentity(record.ContainerIDs, req.Id, newID)
+						record.ProtectedNames = appendTaskIdentity(record.ProtectedNames, req.ContainerName)
+					})
+				},
 			})
 			if err != nil {
 				return err
 			}
 			return execution.Progress("completed", 100, "容器更新完成")
+		},
+		Recover: func(_ context.Context, cause error) (task.Recovery, error) {
+			if l.taskStore == nil {
+				return task.Recovery{Status: "unknown", Detail: "更新任务存储不可用；无法核对持久化阶段"}, errors.New("task store unavailable during update recovery")
+			}
+			current, getErr := l.taskStore.Get(taskID)
+			if getErr != nil {
+				return task.Recovery{Status: "unknown", Detail: "更新停止后的Docker状态未知；请检查任务快照、旧容器和新容器"}, getErr
+			}
+			switch current.Stage {
+			case "preflight", "snapshot", "snapshot-saved", "pulling-image", "resolving-image", "image-resolved":
+				return task.Recovery{Status: "not-needed"}, nil
+			default:
+				return task.Recovery{Status: "unknown", Detail: "更新可能已停止、改名或创建容器；本阶段未执行自动恢复，请核对私有快照及旧/新容器后人工处理"}, nil
+			}
 		},
 	})
 	if err != nil {
@@ -123,8 +198,15 @@ func (l *UpdateLogic) Update(req *types.ContainerUpdateReq) (resp *types.Resp, e
 	}
 	resp.Code = 200
 	resp.Msg = "success"
-	resp.Data = map[string]string{"taskID": taskID}
+	resp.Data = map[string]string{"taskID": acceptedTaskID}
 	return resp, nil
+}
+
+func (l *UpdateLogic) effectiveDeleteOld(requestValue *bool) bool {
+	if requestValue != nil {
+		return *requestValue
+	}
+	return l.deleteOldDefault
 }
 
 func appendTaskIdentity(existing []string, values ...string) []string {
