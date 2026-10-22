@@ -5,17 +5,15 @@
 
 # 介绍
 
-一个主打便捷的docker容器管理工具，现在已经支持所有平台。
-已经实现：
-1. 一键更新容器
-2. 指定镜像和tag更新
-3. 启动、停止、重启容器
-4. 重命名容器
-5. 删除无TAG镜像
-6. 删除未使用镜像
-7. 更新进度查看
-8. 备份容器设置
-9. 恢复容器设置
+一个面向 Docker Engine 的单主机容器管理工具。服务提供容器生命周期与镜像管理、容器更新、备份恢复、端口映射和图标管理，并以持久任务记录展示异步操作进度与结果。
+
+已实现的主要功能：
+
+1. 更新容器或指定镜像与 tag，并查看任务进度和结果。
+2. 启动、停止、重启、重命名容器及查看端口映射。
+3. 查看镜像、检查更新、删除未使用镜像，并按策略清理旧镜像。
+4. 导出 JSON/Compose 配置备份并恢复容器配置；备份不包含挂载卷数据，恢复不会自动启动容器。
+5. 管理自定义图标、查看任务状态，并在页面刷新或服务重启后查询已接受的任务。
 
 ## 使用
 
@@ -42,9 +40,9 @@ services:
 
 ## 服务配置
 
-服务默认读取 `etc/dockerCopilot.yaml`。集中配置预设任务记录目录为 `/data/tasks`、并发上限为 2、队列容量为 100、更新/恢复期限为 30 分钟、终态记录保留 7 天且最多 1000 条。健康检查等待、持续运行观察和恢复预算分别预设为 120 秒、10 秒和 2 分钟；任务执行器和这些行为由后续任务接入。
+服务默认读取 `etc/dockerCopilot.yaml`。集中配置预设任务记录目录为 `/data/tasks`、并发上限为 2、队列容量为 100、更新/恢复期限为 30 分钟、终态记录保留 7 天且最多 1000 条。健康检查等待、持续运行观察和恢复预算分别预设为 120 秒、10 秒和 2 分钟；任务记录、队列、恢复和排空行为由服务启动时统一组装。
 
-日志配置预设写入 `/data/logs`、级别为 `info`、保留 7 天，单文件与目录容量上限分别为 20 MiB 和 200 MiB；轮转和容量清理由后续日志任务接入。备份默认写入 `/data/backups`，端口覆盖配置默认写入 `/data/config/container-port-overrides.json`。在线更新源默认为 `RookieRoll/dockerCopilot`。旧的 `BACKUP_DIR`、`DelOldContainer`、`githubProxy` 和 `CONTAINER_PORT_OVERRIDES_PATH` 环境变量继续生效；对应环境变量优先于 YAML。`DelOldContainer` 接受 `true` 或 `false`，单次更新请求显式提供 `delOldContainer` 时优先使用请求值。
+日志配置预设写入 `/data/logs`、级别为 `info`、保留 7 天，单文件与目录容量上限分别为 20 MiB 和 200 MiB；日志按日和文件大小轮转，并在写入时清理过期文件及控制总容量。文件日志不可用时保留标准输出并降级告警。备份默认写入 `/data/backups`，端口覆盖配置默认写入 `/data/config/container-port-overrides.json`。在线更新源默认为 `RookieRoll/dockerCopilot`。旧的 `BACKUP_DIR`、`DelOldContainer`、`githubProxy` 和 `CONTAINER_PORT_OVERRIDES_PATH` 环境变量继续生效；对应环境变量优先于 YAML。`DelOldContainer` 接受 `true` 或 `false`，单次更新请求显式提供 `delOldContainer` 时优先使用请求值。
 
 JSON 与 Compose 备份保存容器配置（包括环境变量、挂载定义和网络配置），不复制挂载卷中的文件或应用数据；恢复会按备份配置创建容器，但不会自动启动。备份文件使用限制性权限保存，请按敏感配置数据管理。
 
@@ -81,11 +79,11 @@ Docker:
   PortOverridesPath: /data/config/container-port-overrides.json
 ```
 
-本任务集中提供配置加载、默认值和启动校验；任务运行器、日志轮转/容量限制以及健康检查等待会由后续功能接入。
+配置加载、默认值和启动校验通过后，服务会组装任务运行器、日志轮转和容器更新健康验证等运行时组件。
 
 ## 开发环境
 
-go版本：1.23+
+Go 最低版本以 `go.mod` 为准，当前为 1.24；本次验收使用 Go 1.27.2。
 
 前端源码位于 `frontend/`，生产构建产物输出到 `frontend/dist/`，发布流程会将其放入根目录的 `front/` 后由 Go 服务嵌入。
 
@@ -112,3 +110,9 @@ Copy-Item -Path .\frontend\dist\* -Destination .\front\ -Recurse -Force
 go test ./...
 ```
 
+
+## 架构与排障文档
+
+- [架构验收与验证边界](docs/architecture-validation.md)
+- [旧接口和文件兼容矩阵](docs/compatibility-baseline.md)
+- [任务排障](docs/task-troubleshooting.md)与[诊断日志](docs/logging.md)

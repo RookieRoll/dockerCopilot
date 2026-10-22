@@ -15,7 +15,7 @@
 | 相关业务包 race | 下述 11 包及根包、HTTP 日志回归 | 全部通过 |
 | 启动脚本 | `sh -n start.sh`、`sh -n scripts/test-start.sh`、`sh scripts/test-start.sh` | 通过；MINGW 跳过 POSIX SIGKILL 用例 |
 | Linux amd64 / arm64 | `CGO_ENABLED=0` 交叉构建、ELF 架构与本地包校验 | 构建、ELF 架构、唯一根条目和 SHA256 均通过 |
-| 格式、关系图和规格 | 改动文件 gofmt、`git diff --check`、`graphify update .`、OpenSpec strict | 收尾检查在 10.3 完成后记录 |
+| 格式、关系图和规格 | 改动文件 gofmt、`git diff --check`、`graphify update .`、OpenSpec strict | 全部通过 |
 
 race 覆盖：`internal/task`、`container`、`image`、`settings`、`operation`、`svc`、`updater`、`logic/container`、`logic/image`、`logic/version`、`observability`。分别运行：
 

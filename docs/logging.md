@@ -26,3 +26,5 @@ go test .
 任务接受、执行开始、阶段变化、恢复尝试和恢复结果、终态均以结构化事件关联同一 taskId 和提交 requestId。适用字段包含 operation、stage、containerId/name、imageRef/imageId、durationMs、result、errorCode 和经脱敏的原始错误。短容器修改也记录请求标识、目标、结果与耗时；错误展开有界的 cause 链后脱敏，页面仍显示简明错误。
 
 默认 INFO 仅记录阶段及结果。镜像拉取细节使用 DEBUG，每个任务最多每秒一条；启用配置 Logs.Level=debug 后可查看节流后的进度，仍不记录请求体、环境变量或完整 inspect。成功的任务轮询不产生重复错误日志。失败和恢复失败使用 ERROR；清理警告、状态未知和中断使用 WARN。go-zero 没有独立 WARN 输出接口，WARN 事件的传输 level 为 info，结构化 severity 为 WARN；检索时以 severity 字段为准。
+
+同步修改的 HTTP 摘要使用 event=http.mutation_result，包含 requestId、method、不含 query 的 path、status、result 和 durationMs；覆盖镜像删除、端口/图标保存、备份文件删除等修改，以及两个旧 GET 导出入口。普通 GET 轮询直接旁路，不包装输出或记录成功摘要。HTTP 错误仍记录相同 requestId 和脱敏原因，便于从页面标识定位短操作。
