@@ -133,11 +133,16 @@ func WriteBadRequest(w http.ResponseWriter, r *http.Request, err error) {
 // response, and normalizes the request ID even when auth runs before the
 // request-ID middleware.
 func WriteUnauthorized(w http.ResponseWriter, r *http.Request) {
-	var headerValue string
+	id := ""
 	if r != nil {
-		headerValue = r.Header.Get("X-Request-ID")
+		id = requestIDFromContext(r.Context())
+		if id == "" {
+			id = NormalizeRequestID(r.Header.Get("X-Request-ID"))
+		}
 	}
-	id := NormalizeRequestID(headerValue)
+	if id == "" {
+		id = NormalizeRequestID("")
+	}
 	w.Header().Set("X-Request-ID", id)
 	writeJSON(w, http.StatusUnauthorized, HTTPErrorResponse{
 		Code: http.StatusUnauthorized, Msg: "未授权", Data: map[string]any{},

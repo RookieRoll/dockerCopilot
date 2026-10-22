@@ -208,6 +208,9 @@ func (s *Store) List() ([]Record, error) {
 	if err := s.ready(); err != nil {
 		return nil, err
 	}
+	if err := s.ensureNoQuarantinedRecords(); err != nil {
+		return nil, err
+	}
 	entries, err := os.ReadDir(s.dir)
 	if err != nil {
 		return nil, err
@@ -220,13 +223,12 @@ func (s *Store) List() ([]Record, error) {
 		}
 		id := strings.TrimSuffix(name, ".json")
 		if !validTaskID(id) {
-			s.warnf("ignoring task record with invalid filename %q", name)
-			continue
+			return nil, fmt.Errorf("invalid task record filename %q", name)
 		}
 		r, err := s.readRecord(id)
 		if err != nil {
 			s.warnf("cannot read task record %s: %v", id, err)
-			continue
+			return nil, fmt.Errorf("cannot read task record %s: %w", id, err)
 		}
 		records = append(records, r)
 	}
@@ -246,6 +248,9 @@ func (s *Store) ProtectedImages() ([]ProtectedImage, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err := s.ready(); err != nil {
+		return nil, err
+	}
+	if err := s.ensureNoQuarantinedRecords(); err != nil {
 		return nil, err
 	}
 	entries, err := os.ReadDir(s.dir)
@@ -301,6 +306,32 @@ func (s *Store) ProtectedImages() ([]ProtectedImage, error) {
 		return result[i].TaskID < result[j].TaskID
 	})
 	return result, nil
+}
+
+// ensureNoQuarantinedRecords prevents callers from treating a partial task
+// directory as authoritative after Open has moved an unreadable record aside.
+// Quarantine contents remain durable evidence that task/recovery protections
+// are unknown until an operator resolves the files.
+func (s *Store) ensureNoQuarantinedRecords() error {
+	path := filepath.Join(s.dir, "corrupt")
+	info, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("inspect task corruption quarantine: %w", err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		return errors.New("task corruption quarantine is not a real directory")
+	}
+	entries, err := os.ReadDir(path)
+	if err != nil {
+		return fmt.Errorf("read task corruption quarantine: %w", err)
+	}
+	if len(entries) != 0 {
+		return errors.New("task store has quarantined corrupt records; task protections are unknown until they are manually resolved")
+	}
+	return nil
 }
 
 // ProtectedImageIDs is a convenience projection for callers that only need
@@ -541,14 +572,20 @@ func (s *Store) atomicWrite(path string, data []byte) error {
 	if err = s.dirSync(s.dir); err != nil {
 		if existed {
 			if rollbackErr := s.restoreFile(path, previous); rollbackErr != nil {
-				return errors.Join(err, fmt.Errorf("restore previous task file after directory sync failure: %w", rollbackErr))
+				return &PersistenceOutcomeUncertainError{
+					CommitErr: err, RollbackErr: fmt.Errorf("restore previous task file after directory sync failure: %w", rollbackErr),
+				}
 			}
 		} else {
 			if rollbackErr := s.removePath(path); rollbackErr != nil {
-				return errors.Join(err, fmt.Errorf("remove uncommitted task file after directory sync failure: %w", rollbackErr))
+				return &PersistenceOutcomeUncertainError{
+					CommitErr: err, RollbackErr: fmt.Errorf("remove uncommitted task file after directory sync failure: %w", rollbackErr),
+				}
 			}
 			if rollbackErr := s.dirSync(s.dir); rollbackErr != nil {
-				return errors.Join(err, fmt.Errorf("sync directory after removing uncommitted task file: %w", rollbackErr))
+				return &PersistenceOutcomeUncertainError{
+					CommitErr: err, RollbackErr: fmt.Errorf("sync directory after removing uncommitted task file: %w", rollbackErr),
+				}
 			}
 		}
 		return err

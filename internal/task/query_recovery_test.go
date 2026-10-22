@@ -295,6 +295,59 @@ func TestStartupReconcileInspectionFailureRetainsEvidenceAndAttention(t *testing
 	}
 }
 
+func TestStartupReconcileSettlesBatchItemsWithoutReplay(t *testing.T) {
+	store, err := Open(Options{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	parent := startupRecord("00000000-0000-4000-8000-000000000091", StatusQueued)
+	parent.Type = "container-batch-update"
+	parent.Items = []Item{
+		{ID: "committed-id", Name: "committed", Status: "running", Committed: true, NewContainerID: "replacement-id"},
+		{ID: "uncertain-id", Name: "uncertain", Status: "running", ProtectedNames: []string{"uncertain"}},
+		{ID: "queued-id", Name: "queued", Status: "queued"},
+	}
+	if err := store.Create(parent); err != nil {
+		t.Fatal(err)
+	}
+	parent.Status = StatusRunning
+	if err := store.Save(parent); err != nil {
+		t.Fatal(err)
+	}
+	inspector := &readonlyInspectorFake{observations: map[string]ContainerObservation{
+		"committed-id":   {Name: "committed", State: "running", Running: true},
+		"uncertain-id":   {Name: "uncertain", State: "running", Running: true},
+		"replacement-id": {Name: "committed", State: "running", Running: true},
+	}}
+	reconciler, err := NewStartupReconciler(store, inspector, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reconciler.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.Get(parent.TaskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != StatusInterrupted || got.SuccessCount != 1 || got.FailedCount != 1 || got.SkippedCount != 1 {
+		t.Fatalf("startup did not settle parent/items and recount: %#v", got)
+	}
+	if got.Items[0].Status != "succeeded" || !got.Items[0].Committed || got.Items[0].NewContainerID != "replacement-id" {
+		t.Fatalf("durable committed item fact was lost: %#v", got.Items[0])
+	}
+	if got.Items[1].Status != "failed" || !got.Items[1].RequiresAttention || got.Items[1].Recovery.Status != "unknown" || !containsString(got.ProtectedNames, "uncertain") {
+		t.Fatalf("uncertain running item was not protected: %#v parent protected=%v", got.Items[1], got.ProtectedNames)
+	}
+	if got.Items[2].Status != "skipped" {
+		t.Fatalf("unstarted item was not skipped: %#v", got.Items[2])
+	}
+	if len(inspector.calls) != 3 {
+		t.Fatalf("startup should only inspect known container IDs, calls=%v", inspector.calls)
+	}
+}
+
 func TestStartupReconcileDistinguishesNotFoundAndSurfacesPersistenceFailure(t *testing.T) {
 	store, err := Open(Options{Dir: t.TempDir()})
 	if err != nil {

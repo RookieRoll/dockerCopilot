@@ -385,6 +385,7 @@ func (r *StartupReconciler) Run(ctx context.Context) (StartupReport, error) {
 			}
 		}
 		wasRunning := record.Status == StatusRunning
+		itemUncertain := settleInterruptedStartupItems(&record)
 		record.Status = StatusInterrupted
 		record.IsDone = true
 		finished := r.now().UTC()
@@ -397,6 +398,10 @@ func (r *StartupReconciler) Run(ctx context.Context) (StartupReport, error) {
 		} else {
 			record.Error = "service restarted before the queued task began; the operation was not replayed"
 			record.Recovery = Recovery{Status: "not-needed"}
+			if itemUncertain {
+				record.Recovery = Recovery{Status: "unknown", Detail: "a batch item was running when the service restarted; manual review is required"}
+				record.RequiresAttention = true
+			}
 		}
 		r.inspectRelated(ctx, &record, &report)
 		if err := r.store.Save(record); err != nil {
@@ -405,6 +410,65 @@ func (r *StartupReconciler) Run(ctx context.Context) (StartupReport, error) {
 		report.InterruptedTaskIDs = append(report.InterruptedTaskIDs, record.TaskID)
 	}
 	return report, nil
+}
+
+// settleInterruptedStartupItems preserves durable item outcomes and records
+// uncertainty for work that may have changed Docker before the process exited.
+// Startup reconciliation is read-only; it never retries an item.
+func settleInterruptedStartupItems(record *Record) bool {
+	uncertain := false
+	for index := range record.Items {
+		item := &record.Items[index]
+		if item.Committed && item.RequiresAttention && item.Recovery.Status == "unknown" {
+			// A commit candidate may be visible even though directory durability
+			// and rollback both failed. Keep its outcome unknown after restart.
+			item.Committed = false
+			item.Status = "failed"
+			uncertain = true
+			if item.Name != "" && !containsString(item.ProtectedNames, item.Name) {
+				item.ProtectedNames = append(item.ProtectedNames, item.Name)
+			}
+			for _, name := range item.ProtectedNames {
+				if !containsString(record.ProtectedNames, name) {
+					record.ProtectedNames = append(record.ProtectedNames, name)
+				}
+			}
+			continue
+		}
+		if item.Committed || item.Status == "succeeded" {
+			item.Status = "succeeded"
+			continue
+		}
+		switch item.Status {
+		case "queued":
+			item.Status = "skipped"
+			if item.Error == "" {
+				item.Error = "service restarted before item began; the item was not replayed"
+			}
+		case "running":
+			uncertain = true
+			item.Status = "failed"
+			item.RequiresAttention = true
+			item.Recovery = Recovery{Status: "unknown", Detail: "service restarted while item was running; Docker state was not changed during startup reconciliation"}
+			if item.Error == "" {
+				item.Error = "item outcome is uncertain after service restart"
+			}
+			if item.Name != "" && !containsString(record.ProtectedNames, item.Name) {
+				record.ProtectedNames = append(record.ProtectedNames, item.Name)
+			}
+		}
+	}
+	recountBatchItems(record)
+	return uncertain
+}
+
+func containsString(values []string, target string) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+	return false
 }
 
 func (r *StartupReconciler) verifiedPendingInstall(ctx context.Context, record Record) (bool, string) {

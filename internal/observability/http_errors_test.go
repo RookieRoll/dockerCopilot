@@ -81,3 +81,22 @@ func TestWriteHTTPErrorHandlesNilAndIllegalBusinessCode(t *testing.T) {
 		t.Fatalf("nil error did not produce diagnostic envelope: %#v", got)
 	}
 }
+
+func TestUnauthorizedPreservesMiddlewareCorrelationID(t *testing.T) {
+	var contextID string
+	handler := RequestIDMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		contextID = RequestIDFromContext(r.Context())
+		WriteUnauthorized(w, r)
+	})
+	request := httptest.NewRequest(http.MethodPost, "/protected", nil)
+	request.Header.Set("X-Request-ID", "invalid-id")
+	recorder := httptest.NewRecorder()
+	handler(recorder, request)
+	var got HTTPErrorResponse
+	if err := json.Unmarshal(recorder.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.RequestID != contextID || recorder.Header().Get("X-Request-ID") != contextID {
+		t.Fatalf("authentication response lost middleware ID: context=%q body=%q header=%q", contextID, got.RequestID, recorder.Header().Get("X-Request-ID"))
+	}
+}

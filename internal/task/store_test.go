@@ -517,6 +517,9 @@ func TestStoreAtomicRollbackFailureRetainsBothErrors(t *testing.T) {
 	if !errors.Is(err, commitErr) || !errors.Is(err, rollbackErr) {
 		t.Fatalf("expected commit and rollback errors to be discoverable, got %v", err)
 	}
+	if !IsPersistenceOutcomeUncertain(err) {
+		t.Fatalf("expected a typed uncertain persistence result, got %T: %v", err, err)
+	}
 }
 
 func TestStoreSnapshotIsWriteOnceAndActiveOnly(t *testing.T) {

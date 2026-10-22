@@ -77,6 +77,13 @@ func TestUpdateLogicDeduplicatesEquivalentQueuedTaskAndRejectsDifferentOptions(t
 	if queuedID == firstID {
 		t.Fatal("distinct queued update reused the running task ID")
 	}
+	queuedRecord, err := ctx.TaskStore.Get(queuedID)
+	if err != nil {
+		t.Fatalf("read queued update record: %v", err)
+	}
+	if !containsTaskID(queuedRecord.ImageIDs, "sha256:old-image") {
+		t.Fatalf("queued update did not durably protect its original image before worker execution: %+v", queuedRecord.ImageIDs)
+	}
 
 	duplicateResp, err := NewUpdateLogic(context.Background(), ctx).Update(updateReq("c2", "two", "nginx:stable", false))
 	if err != nil || duplicateResp.Data.(map[string]string)["taskID"] != queuedID {

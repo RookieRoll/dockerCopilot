@@ -317,6 +317,10 @@ func (r *Runner) execute(q queuedTask) {
 		if out.err != nil {
 			cause = errors.Join(cause, out.err)
 		}
+		if e.hasUncertainCommit() {
+			cancel()
+			return
+		}
 		out.err = cause
 		r.runRecoveryAndReconcile(e, q.spec.Recover, cause, out, q.spec.RollbackHandoff)
 		cancel()
@@ -356,6 +360,13 @@ func (r *Runner) finishExecution(e *Execution, out taskOutcome, recoverFn Recove
 			r.runRecoveryAndReconcile(e, recoverFn, cause, out, rollbackHandoff)
 			return
 		}
+	}
+	if e.hasUncertainCommit() {
+		if cause == nil {
+			cause = ErrPersistenceOutcomeUncertain
+		}
+		r.finish(e, StatusFailed, cause, Recovery{Status: "unknown", Detail: "commit persistence and rollback outcome are uncertain; automatic compensation was not attempted"}, true)
+		return
 	}
 	status := StatusSucceeded
 	if cause != nil {
@@ -778,17 +789,18 @@ func timePointer(t time.Time) *time.Time { return &t }
 // Critical must succeed before the callback performs the destructive step it
 // describes. A failed critical write cancels the task context immediately.
 type Execution struct {
-	mu          sync.Mutex
-	store       RecordStore
-	record      Record
-	ctx         context.Context
-	cancel      context.CancelFunc
-	now         func() time.Time
-	report      func(string, ...any)
-	finalized   bool
-	criticalErr error
-	recoveryCtx context.Context
-	committed   bool
+	mu              sync.Mutex
+	store           RecordStore
+	record          Record
+	ctx             context.Context
+	cancel          context.CancelFunc
+	now             func() time.Time
+	report          func(string, ...any)
+	finalized       bool
+	criticalErr     error
+	recoveryCtx     context.Context
+	committed       bool
+	uncertainCommit bool
 }
 
 func (e *Execution) TaskID() string { e.mu.Lock(); defer e.mu.Unlock(); return e.record.TaskID }
@@ -898,11 +910,22 @@ func (e *Execution) CriticalItemCommit(index int, stage string, mutate func(*Rec
 		return errors.New("critical checkpoint cannot change task identity or status")
 	}
 	next.UpdatedAt = e.now().UTC()
-	if err := e.store.Save(next); err != nil {
+	writeNext := cloneRecord(next)
+	if !e.record.Items[index].Committed {
+		writeNext.RequiresAttention = true
+		writeNext.Recovery = Recovery{Status: "unknown", Detail: "commit checkpoint is being persisted; automatic compensation is unsafe until confirmed"}
+		writeNext.Items[index].RequiresAttention = true
+		writeNext.Items[index].Recovery = writeNext.Recovery
+	}
+	if err := e.store.Save(writeNext); err != nil {
 		e.criticalErr = fmt.Errorf("critical task checkpoint %q failed: %w", stage, err)
 		// Keep observations such as the replacement ID, but never promote an
 		// unpersisted commit. A previously durable commit remains true.
 		next.Items[index].Committed = e.record.Items[index].Committed
+		if !e.record.Items[index].Committed && IsPersistenceOutcomeUncertain(err) {
+			e.uncertainCommit = true
+			markUncertainItemCommit(&next, index)
+		}
 		e.record = next
 		if e.report != nil {
 			e.report("task %s critical persistence failure: %v\n", next.TaskID, e.criticalErr)
@@ -911,6 +934,9 @@ func (e *Execution) CriticalItemCommit(index int, stage string, mutate func(*Rec
 		return e.criticalErr
 	}
 	e.record = next
+	if !e.record.Items[index].RequiresAttention && e.record.Items[index].Recovery.Detail == "commit checkpoint is being persisted; automatic compensation is unsafe until confirmed" {
+		e.record.Items[index].Recovery = Recovery{}
+	}
 	if err := taskContextError(e.ctx); err != nil {
 		e.cancel()
 		return err
@@ -940,11 +966,22 @@ func (e *Execution) critical(stage string, mutate func(*Record), commit bool) er
 		return errors.New("critical checkpoint cannot change task identity or status")
 	}
 	next.UpdatedAt = e.now().UTC()
-	if err := e.store.Save(next); err != nil {
+	writeNext := next
+	if commit && !e.committed {
+		writeNext = cloneRecord(next)
+		writeNext.RequiresAttention = true
+		writeNext.Recovery = Recovery{Status: "unknown", Detail: "commit checkpoint is being persisted; automatic compensation is unsafe until confirmed"}
+	}
+	if err := e.store.Save(writeNext); err != nil {
 		e.criticalErr = fmt.Errorf("critical task checkpoint %q failed: %w", stage, err)
 		// Preserve the observed in-memory facts for terminal persistence and
 		// recovery even though this checkpoint was not durable.
 		e.record = next
+		if commit && !e.committed && IsPersistenceOutcomeUncertain(err) {
+			e.uncertainCommit = true
+			e.record.RequiresAttention = true
+			e.record.Recovery = Recovery{Status: "unknown", Detail: "commit persistence and rollback outcome are uncertain; automatic compensation was not attempted"}
+		}
 		if e.report != nil {
 			e.report("task %s critical persistence failure: %v\n", next.TaskID, e.criticalErr)
 		}
@@ -968,6 +1005,33 @@ func (e *Execution) isCommitted() bool {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	return e.committed && e.criticalErr == nil
+}
+
+func (e *Execution) hasUncertainCommit() bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.uncertainCommit
+}
+
+func markUncertainItemCommit(record *Record, index int) {
+	item := &record.Items[index]
+	item.Committed = false
+	item.RequiresAttention = true
+	item.Recovery = Recovery{Status: "unknown", Detail: "commit persistence and rollback outcome are uncertain; automatic compensation was not attempted"}
+	if item.Name != "" {
+		found := false
+		for _, name := range item.ProtectedNames {
+			if name == item.Name {
+				found = true
+				break
+			}
+		}
+		if !found {
+			item.ProtectedNames = append(item.ProtectedNames, item.Name)
+		}
+	}
+	record.RequiresAttention = true
+	record.Recovery = item.Recovery
 }
 
 // MarkPendingInstall durably records the verified handoff facts while the
@@ -1217,6 +1281,11 @@ func (r *Runner) SubmitBatchWithHooks(record Record, operations []BatchOperation
 				return err
 			}
 			out := invokeTask(func(ctx context.Context, e *Execution) error { return operation.Run(ctx, e) }, ctx, e)
+			if e.hasUncertainCommit() {
+				// A commit whose durable outcome is uncertain must not enter the
+				// item's recovery callback or allow later batch items to mutate.
+				return errors.Join(errors.Join(failures...), out.err, e.failure(), ErrPersistenceOutcomeUncertain)
+			}
 			status := "succeeded"
 			detail := ""
 			if out.err != nil {
