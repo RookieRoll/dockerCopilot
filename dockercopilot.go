@@ -29,12 +29,6 @@ var embeddedFront embed.FS
 
 var configFile = flag.String("f", "etc/dockerCopilot.yaml", "the config file")
 
-type UnauthorizedResponse struct {
-	Code int                    `json:"code"`
-	Msg  string                 `json:"msg"`
-	Data map[string]interface{} `json:"data"`
-}
-
 func main() {
 	flag.Parse()
 	c, err := config.LoadFile(*configFile, true)
@@ -48,15 +42,7 @@ func main() {
 		os.Exit(1)
 	}
 	disableDefaultRequestLogging(&c)
-	server := rest.MustNewServer(c.RestConf, rest.WithCors("*"), rest.WithUnauthorizedCallback(
-		func(w http.ResponseWriter, r *http.Request, err error) {
-			response := UnauthorizedResponse{
-				Code: http.StatusUnauthorized, // 401
-				Msg:  "未授权",
-				Data: map[string]interface{}{},
-			}
-			httpx.WriteJson(w, http.StatusUnauthorized, response)
-		}))
+	server := rest.MustNewServer(c.RestConf, rest.WithCors("*"), rest.WithUnauthorizedCallback(unauthorizedCallback))
 	defer server.Stop()
 	ctx, err := svc.NewServiceContextChecked(c)
 	if err != nil {
@@ -153,6 +139,10 @@ export const customImageLogos = {
 		<-serverDone
 	case <-serverDone:
 	}
+}
+
+func unauthorizedCallback(w http.ResponseWriter, r *http.Request, _ error) {
+	observability.WriteUnauthorized(w, r)
 }
 
 // disableDefaultRequestLogging leaves HTTP diagnostics to the redacted

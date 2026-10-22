@@ -128,6 +128,23 @@ func WriteBadRequest(w http.ResponseWriter, r *http.Request, err error) {
 	WriteHTTPError(w, r, BadRequest(err))
 }
 
+// WriteUnauthorized writes the fixed authentication failure envelope. It
+// deliberately ignores parser details so credentials never appear in the
+// response, and normalizes the request ID even when auth runs before the
+// request-ID middleware.
+func WriteUnauthorized(w http.ResponseWriter, r *http.Request) {
+	var headerValue string
+	if r != nil {
+		headerValue = r.Header.Get("X-Request-ID")
+	}
+	id := NormalizeRequestID(headerValue)
+	w.Header().Set("X-Request-ID", id)
+	writeJSON(w, http.StatusUnauthorized, HTTPErrorResponse{
+		Code: http.StatusUnauthorized, Msg: "未授权", Data: map[string]any{},
+		ErrorCode: "UNAUTHORIZED", RequestID: id,
+	})
+}
+
 // HTTPError returns a legal HTTP status and compatible error envelope. It is
 // also used by go-zero's process-wide error callback, which has no Request.
 func HTTPError(err error, r *http.Request) (int, HTTPErrorResponse) {

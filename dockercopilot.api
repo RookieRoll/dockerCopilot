@@ -94,6 +94,16 @@ type ContainerUpdateReq {
 	DelOldContainer *bool  `form:"delOldContainer,optional"`
 }
 
+type ContainerBatchReq {
+	Action             string   `json:"action"`
+	ContainerIDs       []string `json:"containerIDs"`
+	DeleteOldContainer *bool    `json:"deleteOldContainer,optional"`
+}
+
+type ImageCleanupReq {
+	Policy string `json:"policy"`
+}
+
 type ConfiguredPort {
 	Port     int    `json:"port"`
 	Protocol string `json:"protocol"`
@@ -165,6 +175,9 @@ service dockerCopilot {
 	@handler update
 	post /container/:id/update (ContainerUpdateReq) returns (Resp)
 
+	@handler batch
+	post /containers/batch (ContainerBatchReq) returns (Resp)
+
 	@handler configuredPorts
 	put /container/:id/configured-ports (ContainerConfiguredPortsReq) returns (Resp)
 
@@ -198,6 +211,9 @@ service dockerCopilot {
 service dockerCopilot {
 	@handler imagesList
 	get /images returns (Resp)
+
+	@handler cleanup
+	post /images/cleanup (ImageCleanupReq) returns (Resp)
 
 	@handler remove
 	delete /image/:id (RemoveImageReq) returns (Resp)

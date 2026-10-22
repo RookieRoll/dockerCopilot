@@ -15,16 +15,13 @@ import (
 	"github.com/onlyLTY/dockerCopilot/internal/operation"
 	"github.com/onlyLTY/dockerCopilot/internal/svc"
 	"github.com/onlyLTY/dockerCopilot/internal/task"
+	"github.com/onlyLTY/dockerCopilot/internal/types"
 	"github.com/zeromicro/go-zero/core/logx"
 )
 
 const MaxContainerBatchTargets = 100
 
-type BatchRequest struct {
-	Action             string   `json:"action"`
-	ContainerIDs       []string `json:"containerIDs"`
-	DeleteOldContainer *bool    `json:"deleteOldContainer,optional"`
-}
+type BatchRequest = types.ContainerBatchReq
 
 type BatchLogic struct {
 	logx.Logger
