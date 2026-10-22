@@ -42,7 +42,7 @@ type classifiedHTTPError struct {
 
 func (e classifiedHTTPError) Error() string     { return e.cause.Error() }
 func (e classifiedHTTPError) Unwrap() error     { return e.cause }
-func (e classifiedHTTPError) HTTPStatus() int   { return e.status }
+func (e classifiedHTTPError) HTTPStatus() int  { return e.status }
 func (e classifiedHTTPError) ErrorCode() string { return e.code }
 
 func BadRequest(err error) error {

@@ -48,7 +48,9 @@ services:
 
 JSON 与 Compose 备份保存容器配置（包括环境变量、挂载定义和网络配置），不复制挂载卷中的文件或应用数据；恢复会按备份配置创建容器，但不会自动启动。备份文件使用限制性权限保存，请按敏感配置数据管理。
 
-任务、日志和更新配置也可使用 `DOCKERCOPILOT_TASK_*`、`DOCKERCOPILOT_LOG_*`、`DOCKERCOPILOT_UPDATE_REPOSITORY` 与 `DOCKERCOPILOT_GITHUB_PROXY` 覆盖。任务超时、保留期和恢复/健康检查时间使用 Go duration 格式，例如 `30m`、`168h` 和 `120s`。更新仓库使用 `owner/repository` 格式；代理地址必须是没有凭据、查询参数或片段的 HTTP(S) URL。
+任务、日志和更新配置也可使用 `DOCKERCOPILOT_TASK_*`、`DOCKERCOPILOT_LOG_*`、`DOCKERCOPILOT_UPDATE_REPOSITORY` 与 `DOCKERCOPILOT_GITHUB_PROXY` 覆盖。`WORKDIR` 可设置在线程序更新目录；未设置时使用当前可执行文件所在目录。`DOCKERCOPILOT_SELF_CONTAINER` 可显式指定运行服务的容器名或 ID；未设置时仅当容器默认 hostname 是至少 12 位十六进制 ID 时尝试通过 Docker inspect 核验。任务超时、保留期和恢复/健康检查时间使用 Go duration 格式，例如 `30m`、`168h` 和 `120s`。更新仓库使用 `owner/repository` 格式；代理地址必须是没有凭据、查询参数或片段的 HTTP(S) URL。
+
+在线程序更新只支持能通过 Docker inspect 确认自身容器的部署，并要求容器重启策略为 `always` 或 `unless-stopped`、root filesystem 可写、安装目录与运行程序目录一致且可写。无法确认这些条件时更新任务会拒绝 handoff；普通容器管理仍可使用。使用自定义 hostname 的部署请显式设置 `DOCKERCOPILOT_SELF_CONTAINER`，例如 compose 中的固定 `container_name`。`WORKDIR` 应与挂载并运行 `start.sh` 的安装目录一致。
 
 关键默认值可在 YAML 中显式调整：
 

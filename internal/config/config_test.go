@@ -118,6 +118,39 @@ func TestExplicitEmptyCanonicalProxyClearsLegacyProxy(t *testing.T) {
 	}
 }
 
+func TestProgramWorkDirAndSelfContainerEnvironmentAreCentralized(t *testing.T) {
+	filename := filepath.Join(t.TempDir(), "config.yaml")
+	content := []byte("Name: dockerCopilot\nHost: 0.0.0.0\nPort: 12712\nTimeout: 100000000000000\nLog:\n  Encoding: plain\nAuth:\n  AccessSecret: test-secret\n  AccessExpire: 7257600\nUpdates:\n  WorkDir: /yaml/install\nDocker:\n  SelfContainer: named-container\n")
+	if err := os.WriteFile(filename, content, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	envWorkDir := filepath.Join(t.TempDir(), "env-install")
+	t.Setenv("WORKDIR", envWorkDir)
+	t.Setenv("DOCKERCOPILOT_SELF_CONTAINER", "copilot-prod")
+	loaded, err := LoadFile(filename, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.UpdateSource().WorkDir != envWorkDir || loaded.Docker.SelfContainer != "copilot-prod" {
+		t.Fatalf("environment values did not override YAML: updates=%+v docker=%+v", loaded.Updates, loaded.Docker)
+	}
+	resolved, err := loaded.ProgramWorkDir()
+	if err != nil || resolved != envWorkDir {
+		t.Fatalf("ProgramWorkDir=%q err=%v", resolved, err)
+	}
+
+	loaded.Updates.WorkDir = ""
+	resolved, err = loaded.ProgramWorkDir()
+	executable, exeErr := os.Executable()
+	if err != nil || exeErr != nil || resolved != filepath.Dir(executable) {
+		t.Fatalf("executable fallback workdir=%q err=%v exeErr=%v", resolved, err, exeErr)
+	}
+	loaded.Docker.SelfContainer = "../another-container"
+	if err := loaded.Validate(); err == nil {
+		t.Fatal("expected unsafe self-container reference to fail validation")
+	}
+}
+
 func TestValidateRejectsInvalidExplicitOverrides(t *testing.T) {
 	cfg := Config{}
 	cfg.ApplyDefaults()

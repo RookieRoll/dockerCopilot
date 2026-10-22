@@ -41,6 +41,14 @@ type TaskSpec struct {
 	Recover    RecoveryFunc
 	OnAccepted func() error
 	OnSettled  func()
+	// OnHandoff runs only after a complete pending-install marker is durably
+	// saved. A successful callback requests controlled process shutdown; the
+	// task remains running until a new process confirms readiness.
+	OnHandoff func(Record) error
+	// RollbackHandoff removes any candidate file created for this task when a
+	// marker, notification, task, or deadline failure prevents the handoff.
+	// It runs with the independent recovery deadline after Run has returned.
+	RollbackHandoff func(context.Context, Record) error
 }
 
 type RunnerOptions struct {
@@ -250,7 +258,7 @@ func (r *Runner) execute(q queuedTask) {
 		} else if ctx.Err() != nil {
 			out.err = ctx.Err()
 		}
-		r.finishExecution(e, out, q.spec.Recover, ctx.Err() != nil || out.panicked)
+		r.finishExecution(e, out, q.spec.Recover, ctx.Err() != nil || out.panicked, q.spec.OnHandoff, q.spec.RollbackHandoff)
 		cancel()
 	case <-ctx.Done():
 		cause := e.failure()
@@ -258,24 +266,65 @@ func (r *Runner) execute(q queuedTask) {
 			cause = ctx.Err()
 		}
 		rec := e.current()
+		// A critical marker write can itself fail while leaving the in-memory
+		// stage at install-handoff. Use a distinct failed stage so the final
+		// result can still be durably stored alongside the cleanup evidence.
+		if rec.PendingInstall != nil {
+			e.mu.Lock()
+			e.record.Stage = "handoff-failed"
+			e.record.Message = "程序交接超时，正在等待任务操作退出后清理"
+			e.mu.Unlock()
+			rec = e.current()
+		}
 		rec.Recovery = Recovery{Status: "unknown", Detail: "task stopped at its deadline or critical persistence failed; recovery is pending"}
 		r.finish(e, StatusFailed, cause, rec.Recovery, true)
-		// Keep this worker slot until Run actually exits. Recovery must never
-		// race a callback that may still be mutating Docker state.
+		// Run may ignore its deadline and still be mutating Docker state or
+		// placing the candidate. Do not roll back or clear its facts until it has
+		// really returned. The failed terminal result is durable immediately,
+		// while its pending-install marker preserves the cleanup facts.
 		out := <-done
 		if criticalErr := e.failure(); criticalErr != nil {
-			cause = criticalErr
-			out.err = criticalErr
+			cause = errors.Join(cause, criticalErr)
 		}
-		r.runRecoveryAndReconcile(e, q.spec.Recover, cause, out)
+		if out.err != nil {
+			cause = errors.Join(cause, out.err)
+		}
+		out.err = cause
+		r.runRecoveryAndReconcile(e, q.spec.Recover, cause, out, q.spec.RollbackHandoff)
 		cancel()
 	}
 }
 
-func (r *Runner) finishExecution(e *Execution, out taskOutcome, recoverFn RecoveryFunc, needsRecovery bool) {
+func (r *Runner) finishExecution(e *Execution, out taskOutcome, recoverFn RecoveryFunc, needsRecovery bool, onHandoff func(Record) error, rollbackHandoff func(context.Context, Record) error) {
 	cause := out.err
 	if cause == nil && out.panicked {
 		cause = errors.New("task panicked")
+	}
+	if e.hasPendingInstall() {
+		pendingHandoffFailed := cause != nil || needsRecovery
+		if cause == nil && !needsRecovery {
+			if onHandoff == nil {
+				cause = errors.New("pending program install has no handoff callback")
+				pendingHandoffFailed = true
+			} else if err := invokeHandoff(onHandoff, e.current()); err != nil {
+				cause = fmt.Errorf("notify process handoff: %w", err)
+				pendingHandoffFailed = true
+			} else {
+				e.deferFinalization()
+				return
+			}
+		}
+		if pendingHandoffFailed {
+			// Persist terminal failure promptly while retaining the marker. Cleanup
+			// and gate recovery run afterward under the bounded recovery context.
+			if cause == nil {
+				cause = errors.New("program install handoff did not complete")
+			}
+			e.setPendingInstallFailureStage()
+			r.finish(e, StatusFailed, cause, Recovery{Status: "unknown", Detail: "program handoff cleanup is pending"}, true)
+			r.runRecoveryAndReconcile(e, recoverFn, cause, out, rollbackHandoff)
+			return
+		}
 	}
 	status := StatusSucceeded
 	if cause != nil {
@@ -317,7 +366,7 @@ func (r *Runner) finishExecution(e *Execution, out taskOutcome, recoverFn Recove
 			// mutating callback concurrently with an uncooperative recovery.
 			result := <-call.done
 			call.cancel()
-			r.reconcileLateRecovery(e, result)
+			r.reconcileLateRecovery(e, result, false, cause)
 			return
 		}
 	}
@@ -332,24 +381,79 @@ func (r *Runner) finishExecution(e *Execution, out taskOutcome, recoverFn Recove
 	r.finish(e, status, nil, Recovery{}, false)
 }
 
-func (r *Runner) runRecoveryAndReconcile(e *Execution, recoverFn RecoveryFunc, cause error, out taskOutcome) {
+func (r *Runner) runRecoveryAndReconcile(e *Execution, recoverFn RecoveryFunc, cause error, out taskOutcome, rollbackHandoff func(context.Context, Record) error) {
+	recoveryCtx, cancelRecovery := context.WithTimeout(context.Background(), r.recoveryTimeout)
+	defer cancelRecovery()
+	cleanupAttention := false
+	if e.hasPendingInstall() {
+		rollbackDone := r.startHandoffRollback(recoveryCtx, rollbackHandoff, e.current())
+		var rollbackErr error
+		select {
+		case rollbackErr = <-rollbackDone:
+		case <-recoveryCtx.Done():
+			rollbackErr = recoveryCtx.Err()
+			lateErr := <-rollbackDone
+			rollbackErr = errors.Join(rollbackErr, lateErr)
+		}
+		if recoveryCtx.Err() != nil {
+			rollbackErr = errors.Join(rollbackErr, recoveryCtx.Err())
+		}
+		if rollbackErr != nil {
+			cause = errors.Join(cause, fmt.Errorf("rollback pending install after task cancellation: %w", rollbackErr))
+			cleanupAttention = true
+		} else if err := r.reconcilePendingInstallClear(e); err != nil {
+			cause = errors.Join(cause, fmt.Errorf("clear pending install after task cancellation: %w", err))
+			cleanupAttention = true
+		}
+	}
 	if recoverFn == nil {
 		if out.panicked {
 			r.writeOutput("task %s panicked after timeout: %v\n", e.taskID(), out.err)
 		}
+		if cleanupAttention {
+			r.reconcileRecovery(e, Recovery{Status: "unknown", Detail: "pending install cleanup could not be verified"}, true, cause)
+		}
 		return
 	}
-	call := r.startRecovery(recoverFn, cause)
+	call := r.startRecoveryWithContext(recoveryCtx, recoverFn, cause)
 	select {
 	case result := <-call.done:
 		call.cancel()
-		r.reconcileLateRecovery(e, result)
+		r.reconcileLateRecovery(e, result, cleanupAttention, cause)
 	case <-call.ctx.Done():
 		// The failed terminal result has already been persisted. Keep the
 		// worker reserved until this callback really exits before reconciling.
 		result := <-call.done
 		call.cancel()
-		r.reconcileLateRecovery(e, result)
+		r.reconcileLateRecovery(e, result, cleanupAttention, cause)
+	}
+}
+
+func (r *Runner) reconcilePendingInstallClear(e *Execution) error {
+	store, ok := r.store.(ReconciliationStore)
+	if !ok {
+		return errors.New("task record store cannot reconcile pending install marker")
+	}
+	finding := e.reconciliation(Recovery{Status: "unknown", Detail: "program handoff rollback completed; runtime recovery is pending"}, true)
+	finding.ClearPendingInstall = true
+	if err := store.Reconcile(e.taskID(), finding); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (r *Runner) reconcileRecovery(e *Execution, recovery Recovery, attention bool, cause error) {
+	store, ok := r.store.(ReconciliationStore)
+	if !ok {
+		r.writeOutput("task %s record store does not support persisting recovery findings\n", e.taskID())
+		return
+	}
+	finding := e.reconciliation(recovery, attention)
+	if cause != nil {
+		finding.Error = cause.Error()
+	}
+	if err := store.Reconcile(e.taskID(), finding); err != nil {
+		r.writeOutput("task %s recovery finding not durably saved: %v\n", e.taskID(), err)
 	}
 }
 
@@ -365,6 +469,14 @@ type recoveryCall struct {
 
 func (r *Runner) startRecovery(fn RecoveryFunc, cause error) recoveryCall {
 	ctx, cancel := context.WithTimeout(context.Background(), r.recoveryTimeout)
+	call := r.startRecoveryWithContext(ctx, fn, cause)
+	childCancel := call.cancel
+	call.cancel = func() { childCancel(); cancel() }
+	return call
+}
+
+func (r *Runner) startRecoveryWithContext(parent context.Context, fn RecoveryFunc, cause error) recoveryCall {
+	ctx, cancel := context.WithCancel(parent)
 	done := make(chan recoveryResult, 1)
 	go func() {
 		result := recoveryResult{}
@@ -382,23 +494,16 @@ func (r *Runner) startRecovery(fn RecoveryFunc, cause error) recoveryCall {
 	return recoveryCall{ctx: ctx, done: done, cancel: cancel}
 }
 
-func (r *Runner) reconcileLateRecovery(e *Execution, result recoveryResult) {
+func (r *Runner) reconcileLateRecovery(e *Execution, result recoveryResult, forceAttention bool, cause error) {
 	recovery, recoveryErr := result.recovery, result.err
 	if recoveryErr == nil && recovery.Status == "" {
 		recovery = Recovery{Status: "unknown", Detail: "recovery callback returned no status"}
 	}
-	attention := recoveryErr != nil || recovery.Status == "unknown" || recovery.Status == "failed"
+	attention := forceAttention || recoveryErr != nil || recovery.Status == "unknown" || recovery.Status == "failed"
 	if recoveryErr != nil {
 		recovery = Recovery{Status: "failed", Detail: recoveryErr.Error()}
 	}
-	if store, ok := r.store.(ReconciliationStore); ok {
-		finding := e.reconciliation(recovery, attention)
-		if err := store.Reconcile(e.taskID(), finding); err != nil {
-			r.writeOutput("task %s recovery finding not durably saved: %v\n", e.taskID(), err)
-		}
-	} else {
-		r.writeOutput("task %s record store does not support persisting recovery findings\n", e.taskID())
-	}
+	r.reconcileRecovery(e, recovery, attention, cause)
 }
 
 func (r *Runner) finish(e *Execution, status Status, cause error, recovery Recovery, attention bool) {
@@ -508,6 +613,36 @@ func invokeAccepted(fn func() error) (err error) {
 	return fn()
 }
 
+func invokeHandoff(fn func(Record) error, record Record) (err error) {
+	defer func() {
+		if value := recover(); value != nil {
+			err = fmt.Errorf("handoff callback panicked: %v", value)
+		}
+	}()
+	return fn(cloneRecord(record))
+}
+
+func (r *Runner) startHandoffRollback(ctx context.Context, fn func(context.Context, Record) error, record Record) <-chan error {
+	done := make(chan error, 1)
+	go func() {
+		if fn == nil {
+			done <- errors.New("pending install has no rollback callback")
+			return
+		}
+		done <- invokeRollback(fn, ctx, record)
+	}()
+	return done
+}
+
+func invokeRollback(fn func(context.Context, Record) error, ctx context.Context, record Record) (err error) {
+	defer func() {
+		if value := recover(); value != nil {
+			err = fmt.Errorf("handoff rollback callback panicked: %v", value)
+		}
+	}()
+	return fn(ctx, cloneRecord(record))
+}
+
 type taskOutcome struct {
 	err      error
 	panicked bool
@@ -595,6 +730,72 @@ func (e *Execution) Critical(stage string, mutate func(*Record)) error {
 		return err
 	}
 	return nil
+}
+
+// MarkPendingInstall durably records the verified handoff facts while the
+// program-update task is still running. A later successful task return is
+// deferred until the new process proves the installed binary and readiness.
+func (e *Execution) MarkPendingInstall(marker PendingInstallHandoff) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.finalized {
+		return ErrExecutionClosed
+	}
+	if e.record.Type != TaskTypeProgramUpdate || e.record.Status != StatusRunning {
+		return errors.New("only a running program-update task can request install handoff")
+	}
+	if e.record.PendingInstall != nil {
+		return errors.New("program-update task already has a pending install handoff")
+	}
+	if !completePendingInstallMarker(&marker) {
+		return errors.New("pending install marker is incomplete or invalid")
+	}
+	if err := e.ctx.Err(); err != nil {
+		return err
+	}
+	next := cloneRecord(e.record)
+	next.PendingInstall = &marker
+	next.Stage = "install-handoff"
+	next.Percentage = 95
+	next.Message = "已验证待安装程序，等待进程交接"
+	next.UpdatedAt = e.now().UTC()
+	if err := e.store.Save(next); err != nil {
+		e.criticalErr = fmt.Errorf("critical task checkpoint %q failed: %w", "install-handoff", err)
+		e.record = next
+		if e.report != nil {
+			e.report("task %s critical persistence failure: %v\n", next.TaskID, e.criticalErr)
+		}
+		e.cancel()
+		return e.criticalErr
+	}
+	e.record = next
+	if err := e.ctx.Err(); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (e *Execution) hasPendingInstall() bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.record.PendingInstall != nil
+}
+
+func (e *Execution) setPendingInstallFailureStage() {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.record.PendingInstall == nil {
+		return
+	}
+	e.record.Stage = "handoff-failed"
+	e.record.Message = "程序交接失败，正在保留待恢复事实"
+	e.record.UpdatedAt = e.now().UTC()
+}
+
+func (e *Execution) deferFinalization() {
+	e.mu.Lock()
+	e.finalized = true
+	e.mu.Unlock()
 }
 
 func (e *Execution) Current() Record { return e.current() }

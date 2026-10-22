@@ -26,8 +26,10 @@ Logging:
 Updates:
   Repository: RookieRoll/dockerCopilot
   GitHubProxy: ""
+  WorkDir: ""
 Backup:
   Directory: /data/backups
 Docker:
   DeleteOldContainer: true
   PortOverridesPath: /data/config/container-port-overrides.json
+  SelfContainer: ""

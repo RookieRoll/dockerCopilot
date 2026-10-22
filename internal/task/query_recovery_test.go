@@ -334,8 +334,8 @@ func TestStartupReconcileDistinguishesNotFoundAndSurfacesPersistenceFailure(t *t
 }
 
 func TestPendingInstallRequiresCompleteMatchingVerification(t *testing.T) {
-	validMarker := PendingInstallHandoff{HandoffID: "10000000-0000-4000-8000-000000000001", TargetVersion: "v2.0.0", ArtifactSHA256: strings.Repeat("a", 64), PreparedAt: time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC)}
-	validProof := PendingInstallProof{Verified: true, TaskID: "00000000-0000-4000-8000-000000000021", HandoffID: validMarker.HandoffID, TargetVersion: validMarker.TargetVersion, ArtifactSHA256: validMarker.ArtifactSHA256}
+	validMarker := PendingInstallHandoff{HandoffID: "10000000-0000-4000-8000-000000000001", TargetVersion: "v2.0.0", GOARCH: "amd64", ArtifactSHA256: strings.Repeat("a", 64), PreparedAt: time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC)}
+	validProof := PendingInstallProof{Verified: true, TaskID: "00000000-0000-4000-8000-000000000021", HandoffID: validMarker.HandoffID, TargetVersion: validMarker.TargetVersion, GOARCH: validMarker.GOARCH, ArtifactSHA256: validMarker.ArtifactSHA256}
 	cases := []struct {
 		name        string
 		taskType    string
@@ -347,10 +347,12 @@ func TestPendingInstallRequiresCompleteMatchingVerification(t *testing.T) {
 		{name: "verified complete handoff", taskType: TaskTypeProgramUpdate, marker: &validMarker, validator: &pendingValidatorFake{proof: validProof}, wantPending: true},
 		{name: "type alone", taskType: TaskTypeProgramUpdate},
 		{name: "missing marker field", taskType: TaskTypeProgramUpdate, marker: &PendingInstallHandoff{HandoffID: validMarker.HandoffID}},
+		{name: "unsupported marker architecture", taskType: TaskTypeProgramUpdate, marker: func() *PendingInstallHandoff { m := validMarker; m.GOARCH = "386"; return &m }(), validator: &pendingValidatorFake{proof: validProof}},
 		{name: "validator unavailable", taskType: TaskTypeProgramUpdate, marker: &validMarker},
 		{name: "mismatched proof", taskType: TaskTypeProgramUpdate, marker: &validMarker, validator: &pendingValidatorFake{proof: PendingInstallProof{Verified: true, TaskID: "wrong", HandoffID: validMarker.HandoffID, TargetVersion: validMarker.TargetVersion, ArtifactSHA256: validMarker.ArtifactSHA256}}},
 		{name: "mismatched target version", taskType: TaskTypeProgramUpdate, marker: &validMarker, validator: &pendingValidatorFake{proof: PendingInstallProof{Verified: true, TaskID: validProof.TaskID, HandoffID: validMarker.HandoffID, TargetVersion: "v2.0.1", ArtifactSHA256: validMarker.ArtifactSHA256}}},
 		{name: "mismatched digest", taskType: TaskTypeProgramUpdate, marker: &validMarker, validator: &pendingValidatorFake{proof: PendingInstallProof{Verified: true, TaskID: validProof.TaskID, HandoffID: validMarker.HandoffID, TargetVersion: validMarker.TargetVersion, ArtifactSHA256: strings.Repeat("b", 64)}}},
+		{name: "mismatched architecture", taskType: TaskTypeProgramUpdate, marker: &validMarker, validator: &pendingValidatorFake{proof: PendingInstallProof{Verified: true, TaskID: validProof.TaskID, HandoffID: validMarker.HandoffID, TargetVersion: validMarker.TargetVersion, GOARCH: "arm64", ArtifactSHA256: validMarker.ArtifactSHA256}}},
 		{name: "validator error", taskType: TaskTypeProgramUpdate, marker: &validMarker, validator: &pendingValidatorFake{err: errors.New("bad handoff")}},
 		{name: "other task type", taskType: "container-update", marker: &validMarker, validator: &pendingValidatorFake{proof: validProof}},
 		{name: "queued handoff", taskType: TaskTypeProgramUpdate, marker: &validMarker, validator: &pendingValidatorFake{proof: validProof}, status: StatusQueued},

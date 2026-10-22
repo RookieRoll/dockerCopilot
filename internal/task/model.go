@@ -57,8 +57,11 @@ type ContainerCheck struct {
 // PendingInstallHandoff is an explicit, non-secret marker written after a
 // verified updater package enters the installation handoff phase.
 type PendingInstallHandoff struct {
-	HandoffID      string    `json:"handoffID"`
-	TargetVersion  string    `json:"targetVersion"`
+	HandoffID     string `json:"handoffID"`
+	TargetVersion string `json:"targetVersion"`
+	GOARCH        string `json:"goarch"`
+	// ArtifactSHA256 is the digest of the actual dockerCopilot-new binary,
+	// not the downloaded archive.
 	ArtifactSHA256 string    `json:"artifactSHA256"`
 	PreparedAt     time.Time `json:"preparedAt"`
 }

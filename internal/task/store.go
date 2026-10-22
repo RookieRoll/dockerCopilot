@@ -153,6 +153,10 @@ type Reconciliation struct {
 	Recovery          Recovery `json:"recovery,omitempty"`
 	RequiresAttention bool     `json:"requiresAttention"`
 	ProtectedNames    []string `json:"protectedNames,omitempty"`
+	Error             string   `json:"error,omitempty"`
+	// ClearPendingInstall is applied only after the candidate rollback has been
+	// verified; timeout records retain this marker until reconciliation.
+	ClearPendingInstall bool `json:"clearPendingInstall,omitempty"`
 }
 
 // Reconcile persists only read-only findings for an already terminal task.
@@ -175,6 +179,12 @@ func (s *Store) Reconcile(id string, finding Reconciliation) error {
 	old.Recovery = finding.Recovery
 	old.RequiresAttention = finding.RequiresAttention
 	old.ProtectedNames = cloneStrings(finding.ProtectedNames)
+	if finding.Error != "" {
+		old.Error = finding.Error
+	}
+	if finding.ClearPendingInstall {
+		old.PendingInstall = nil
+	}
 	old.UpdatedAt = s.now().UTC()
 	return s.writeRecord(old)
 }

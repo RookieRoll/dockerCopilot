@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"embed"
 	"flag"
 	"fmt"
@@ -8,7 +9,9 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"time"
 
+	"github.com/google/uuid"
 	"github.com/onlyLTY/dockerCopilot/internal/config"
 	"github.com/onlyLTY/dockerCopilot/internal/handler"
 	"github.com/onlyLTY/dockerCopilot/internal/observability"
@@ -16,6 +19,7 @@ import (
 	"github.com/onlyLTY/dockerCopilot/internal/utiles"
 	"github.com/robfig/cron/v3"
 	"github.com/zeromicro/go-zero/core/logx"
+	"github.com/zeromicro/go-zero/core/proc"
 	"github.com/zeromicro/go-zero/rest"
 	"github.com/zeromicro/go-zero/rest/httpx"
 )
@@ -114,11 +118,41 @@ export const customImageLogos = {
 		status, response := observability.HTTPError(err, nil)
 		return status, response
 	})
+	probeToken := uuid.NewString()
+	instanceReady := make(chan struct{}, 1)
+	server.Use(readinessMiddleware(probeToken, instanceReady))
 	handler.RegisterHandlers(server, ctx)
 	RegisterHandlers(server)
 	fmt.Printf("Starting server at %s:%d...\n", c.Host, c.Port)
 	logx.Info("程序版本" + config.Version)
-	server.Start()
+	serverDone := make(chan struct{})
+	go func() {
+		defer close(serverDone)
+		server.Start()
+	}()
+	if ctx.TaskRuntime.HasPendingInstall() {
+		probeCtx, cancelProbe := context.WithTimeout(context.Background(), 45*time.Second)
+		probeErr := waitForInstanceReady(probeCtx, c.Host, c.Port, probeToken, instanceReady)
+		cancelProbe()
+		if probeErr != nil {
+			logx.Errorf("pending program install did not reach HTTP readiness: %v", probeErr)
+		} else {
+			confirmCtx, cancelConfirm := context.WithTimeout(context.Background(), 10*time.Second)
+			confirmErr := ctx.TaskRuntime.ConfirmPendingInstalls(confirmCtx)
+			cancelConfirm()
+			if confirmErr != nil {
+				logx.Errorf("pending program install task confirmation remains pending: %v", confirmErr)
+			} else {
+				ctx.ReleaseStartupProgramDrain()
+			}
+		}
+	}
+	select {
+	case <-ctx.ProgramShutdown:
+		proc.Shutdown()
+		<-serverDone
+	case <-serverDone:
+	}
 }
 
 // disableDefaultRequestLogging leaves HTTP diagnostics to the redacted

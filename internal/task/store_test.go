@@ -153,6 +153,36 @@ func TestStoreTerminalStatusImmutableAndReconcileOnly(t *testing.T) {
 	}
 }
 
+func TestReconcileClearsPendingInstallOnlyAfterVerifiedCleanup(t *testing.T) {
+	s, err := Open(Options{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	r := sampleRecord()
+	r.Type = TaskTypeProgramUpdate
+	r.Status = StatusFailed
+	r.FinishedAt = ptrTime(time.Now())
+	r.PendingInstall = &PendingInstallHandoff{HandoffID: "10000000-0000-4000-8000-000000000067", TargetVersion: "2.3.4", GOARCH: "amd64", ArtifactSHA256: strings.Repeat("a", 64), PreparedAt: time.Now().UTC()}
+	if err := s.Create(r); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Reconcile(r.TaskID, Reconciliation{Recovery: Recovery{Status: "unknown"}, RequiresAttention: true}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.Get(r.TaskID)
+	if err != nil || got.PendingInstall == nil {
+		t.Fatalf("ordinary reconciliation erased cleanup facts: marker=%#v err=%v", got.PendingInstall, err)
+	}
+	if err := s.Reconcile(r.TaskID, Reconciliation{Recovery: Recovery{Status: "unknown"}, RequiresAttention: true, ClearPendingInstall: true}); err != nil {
+		t.Fatal(err)
+	}
+	got, err = s.Get(r.TaskID)
+	if err != nil || got.PendingInstall != nil || got.Status != StatusFailed {
+		t.Fatalf("verified cleanup reconciliation did not clear marker immutably: %#v err=%v", got, err)
+	}
+}
+
 func TestStoreRequiresCallerTaskID(t *testing.T) {
 	s, err := Open(Options{Dir: t.TempDir()})
 	if err != nil {

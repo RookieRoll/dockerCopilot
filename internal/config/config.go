@@ -5,6 +5,7 @@ import (
 	"math"
 	"net/url"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -50,6 +51,7 @@ type LoggingConfig struct {
 type UpdateConfig struct {
 	Repository  string `json:",optional,default=RookieRoll/dockerCopilot"`
 	GitHubProxy string `json:",optional"`
+	WorkDir     string `json:",optional"`
 }
 
 type BackupConfig struct {
@@ -59,6 +61,7 @@ type BackupConfig struct {
 type DockerConfig struct {
 	DeleteOldContainer *bool  `json:",optional"`
 	PortOverridesPath  string `json:",optional,default=/data/config/container-port-overrides.json"`
+	SelfContainer      string `json:",optional"`
 }
 
 type TaskOptions struct {
@@ -208,6 +211,8 @@ func (c *Config) ApplyEnvironment() error {
 		{"DOCKERCOPILOT_LOG_DIR", &c.Logging.Directory},
 		{"DOCKERCOPILOT_LOG_LEVEL", &c.Logging.Level},
 		{"DOCKERCOPILOT_UPDATE_REPOSITORY", &c.Updates.Repository},
+		{"WORKDIR", &c.Updates.WorkDir},
+		{"DOCKERCOPILOT_SELF_CONTAINER", &c.Docker.SelfContainer},
 		{"githubProxy", &c.Updates.GitHubProxy},
 		{"BACKUP_DIR", &c.Backup.Directory},
 		{"CONTAINER_PORT_OVERRIDES_PATH", &c.Docker.PortOverridesPath},
@@ -276,6 +281,9 @@ func (c *Config) Validate() error {
 	if strings.TrimSpace(c.Tasks.Directory) == "" || strings.TrimSpace(c.Backup.Directory) == "" || strings.TrimSpace(c.Logging.Directory) == "" || strings.TrimSpace(c.Docker.PortOverridesPath) == "" {
 		return fmt.Errorf("task, backup, log, and port override paths must not be empty")
 	}
+	if self := strings.TrimSpace(c.Docker.SelfContainer); self != "" && !validContainerReference.MatchString(self) {
+		return fmt.Errorf("Docker.SelfContainer must be a container name or ID")
+	}
 	if strings.TrimSpace(c.Updates.Repository) == "" {
 		return fmt.Errorf("Updates.Repository must not be empty")
 	}
@@ -292,6 +300,7 @@ func (c *Config) Validate() error {
 }
 
 var validRepository = regexp.MustCompile(`^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$`)
+var validContainerReference = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$`)
 
 func validatePositiveDuration(name, value string) error {
 	duration, err := time.ParseDuration(value)
@@ -387,6 +396,20 @@ func (c Config) UpdateSource() UpdateConfig {
 		c.Updates.Repository = defaultUpdateRepo
 	}
 	return c.Updates
+}
+
+// ProgramWorkDir resolves the configured WORKDIR compatibility value or the
+// directory containing the current executable. Marker and candidate paths are
+// always derived from this value, never from persisted task data.
+func (c Config) ProgramWorkDir() (string, error) {
+	if value := strings.TrimSpace(c.Updates.WorkDir); value != "" {
+		return filepath.Abs(filepath.Clean(value))
+	}
+	executable, err := os.Executable()
+	if err != nil {
+		return "", fmt.Errorf("resolve current executable: %w", err)
+	}
+	return filepath.Abs(filepath.Dir(executable))
 }
 
 // LegacyUpdateSource supports callers that have not yet received a loaded

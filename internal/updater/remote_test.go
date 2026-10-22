@@ -111,29 +111,48 @@ func TestVersionCheckerCacheIsolatedBySourceURL(t *testing.T) {
 }
 
 func TestVersionCheckerHonorsTimeoutAndCallerCancellation(t *testing.T) {
-	started := make(chan struct{}, 1)
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		started <- struct{}{}
-		<-r.Context().Done()
-	}))
-	defer server.Close()
-	client := server.Client()
-	client.Timeout = 30 * time.Millisecond
-	checker := NewVersionChecker(client)
-	source := proxySource(server.URL, "org/slow")
-	if _, err := checker.Check(context.Background(), source); err == nil || !errors.Is(err, context.DeadlineExceeded) || !strings.Contains(err.Error(), "request remote version") {
-		t.Fatalf("timeout error = %v", err)
-	}
-	<-started
-
-	ctx, cancel := context.WithCancel(context.Background())
-	go func() {
-		<-started
+	t.Run("client timeout", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) { <-r.Context().Done() }))
+		defer server.Close()
+		client := &http.Client{Transport: server.Client().Transport, Timeout: 30 * time.Millisecond}
+		checker := NewVersionChecker(client)
+		source := proxySource(server.URL, "org/slow")
+		if _, err := checker.Check(context.Background(), source); err == nil || !errors.Is(err, context.DeadlineExceeded) || !strings.Contains(err.Error(), "request remote version") {
+			t.Fatalf("timeout error = %v", err)
+		}
+	})
+	t.Run("in-flight caller cancellation", func(t *testing.T) {
+		entered := make(chan struct{})
+		server := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+			close(entered)
+			<-r.Context().Done()
+		}))
+		defer server.Close()
+		client := &http.Client{Transport: server.Client().Transport, Timeout: 5 * time.Second}
+		checker := NewVersionChecker(client)
+		source := proxySource(server.URL, "org/cancel")
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		result := make(chan error, 1)
+		go func() {
+			_, err := checker.Check(ctx, source)
+			result <- err
+		}()
+		select {
+		case <-entered:
+		case <-time.After(5 * time.Second):
+			t.Fatal("caller-cancel request did not reach fake server")
+		}
 		cancel()
-	}()
-	if _, err := checker.Check(ctx, source); err == nil || !errors.Is(err, context.Canceled) || !strings.Contains(err.Error(), "request remote version") {
-		t.Fatalf("cancellation error = %v", err)
-	}
+		select {
+		case err := <-result:
+			if err == nil || !errors.Is(err, context.Canceled) || !strings.Contains(err.Error(), "request remote version") {
+				t.Fatalf("cancellation error = %v", err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("caller cancellation did not unblock version request")
+		}
+	})
 }
 
 func TestVersionCheckerCachesOnlySuccessAndExpires(t *testing.T) {

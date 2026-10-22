@@ -42,7 +42,11 @@ type ServiceContext struct {
 	TaskRunner                 *task.Runner
 	TaskQuery                  *task.QueryService
 	Mutations                  *operation.MutationGate
+	ProgramShutdown            chan struct{}
+	pendingProgramDrain        *operation.MutationDrain
 	mu                         sync.Mutex
+	programUpdateMu            sync.Mutex
+	programUpdateActive        bool
 }
 
 type TaskProgress = types.TaskProgress
@@ -76,7 +80,15 @@ func NewServiceContextChecked(c config.Config) (*ServiceContext, error) {
 		}
 		return nil, err
 	}
-	runtime, err := NewTaskRuntimeForConfig(context.Background(), c, serviceInspector{service: ctx.Containers})
+	workDir, err := c.ProgramWorkDir()
+	if err != nil {
+		if cli != nil {
+			_ = cli.Close()
+		}
+		return nil, fmt.Errorf("resolve program working directory: %w", err)
+	}
+	validator := newProgramInstallValidator(c, cli, workDir)
+	runtime, err := NewTaskRuntimeForConfigWithValidator(context.Background(), c, serviceInspector{service: ctx.Containers}, validator, workDir)
 	if err != nil {
 		if cli != nil {
 			_ = cli.Close()
@@ -84,6 +96,15 @@ func NewServiceContextChecked(c config.Config) (*ServiceContext, error) {
 		return nil, err
 	}
 	ctx.TaskRuntime, ctx.TaskStore, ctx.TaskRunner, ctx.TaskQuery = runtime, runtime.Store, runtime.Runner, runtime.Query
+	if runtime.HasPendingInstall() {
+		drain, drainErr := ctx.MutationGate().BeginDrain("pending-program-install")
+		if drainErr != nil {
+			_ = runtime.Close()
+			_ = cli.Close()
+			return nil, fmt.Errorf("block mutations while confirming pending program install: %w", drainErr)
+		}
+		ctx.pendingProgramDrain = drain
+	}
 	return ctx, nil
 }
 
@@ -93,16 +114,17 @@ func newServiceContext(c config.Config, cli *client.Client) (*ServiceContext, er
 	progress := legacyprogress.NewStore(progressStore)
 	containers := containerService.NewService(cli, updates)
 	ctx := &ServiceContext{
-		Config:         c,
-		HubImageInfo:   updates,
-		ProgressStore:  progressStore,
-		LegacyProgress: progress,
-		DockerClient:   cli,
-		Mutations:      operation.NewMutationGate(),
-		Containers:     containers,
-		Images:         imageService.NewService(cli),
-		Backups:        backupService.NewService(cli, c.BackupDirectory(), containers.Operations()),
-		Ports:          settings.NewPortOverridesService(c.PortOverridesFilePath()),
+		Config:          c,
+		HubImageInfo:    updates,
+		ProgressStore:   progressStore,
+		LegacyProgress:  progress,
+		DockerClient:    cli,
+		Mutations:       operation.NewMutationGate(),
+		ProgramShutdown: make(chan struct{}, 1),
+		Containers:      containers,
+		Images:          imageService.NewService(cli),
+		Backups:         backupService.NewService(cli, c.BackupDirectory(), containers.Operations()),
+		Ports:           settings.NewPortOverridesService(c.PortOverridesFilePath()),
 	}
 	icons, err := settings.NewIconService(settings.IconOptions{ImageDir: settings.DefaultImageDir, MappingPath: settings.DefaultImageLogosPath})
 	if err != nil {
@@ -112,6 +134,55 @@ func newServiceContext(c config.Config, cli *client.Client) (*ServiceContext, er
 	ctx.Backups.SetProgressCallbacks(backupService.ProgressCallbacks{Update: progress.Update, Get: progress.Get})
 	ctx.Containers.SetProgressCallbacks(containerService.ProgressCallbacks{Update: progress.Update, Get: progress.Get})
 	return ctx, nil
+}
+
+// RequestProgramShutdown sends a controlled, process-local handoff signal.
+// It fails when there is no listener or a signal is already pending.
+func (ctx *ServiceContext) RequestProgramShutdown() error {
+	if ctx == nil || ctx.ProgramShutdown == nil {
+		return fmt.Errorf("program shutdown signal is unavailable")
+	}
+	select {
+	case ctx.ProgramShutdown <- struct{}{}:
+		return nil
+	default:
+		return fmt.Errorf("program shutdown signal is already pending")
+	}
+}
+
+func (ctx *ServiceContext) ReserveProgramUpdate() bool {
+	if ctx == nil {
+		return false
+	}
+	ctx.programUpdateMu.Lock()
+	defer ctx.programUpdateMu.Unlock()
+	if ctx.programUpdateActive {
+		return false
+	}
+	ctx.programUpdateActive = true
+	return true
+}
+
+func (ctx *ServiceContext) ReleaseProgramUpdate() {
+	if ctx == nil {
+		return
+	}
+	ctx.programUpdateMu.Lock()
+	ctx.programUpdateActive = false
+	ctx.programUpdateMu.Unlock()
+}
+
+func (ctx *ServiceContext) ReleaseStartupProgramDrain() {
+	if ctx == nil {
+		return
+	}
+	ctx.mu.Lock()
+	drain := ctx.pendingProgramDrain
+	ctx.pendingProgramDrain = nil
+	ctx.mu.Unlock()
+	if drain != nil {
+		drain.Resume()
+	}
 }
 
 // MutationGate returns the process-wide gate used to coordinate writes with a

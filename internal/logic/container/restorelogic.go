@@ -4,11 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/google/uuid"
 	"net/http"
 
 	backupService "github.com/onlyLTY/dockerCopilot/internal/backup"
 	"path/filepath"
 
+	"github.com/onlyLTY/dockerCopilot/internal/operation"
 	"github.com/onlyLTY/dockerCopilot/internal/svc"
 	"github.com/onlyLTY/dockerCopilot/internal/task"
 	"github.com/onlyLTY/dockerCopilot/internal/types"
@@ -21,6 +23,7 @@ type RestoreLogic struct {
 	ctx        context.Context
 	taskRunner *task.Runner
 	service    *backupService.Service
+	gate       *operation.MutationGate
 }
 
 func NewRestoreLogic(ctx context.Context, svcCtx *svc.ServiceContext) *RestoreLogic {
@@ -29,6 +32,7 @@ func NewRestoreLogic(ctx context.Context, svcCtx *svc.ServiceContext) *RestoreLo
 		ctx:        ctx,
 		taskRunner: svcCtx.TaskRunner,
 		service:    backupServiceFromContext(svcCtx),
+		gate:       svcCtx.MutationGate(),
 	}
 }
 
@@ -56,8 +60,20 @@ func (l *RestoreLogic) Restore(req *types.ContainerRestoreReq) (resp *types.Resp
 	if l.taskRunner == nil {
 		return nil, taskUnavailableError("task runner is unavailable")
 	}
+	taskID := uuid.NewString()
+	var mutationLease *operation.MutationLease
 	taskID, submitErr := l.taskRunner.Submit(task.TaskSpec{
-		Record: task.Record{Type: "backup-restore", Name: fileName},
+		Record: task.Record{TaskID: taskID, Type: "backup-restore", Name: fileName},
+		OnAccepted: func() error {
+			var acquireErr error
+			mutationLease, acquireErr = l.gate.Acquire(l.ctx, taskID)
+			return acquireErr
+		},
+		OnSettled: func() {
+			if mutationLease != nil {
+				mutationLease.Release()
+			}
+		},
 		Run: func(ctx context.Context, execution *task.Execution) error {
 			if err := execution.Progress("restoring", 0, "备份恢复已开始"); err != nil {
 				return err
@@ -82,6 +98,9 @@ func (l *RestoreLogic) Restore(req *types.ContainerRestoreReq) (resp *types.Resp
 		},
 	})
 	if submitErr != nil {
+		if mutationLease != nil {
+			mutationLease.Release()
+		}
 		return &types.Resp{Msg: submitErr.Error(), Data: map[string]any{}}, taskSubmitError{cause: submitErr}
 	}
 	resp.Code = 200

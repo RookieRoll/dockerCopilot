@@ -41,7 +41,7 @@ func RegisterHandlers(server *rest.Server, serverCtx *svc.ServiceContext) {
 	)
 
 	server.AddRoutes(
-		[]rest.Route{
+		rest.WithMiddlewares([]rest.Middleware{mutationGateMiddleware(serverCtx)}, []rest.Route{
 			{
 				Method:  http.MethodPost,
 				Path:    "/container/:id/rename",
@@ -112,13 +112,13 @@ func RegisterHandlers(server *rest.Server, serverCtx *svc.ServiceContext) {
 				Path:    "/containers",
 				Handler: container.ContainersListHandler(serverCtx),
 			},
-		},
+		}...),
 		rest.WithJwt(serverCtx.Config.Auth.AccessSecret),
 		rest.WithPrefix("/api"),
 	)
 
 	server.AddRoutes(
-		[]rest.Route{
+		rest.WithMiddlewares([]rest.Middleware{mutationGateMiddleware(serverCtx)}, []rest.Route{
 			{
 				Method:  http.MethodPost,
 				Path:    "/",
@@ -129,13 +129,13 @@ func RegisterHandlers(server *rest.Server, serverCtx *svc.ServiceContext) {
 				Path:    "/",
 				Handler: icons.ObtainHandler(serverCtx),
 			},
-		},
+		}...),
 		rest.WithJwt(serverCtx.Config.Auth.AccessSecret),
 		rest.WithPrefix("/api/icons"),
 	)
 
 	server.AddRoutes(
-		[]rest.Route{
+		rest.WithMiddlewares([]rest.Middleware{mutationGateMiddleware(serverCtx)}, []rest.Route{
 			{
 				Method:  http.MethodDelete,
 				Path:    "/image/:id",
@@ -146,13 +146,13 @@ func RegisterHandlers(server *rest.Server, serverCtx *svc.ServiceContext) {
 				Path:    "/images",
 				Handler: image.ImagesListHandler(serverCtx),
 			},
-		},
+		}...),
 		rest.WithJwt(serverCtx.Config.Auth.AccessSecret),
 		rest.WithPrefix("/api"),
 	)
 
 	server.AddRoutes(
-		[]rest.Route{
+		rest.WithMiddlewares([]rest.Middleware{mutationGateMiddleware(serverCtx)}, []rest.Route{
 			{
 				Method:  http.MethodGet,
 				Path:    "/progress/:taskid",
@@ -163,13 +163,13 @@ func RegisterHandlers(server *rest.Server, serverCtx *svc.ServiceContext) {
 				Path:    "/tasks",
 				Handler: taskHandler.ListTasksHandler(serverCtx),
 			},
-		},
+		}...),
 		rest.WithJwt(serverCtx.Config.Auth.AccessSecret),
 		rest.WithPrefix("/api"),
 	)
 
 	server.AddRoutes(
-		[]rest.Route{
+		rest.WithMiddlewares([]rest.Middleware{mutationGateMiddleware(serverCtx)}, []rest.Route{
 			{
 				Method:  http.MethodPut,
 				Path:    "/program",
@@ -180,7 +180,7 @@ func RegisterHandlers(server *rest.Server, serverCtx *svc.ServiceContext) {
 				Path:    "/version",
 				Handler: version.VersionHandler(serverCtx),
 			},
-		},
+		}...),
 		rest.WithJwt(serverCtx.Config.Auth.AccessSecret),
 		rest.WithPrefix("/api"),
 	)

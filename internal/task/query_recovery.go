@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -20,6 +21,8 @@ const (
 )
 
 var ErrContainerNotFound = errors.New("container not found")
+
+var pendingInstallVersionPattern = regexp.MustCompile(`^v?[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?|\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$`)
 
 type TaskQueryStore interface {
 	Get(string) (Record, error)
@@ -308,9 +311,11 @@ type PendingInstallValidator interface {
 // ordinary startup interruption handling.
 type PendingInstallProof struct {
 	Verified       bool
+	Ready          bool
 	TaskID         string
 	HandoffID      string
 	TargetVersion  string
+	GOARCH         string
 	ArtifactSHA256 string
 }
 
@@ -396,14 +401,14 @@ func (r *StartupReconciler) verifiedPendingInstall(ctx context.Context, record R
 		return false, fmt.Sprintf("task %s pending-install handoff has no validator; treating it as an ordinary interrupted task", record.TaskID)
 	}
 	proof, err := r.validator.VerifyPendingInstall(ctx, cloneRecord(record))
-	if err != nil || !proof.Verified || proof.TaskID != record.TaskID || proof.HandoffID != marker.HandoffID || proof.TargetVersion != marker.TargetVersion || !strings.EqualFold(proof.ArtifactSHA256, marker.ArtifactSHA256) {
+	if err != nil || !proof.Verified || proof.TaskID != record.TaskID || proof.HandoffID != marker.HandoffID || proof.TargetVersion != marker.TargetVersion || proof.GOARCH != marker.GOARCH || !strings.EqualFold(proof.ArtifactSHA256, marker.ArtifactSHA256) {
 		return false, fmt.Sprintf("task %s pending-install handoff could not be fully verified; treating it as an ordinary interrupted task", record.TaskID)
 	}
 	return true, ""
 }
 
 func completePendingInstallMarker(marker *PendingInstallHandoff) bool {
-	if marker == nil || strings.TrimSpace(marker.TargetVersion) == "" || marker.PreparedAt.IsZero() || !validTaskID(marker.HandoffID) || len(marker.ArtifactSHA256) != 64 {
+	if marker == nil || !pendingInstallVersionPattern.MatchString(marker.TargetVersion) || marker.PreparedAt.IsZero() || !validTaskID(marker.HandoffID) || (marker.GOARCH != "amd64" && marker.GOARCH != "arm64") || len(marker.ArtifactSHA256) != 64 {
 		return false
 	}
 	_, err := hex.DecodeString(marker.ArtifactSHA256)

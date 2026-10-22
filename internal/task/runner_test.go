@@ -85,6 +85,12 @@ func (s *runnerMemoryStore) Reconcile(id string, f Reconciliation) error {
 	r.Recovery = f.Recovery
 	r.RequiresAttention = f.RequiresAttention
 	r.ProtectedNames = cloneStrings(f.ProtectedNames)
+	if f.Error != "" {
+		r.Error = f.Error
+	}
+	if f.ClearPendingInstall {
+		r.PendingInstall = nil
+	}
 	s.records[id] = r
 	return nil
 }
@@ -103,6 +109,342 @@ func TestRunnerRejectsInitialPersistenceFailureWithoutRunning(t *testing.T) {
 	}
 }
 
+func TestRunnerDefersProgramUpdateFinalizationUntilPendingInstallConfirmation(t *testing.T) {
+	store := newRunnerMemoryStore()
+	runner := newTestRunner(t, store, RunnerOptions{MaxConcurrent: 1, QueueCapacity: 1})
+	marker := PendingInstallHandoff{
+		HandoffID: "10000000-0000-4000-8000-000000000061", TargetVersion: "v2.3.4",
+		GOARCH: "amd64", ArtifactSHA256: strings.Repeat("a", 64), PreparedAt: time.Now().UTC(),
+	}
+	var handoffCalls atomic.Int32
+	id, err := runner.Submit(TaskSpec{
+		Record: func() Record { r := runnerRecord(); r.Type = TaskTypeProgramUpdate; return r }(),
+		Run: func(_ context.Context, execution *Execution) error {
+			return execution.MarkPendingInstall(marker)
+		},
+		OnHandoff: func(record Record) error {
+			handoffCalls.Add(1)
+			if record.Status != StatusRunning || record.PendingInstall == nil || record.PendingInstall.HandoffID != marker.HandoffID {
+				return fmt.Errorf("handoff callback received unpersisted record: %#v", record)
+			}
+			persisted, getErr := store.Get(record.TaskID)
+			if getErr != nil || persisted.PendingInstall == nil || persisted.PendingInstall.HandoffID != marker.HandoffID {
+				return fmt.Errorf("handoff marker was not persisted before callback: %#v err=%v", persisted, getErr)
+			}
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := runner.WaitIdle(testContext(t, time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	record, err := store.Get(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if handoffCalls.Load() != 1 || record.Status != StatusRunning || record.IsDone || record.FinishedAt != nil || record.PendingInstall == nil {
+		t.Fatalf("successful handoff was finalized early: calls=%d record=%#v", handoffCalls.Load(), record)
+	}
+}
+
+func TestRunnerFailedHandoffNeverLeavesPendingOrReportsSuccess(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		onHandoff  func(Record) error
+		runError   error
+		wantCalled bool
+	}{
+		{name: "missing callback"},
+		{name: "callback error", onHandoff: func(Record) error { return errors.New("shutdown signal unavailable") }, wantCalled: true},
+		{name: "callback panic", onHandoff: func(Record) error { panic("shutdown signal panic") }, wantCalled: true},
+		{name: "run error after marker", onHandoff: func(Record) error { return nil }, runError: errors.New("post-handoff preparation failed")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := newRunnerMemoryStore()
+			runner := newTestRunner(t, store, RunnerOptions{MaxConcurrent: 1, QueueCapacity: 1})
+			marker := PendingInstallHandoff{HandoffID: "10000000-0000-4000-8000-000000000062", TargetVersion: "2.3.4", GOARCH: "arm64", ArtifactSHA256: strings.Repeat("b", 64), PreparedAt: time.Now().UTC()}
+			var callbackCalls atomic.Int32
+			callback := tc.onHandoff
+			if callback != nil {
+				callback = func(record Record) error {
+					callbackCalls.Add(1)
+					return tc.onHandoff(record)
+				}
+			}
+			record := runnerRecord()
+			record.Type = TaskTypeProgramUpdate
+			var rollbackCalls atomic.Int32
+			id, err := runner.Submit(TaskSpec{Record: record, Run: func(_ context.Context, execution *Execution) error {
+				if err := execution.MarkPendingInstall(marker); err != nil {
+					return err
+				}
+				return tc.runError
+			}, OnHandoff: callback, RollbackHandoff: func(context.Context, Record) error { rollbackCalls.Add(1); return nil }})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := runner.WaitIdle(testContext(t, time.Second)); err != nil {
+				t.Fatal(err)
+			}
+			got, err := store.Get(id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.Status != StatusFailed || !got.IsDone || got.PendingInstall != nil || tc.wantCalled != (callbackCalls.Load() == 1) || rollbackCalls.Load() != 1 {
+				t.Fatalf("failed handoff state: callback=%d rollback=%d record=%#v", callbackCalls.Load(), rollbackCalls.Load(), got)
+			}
+		})
+	}
+}
+
+func TestRunnerDoesNotSignalHandoffWhenMarkerPersistenceFails(t *testing.T) {
+	store := newRunnerMemoryStore()
+	store.saveErr = func(record Record, _ int) error {
+		if record.Stage == "install-handoff" {
+			return errors.New("pending marker storage unavailable")
+		}
+		return nil
+	}
+	runner := newTestRunner(t, store, RunnerOptions{MaxConcurrent: 1, QueueCapacity: 1})
+	var handoffCalls atomic.Int32
+	record := runnerRecord()
+	record.Type = TaskTypeProgramUpdate
+	id, err := runner.Submit(TaskSpec{
+		Record: record,
+		Run: func(_ context.Context, execution *Execution) error {
+			return execution.MarkPendingInstall(PendingInstallHandoff{
+				HandoffID: "10000000-0000-4000-8000-000000000063", TargetVersion: "2.3.4", GOARCH: "amd64",
+				ArtifactSHA256: strings.Repeat("d", 64), PreparedAt: time.Now().UTC(),
+			})
+		},
+		OnHandoff:       func(Record) error { handoffCalls.Add(1); return nil },
+		RollbackHandoff: func(context.Context, Record) error { return nil },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := runner.WaitIdle(testContext(t, time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.Get(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if handoffCalls.Load() != 0 || got.Status != StatusFailed || !got.RequiresAttention || got.PendingInstall != nil || !strings.Contains(got.Error, "pending marker storage unavailable") {
+		t.Fatalf("marker persistence failure did not stop handoff: calls=%d record=%#v", handoffCalls.Load(), got)
+	}
+}
+
+func TestRunnerMarksHandoffRollbackFailureForAttention(t *testing.T) {
+	store := newRunnerMemoryStore()
+	runner := newTestRunner(t, store, RunnerOptions{MaxConcurrent: 1, QueueCapacity: 1})
+	record := runnerRecord()
+	record.Type = TaskTypeProgramUpdate
+	id, err := runner.Submit(TaskSpec{
+		Record: record,
+		Run: func(_ context.Context, execution *Execution) error {
+			return execution.MarkPendingInstall(PendingInstallHandoff{HandoffID: "10000000-0000-4000-8000-000000000064", TargetVersion: "2.3.4", GOARCH: "amd64", ArtifactSHA256: strings.Repeat("e", 64), PreparedAt: time.Now().UTC()})
+		},
+		OnHandoff:       func(Record) error { return errors.New("shutdown signal unavailable") },
+		RollbackHandoff: func(context.Context, Record) error { return errors.New("candidate cleanup failed") },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := runner.WaitIdle(testContext(t, time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.Get(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != StatusFailed || !got.RequiresAttention || got.Recovery.Status != "unknown" || got.PendingInstall == nil || !strings.Contains(got.Error, "candidate cleanup failed") {
+		t.Fatalf("rollback failure was not surfaced as uncertain: %#v", got)
+	}
+}
+
+func TestRunnerRunsRecoveryAfterHandoffNotificationFailure(t *testing.T) {
+	store := newRunnerMemoryStore()
+	runner := newTestRunner(t, store, RunnerOptions{MaxConcurrent: 1, QueueCapacity: 1})
+	record := runnerRecord()
+	record.Type = TaskTypeProgramUpdate
+	var recoverCalls atomic.Int32
+	id, err := runner.Submit(TaskSpec{
+		Record: record,
+		Run: func(_ context.Context, execution *Execution) error {
+			return execution.MarkPendingInstall(PendingInstallHandoff{HandoffID: "10000000-0000-4000-8000-000000000065", TargetVersion: "2.3.4", GOARCH: "amd64", ArtifactSHA256: strings.Repeat("f", 64), PreparedAt: time.Now().UTC()})
+		},
+		OnHandoff:       func(Record) error { return errors.New("shutdown signal failed") },
+		RollbackHandoff: func(context.Context, Record) error { return errors.New("rollback needs recovery") },
+		Recover: func(context.Context, error) (Recovery, error) {
+			recoverCalls.Add(1)
+			return Recovery{Status: "restored", Detail: "candidate removed and gate resumed"}, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := runner.WaitIdle(testContext(t, time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.Get(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recoverCalls.Load() != 1 || got.Status != StatusFailed || got.Recovery.Status != "restored" || !got.RequiresAttention || got.PendingInstall == nil {
+		t.Fatalf("handoff recovery result: calls=%d record=%#v", recoverCalls.Load(), got)
+	}
+}
+
+func TestRunnerDoesNotRollbackHandoffUntilUncooperativeRunReturns(t *testing.T) {
+	store := newRunnerMemoryStore()
+	runner := newTestRunner(t, store, RunnerOptions{MaxConcurrent: 1, QueueCapacity: 1, TaskTimeout: 30 * time.Millisecond, RecoveryTimeout: time.Second})
+	runCtxReady := make(chan struct{})
+	deadlineReached := make(chan struct{})
+	releaseRun := make(chan struct{})
+	var releaseRunOnce sync.Once
+	releaseRunCallback := func() { releaseRunOnce.Do(func() { close(releaseRun) }) }
+	t.Cleanup(releaseRunCallback)
+	var candidatePlaced atomic.Bool
+	var runReturned atomic.Bool
+	var rollbackCalls atomic.Int32
+	record := runnerRecord()
+	record.Type = TaskTypeProgramUpdate
+	id, err := runner.Submit(TaskSpec{
+		Record: record,
+		Run: func(ctx context.Context, execution *Execution) error {
+			if err := execution.MarkPendingInstall(PendingInstallHandoff{HandoffID: "10000000-0000-4000-8000-000000000066", TargetVersion: "2.3.4", GOARCH: "amd64", ArtifactSHA256: strings.Repeat("1", 64), PreparedAt: time.Now().UTC()}); err != nil {
+				return err
+			}
+			close(runCtxReady)
+			go func() { <-ctx.Done(); close(deadlineReached) }()
+			<-releaseRun // deliberately ignores deadline while a candidate is being placed
+			candidatePlaced.Store(true)
+			runReturned.Store(true)
+			return nil
+		},
+		OnHandoff: func(Record) error { return errors.New("deadline should prevent handoff notification") },
+		RollbackHandoff: func(ctx context.Context, _ Record) error {
+			rollbackCalls.Add(1)
+			if !runReturned.Load() || !candidatePlaced.Load() {
+				return errors.New("rollback ran before Run finished placing candidate")
+			}
+			candidatePlaced.Store(false)
+			return nil
+		},
+		Recover: func(context.Context, error) (Recovery, error) {
+			if candidatePlaced.Load() {
+				return Recovery{Status: "unknown", Detail: "candidate still exists"}, errors.New("candidate cleanup did not finish")
+			}
+			return Recovery{Status: "restored"}, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-runCtxReady
+	<-deadlineReached
+	if rollbackCalls.Load() != 0 {
+		t.Fatal("handoff cleanup raced the still-running task callback")
+	}
+	var terminal Record
+	waitFor(t, func() bool {
+		var getErr error
+		terminal, getErr = store.Get(id)
+		return getErr == nil && terminal.Status == StatusFailed
+	})
+	if terminal.Status != StatusFailed || !terminal.RequiresAttention || terminal.PendingInstall == nil {
+		t.Fatalf("deadline did not promptly persist failed/unknown handoff facts: %#v", terminal)
+	}
+	releaseRunCallback()
+	if err := runner.WaitIdle(testContext(t, 2*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.Get(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rollbackCalls.Load() != 1 || candidatePlaced.Load() || got.Status != StatusFailed || got.PendingInstall != nil || got.Recovery.Status != "restored" || got.RequiresAttention {
+		t.Fatalf("timeout handoff cleanup did not run after Run exited: rollback=%d candidate=%v record=%#v", rollbackCalls.Load(), candidatePlaced.Load(), got)
+	}
+}
+
+func TestRunnerFinalizesBeforeUncooperativeHandoffRollbackReturns(t *testing.T) {
+	store := newRunnerMemoryStore()
+	runner := newTestRunner(t, store, RunnerOptions{MaxConcurrent: 1, QueueCapacity: 1, TaskTimeout: time.Second, RecoveryTimeout: 30 * time.Millisecond})
+	rollbackEntered := make(chan struct{})
+	rollbackDeadline := make(chan struct{})
+	releaseRollback := make(chan struct{})
+	var releaseRollbackOnce sync.Once
+	releaseRollbackCallback := func() { releaseRollbackOnce.Do(func() { close(releaseRollback) }) }
+	t.Cleanup(releaseRollbackCallback)
+	settled := make(chan struct{})
+	record := runnerRecord()
+	record.Type = TaskTypeProgramUpdate
+	id, err := runner.Submit(TaskSpec{
+		Record: record,
+		Run: func(_ context.Context, execution *Execution) error {
+			return execution.MarkPendingInstall(PendingInstallHandoff{HandoffID: "10000000-0000-4000-8000-000000000068", TargetVersion: "2.3.4", GOARCH: "amd64", ArtifactSHA256: strings.Repeat("2", 64), PreparedAt: time.Now().UTC()})
+		},
+		OnHandoff: func(Record) error { return errors.New("shutdown signal unavailable") },
+		RollbackHandoff: func(ctx context.Context, _ Record) error {
+			close(rollbackEntered)
+			<-ctx.Done()
+			close(rollbackDeadline)
+			<-releaseRollback // deliberately ignores the shared recovery deadline
+			return nil
+		},
+		Recover: func(context.Context, error) (Recovery, error) {
+			return Recovery{Status: "restored"}, nil
+		},
+		OnSettled: func() { close(settled) },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-rollbackEntered
+	deadline := time.Now().Add(time.Second)
+	var terminal Record
+	for time.Now().Before(deadline) {
+		terminal, err = store.Get(id)
+		if err == nil && terminal.Status == StatusFailed {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if terminal.Status != StatusFailed || terminal.Recovery.Status != "unknown" || terminal.PendingInstall == nil || !terminal.RequiresAttention {
+		t.Fatalf("slow rollback left task nonterminal or discarded handoff facts: %#v", terminal)
+	}
+	select {
+	case <-rollbackDeadline:
+	case <-time.After(time.Second):
+		t.Fatal("rollback callback did not observe its bounded recovery deadline")
+	}
+	select {
+	case <-settled:
+		t.Fatal("settlement ran while rollback callback was still executing")
+	default:
+	}
+	releaseRollbackCallback()
+	if err := runner.WaitIdle(testContext(t, time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-settled:
+	case <-time.After(time.Second):
+		t.Fatal("settlement did not run after rollback callback returned")
+	}
+	terminal, err = store.Get(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if terminal.Status != StatusFailed || terminal.PendingInstall == nil || !terminal.RequiresAttention {
+		t.Fatalf("expired rollback incorrectly cleared handoff evidence: %#v", terminal)
+	}
+}
+
 func TestOnSettledWaitsUntilRunAndRecoveryCallbacksReallyReturn(t *testing.T) {
 	store := newRunnerMemoryStore()
 	runner := newTestRunner(t, store, RunnerOptions{MaxConcurrent: 1, QueueCapacity: 1, TaskTimeout: 20 * time.Millisecond, RecoveryTimeout: time.Second})
@@ -110,6 +452,12 @@ func TestOnSettledWaitsUntilRunAndRecoveryCallbacksReallyReturn(t *testing.T) {
 	releaseRun := make(chan struct{})
 	recoveryEntered := make(chan struct{})
 	releaseRecovery := make(chan struct{})
+	var releaseRunOnce, releaseRecoveryOnce sync.Once
+	releaseAll := func() {
+		releaseRunOnce.Do(func() { close(releaseRun) })
+		releaseRecoveryOnce.Do(func() { close(releaseRecovery) })
+	}
+	t.Cleanup(releaseAll)
 	settled := make(chan struct{})
 	_, err := runner.Submit(TaskSpec{
 		Record: runnerRecord(),
@@ -134,14 +482,14 @@ func TestOnSettledWaitsUntilRunAndRecoveryCallbacksReallyReturn(t *testing.T) {
 		t.Fatal("settled callback ran while task callback was still executing")
 	case <-time.After(60 * time.Millisecond):
 	}
-	close(releaseRun)
+	releaseRunOnce.Do(func() { close(releaseRun) })
 	<-recoveryEntered
 	select {
 	case <-settled:
 		t.Fatal("settled callback ran while recovery callback was still executing")
 	case <-time.After(20 * time.Millisecond):
 	}
-	close(releaseRecovery)
+	releaseRecoveryOnce.Do(func() { close(releaseRecovery) })
 	select {
 	case <-settled:
 	case <-time.After(time.Second):
