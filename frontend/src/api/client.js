@@ -125,12 +125,14 @@ export const containerAPI = {
     })
   },
   backupContainer: () => apiClient.get('/api/container/backup'),
+  backupContainerAsync: () => apiClient.post('/api/container/backup'),
   listBackups: () => apiClient.get('/api/container/listBackups'),
   restoreContainer: (filename) => {
-    return apiClient.post(`/api/container/backups/${filename}/restore`)
+    return apiClient.post('/api/container/backups/restore', { filename })
   },
   deleteBackup: (filename) => apiClient.delete(`/api/container/backups?filename=${encodeURIComponent(filename)}`),
   backupToCompose: () => apiClient.get('/api/container/backup2compose'),
+  backupToComposeAsync: () => apiClient.post('/api/container/backup2compose'),
 }
 
 // 镜像相关API

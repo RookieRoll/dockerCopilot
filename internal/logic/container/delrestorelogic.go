@@ -2,7 +2,9 @@ package container
 
 import (
 	"context"
+	"errors"
 	backupService "github.com/onlyLTY/dockerCopilot/internal/backup"
+	"net/http"
 
 	"github.com/onlyLTY/dockerCopilot/internal/svc"
 	"github.com/onlyLTY/dockerCopilot/internal/types"
@@ -26,11 +28,15 @@ func NewDelRestoreLogic(ctx context.Context, svcCtx *svc.ServiceContext) *DelRes
 
 func (l *DelRestoreLogic) DelRestore(req *types.DelContainerBackupReq) (resp *types.Resp, err error) {
 	resp = &types.Resp{}
-	if err := l.service.Delete(req.Filename, ".json", ".yaml"); err != nil {
-		resp.Code = 400
-		resp.Msg = "非法文件名"
+	if err := l.service.Delete(req.Filename, ".json", ".yaml", ".yml"); err != nil {
+		resp.Code = http.StatusBadRequest
+		var statusError interface{ HTTPStatus() int }
+		if errors.As(err, &statusError) {
+			resp.Code = statusError.HTTPStatus()
+		}
+		resp.Msg = err.Error()
 		resp.Data = map[string]interface{}{}
-		return resp, nil
+		return resp, err
 	}
 	resp.Code = 200
 	resp.Msg = "success"

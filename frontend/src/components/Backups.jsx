@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react'
+import React, { useState, useEffect, useCallback } from 'react'
 import {
   HardDrive,
   Trash2,
@@ -12,6 +12,8 @@ import {
 } from 'lucide-react'
 import { containerAPI } from '../api/client.js'
 import { cn } from '../utils/cn.js'
+import { useTask } from '../hooks/useTask.js'
+import { TaskStatusPanel } from './tasks/TaskStatusPanel.jsx'
 
 export function Backups() {
   const [backups, setBackups] = useState([])
@@ -20,6 +22,39 @@ export function Backups() {
   const [isDeleting, setIsDeleting] = useState({})
   const [error, setError] = useState(null)
   const [success, setSuccess] = useState(null)
+
+  const onBackupTaskTerminal = useCallback((task) => {
+    setSuccess(null)
+    if (task.status === 'succeeded') {
+      setSuccessModal({ isOpen: true, message: task.type === 'backup-compose-export' ? 'Compose备份创建成功' : '备份创建成功' })
+      void fetchBackups()
+      return
+    }
+    setError(task.error || task.detailMsg || `备份任务结束，状态：${task.status}`)
+  }, [])
+  const onRestoreTaskTerminal = useCallback((task) => {
+    setSuccess(null)
+    if (task.status === 'succeeded') {
+      setSuccessModal({ isOpen: true, message: `备份 ${task.name || ''} 恢复成功` })
+      return
+    }
+    setError(task.error || task.detailMsg || `恢复任务结束，状态：${task.status}`)
+  }, [])
+  const jsonBackupTask = useTask({
+    taskType: 'backup-export', discoverTaskType: true,
+    storageKey: 'docker_copilot_json_backup_task', onTerminal: onBackupTaskTerminal,
+  })
+  const composeBackupTask = useTask({
+    taskType: 'backup-compose-export', discoverTaskType: true,
+    storageKey: 'docker_copilot_compose_backup_task', onTerminal: onBackupTaskTerminal,
+  })
+  const restoreTask = useTask({
+    taskType: 'backup-restore', discoverTaskType: true,
+    storageKey: 'docker_copilot_backup_restore_task', onTerminal: onRestoreTaskTerminal,
+  })
+  const hasActiveTask = [jsonBackupTask, composeBackupTask, restoreTask].some(({ task, taskId, isTracking }) =>
+    task?.status === 'queued' || task?.status === 'running' || (isTracking && Boolean(taskId)))
+  const isRestoreTaskActive = restoreTask.task?.status === 'queued' || restoreTask.task?.status === 'running' || (restoreTask.isTracking && Boolean(restoreTask.taskId))
 
   // 自定义确认弹窗状态
   const [confirmModal, setConfirmModal] = useState({
@@ -64,14 +99,8 @@ export function Backups() {
       setSuccess(null)
       setError(null)
 
-      const response = await containerAPI.backupContainer()
-      if (response.data && (response.data.code === 0 || response.data.code === 200)) {
-        setSuccessModal({ isOpen: true, message: '备份创建成功' })
-        // 刷新备份列表
-        fetchBackups()
-      } else {
-        setError(response.data?.msg || '备份创建失败')
-      }
+      await jsonBackupTask.submit(() => containerAPI.backupContainerAsync())
+      setSuccess('备份任务已接受；完成后会更新文件列表。')
     } catch (error) {
       setError(error.response?.data?.msg || error.message || '备份创建失败')
     } finally {
@@ -88,14 +117,8 @@ export function Backups() {
       setSuccess(null)
       setError(null)
 
-      const response = await containerAPI.backupToCompose()
-      if (response.data && (response.data.code === 0 || response.data.code === 200)) {
-        setSuccessModal({ isOpen: true, message: 'Compose备份创建成功' })
-        // 刷新备份列表
-        fetchBackups()
-      } else {
-        setError(response.data?.msg || 'Compose备份创建失败')
-      }
+      await composeBackupTask.submit(() => containerAPI.backupToComposeAsync())
+      setSuccess('Compose导出任务已接受；完成后会更新文件列表。')
     } catch (error) {
       setError(error.response?.data?.msg || error.message || 'Compose备份创建失败')
     } finally {
@@ -112,15 +135,8 @@ export function Backups() {
       setError(null)
       setSuccess(null)
 
-      console.log('开始恢复备份:', filename)
-      const response = await containerAPI.restoreContainer(filename)
-      console.log('恢复备份响应:', response.data)
-
-      if (response.data && (response.data.code === 0 || response.data.code === 200)) {
-        setSuccessModal({ isOpen: true, message: `备份 ${filename} 恢复成功` })
-      } else {
-        setError(response.data?.msg || `备份 ${filename} 恢复失败`)
-      }
+      await restoreTask.submit(() => containerAPI.restoreContainer(filename))
+      setSuccess(`备份 ${filename} 恢复任务已接受；请等待任务进入成功终态。`)
     } catch (error) {
       console.error('恢复备份详细错误:', {
         status: error.response?.status,
@@ -149,8 +165,7 @@ export function Backups() {
       // 3秒后清除成功消息
       setTimeout(() => setSuccessModal({ isOpen: false, message: '' }), 3000)
 
-      // 刷新备份列表
-      fetchBackups()
+      // The task panel tracks completion; accepting the request is not completion.
     }
   }
 
@@ -158,7 +173,7 @@ export function Backups() {
     setConfirmModal({
       isOpen: true,
       title: '恢复备份',
-      message: `确定要恢复备份文件 ${filename} 吗？这将覆盖当前容器配置。`,
+      message: `确定要恢复备份文件 ${filename} 吗？已存在的同名容器会跳过；创建成功的容器不会自动启动。此备份只包含容器配置，不包含数据卷内容。`,
       onConfirm: () => {
         setConfirmModal({ ...confirmModal, isOpen: false })
         handleRestore(filename)
@@ -382,12 +397,12 @@ export function Backups() {
         <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
           <div>
             <h2 className="text-2xl font-bold text-gray-900 dark:text-white mb-1">备份管理</h2>
-            <p className="text-gray-600 dark:text-gray-400">创建、恢复和删除容器备份</p>
+            <p className="text-gray-600 dark:text-gray-400">备份和恢复容器配置；数据卷内容不会包含在备份中。</p>
           </div>
           <div className="flex items-center gap-2">
             <button
               onClick={handleBackupToCompose}
-              disabled={isBackingUp}
+              disabled={isBackingUp || hasActiveTask}
               className="flex items-center gap-2 px-4 py-2 bg-purple-100 text-purple-700 dark:bg-purple-900 dark:text-purple-200 rounded-lg hover:bg-purple-200 dark:hover:bg-purple-800 transition-colors disabled:opacity-50"
             >
               <FileCode className={`h-4 w-4 ${isBackingUp ? 'animate-spin' : ''}`} />
@@ -395,7 +410,7 @@ export function Backups() {
             </button>
             <button
               onClick={handleBackup}
-              disabled={isBackingUp}
+              disabled={isBackingUp || hasActiveTask}
               className="flex items-center gap-2 px-4 py-2 bg-blue-100 text-blue-700 dark:bg-blue-900 dark:text-blue-200 rounded-lg hover:bg-blue-200 dark:hover:bg-blue-800 transition-colors disabled:opacity-50"
             >
               <Save className={`h-4 w-4 ${isBackingUp ? 'animate-spin' : ''}`} />
@@ -411,6 +426,14 @@ export function Backups() {
             </button>
           </div>
         </div>
+      </div>
+
+      <div className="px-4 sm:px-6">
+        {[jsonBackupTask, composeBackupTask, restoreTask]
+          .filter(tracker => tracker.task || tracker.taskId || tracker.connectionError || tracker.unauthorized || tracker.submitError)
+          .map((tracker, index) => (
+            <TaskStatusPanel key={index} {...tracker} isTracking={Boolean(tracker.taskId && tracker.isTracking)} />
+          ))}
       </div>
 
       {/* 状态消息 */}
@@ -576,7 +599,8 @@ export function Backups() {
                       <div className="flex gap-2 pt-4 border-t border-gray-100 dark:border-gray-700">
                         <button
                           onClick={() => showRestoreConfirm(backup)}
-                          className="flex-1 flex items-center justify-center gap-1.5 px-2 py-1.5 text-sm text-teal-600 dark:text-teal-400 hover:bg-teal-50 dark:hover:bg-teal-900/20 rounded-lg transition-colors active:scale-95"
+                          disabled={isLoading || isRestoreTaskActive}
+                          className="flex-1 flex items-center justify-center gap-1.5 px-2 py-1.5 text-sm text-teal-600 dark:text-teal-400 hover:bg-teal-50 dark:hover:bg-teal-900/20 rounded-lg transition-colors active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed"
                         >
                           <RotateCcw className="h-3.5 w-3.5" />
                           <span>恢复</span>

@@ -9,7 +9,9 @@ import (
 
 	backupService "github.com/onlyLTY/dockerCopilot/internal/backup"
 	"path/filepath"
+	"sync"
 
+	"github.com/onlyLTY/dockerCopilot/internal/observability"
 	"github.com/onlyLTY/dockerCopilot/internal/operation"
 	"github.com/onlyLTY/dockerCopilot/internal/svc"
 	"github.com/onlyLTY/dockerCopilot/internal/task"
@@ -60,16 +62,23 @@ func (l *RestoreLogic) Restore(req *types.ContainerRestoreReq) (resp *types.Resp
 	if l.taskRunner == nil {
 		return nil, taskUnavailableError("task runner is unavailable")
 	}
+	releaseFile, leaseErr := l.service.AcquireRestoreFileLease(fileName)
+	if leaseErr != nil {
+		return &types.Resp{Msg: leaseErr.Error(), Data: map[string]any{}}, leaseErr
+	}
+	var releaseFileOnce sync.Once
+	finishFileLease := func() { releaseFileOnce.Do(releaseFile) }
 	taskID := uuid.NewString()
 	var mutationLease *operation.MutationLease
 	taskID, submitErr := l.taskRunner.Submit(task.TaskSpec{
-		Record: task.Record{TaskID: taskID, Type: "backup-restore", Name: fileName},
+		Record: task.Record{TaskID: taskID, Type: "backup-restore", Name: fileName, RequestID: observability.RequestIDFromContext(l.ctx)},
 		OnAccepted: func() error {
 			var acquireErr error
 			mutationLease, acquireErr = l.gate.Acquire(l.ctx, taskID)
 			return acquireErr
 		},
 		OnSettled: func() {
+			finishFileLease()
 			if mutationLease != nil {
 				mutationLease.Release()
 			}
@@ -81,7 +90,16 @@ func (l *RestoreLogic) Restore(req *types.ContainerRestoreReq) (resp *types.Resp
 			result, restoreErr := l.service.RestoreWithResults(ctx, fileName, execution.TaskID())
 			if len(result.Items) > 0 {
 				if err := execution.Critical("restore-items", func(record *task.Record) {
+					record.SuccessCount, record.FailedCount, record.SkippedCount = 0, 0, 0
 					for _, item := range result.Items {
+						switch item.Status {
+						case "succeeded":
+							record.SuccessCount++
+						case "failed":
+							record.FailedCount++
+						case "skipped":
+							record.SkippedCount++
+						}
 						record.Items = append(record.Items, task.Item{
 							ID: fmt.Sprintf("%d", item.Index), Name: item.Name,
 							Status: item.Status, Error: item.Error,
@@ -98,6 +116,7 @@ func (l *RestoreLogic) Restore(req *types.ContainerRestoreReq) (resp *types.Resp
 		},
 	})
 	if submitErr != nil {
+		finishFileLease()
 		if mutationLease != nil {
 			mutationLease.Release()
 		}

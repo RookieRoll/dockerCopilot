@@ -3,6 +3,7 @@ package backup
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -12,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	dockerClient "github.com/docker/docker/client"
 	"github.com/onlyLTY/dockerCopilot/internal/operation"
@@ -19,12 +21,14 @@ import (
 )
 
 type restoreDaemon struct {
-	mu        sync.Mutex
-	existing  []string
-	pulls     []string
-	created   []map[string]json.RawMessage
-	started   int
-	listCalls int
+	mu          sync.Mutex
+	existing    []string
+	pulls       []string
+	created     []map[string]json.RawMessage
+	started     int
+	listCalls   int
+	pullEntered chan struct{}
+	pullRelease chan struct{}
 }
 
 func (d *restoreDaemon) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -47,6 +51,13 @@ func (d *restoreDaemon) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		d.mu.Lock()
 		d.pulls = append(d.pulls, image+":"+tag)
 		d.mu.Unlock()
+		if d.pullEntered != nil && d.pullRelease != nil {
+			select {
+			case d.pullEntered <- struct{}{}:
+			default:
+			}
+			<-d.pullRelease
+		}
 		if strings.HasSuffix(image, "/broken") {
 			http.Error(w, `{"message":"pull denied"}`, http.StatusInternalServerError)
 			return
@@ -212,5 +223,72 @@ func TestRestoreSkipsContainerOwnedByAnotherOperation(t *testing.T) {
 	}
 	if len(daemon.pulls) != 0 || len(daemon.created) != 0 || daemon.started != 0 {
 		t.Fatalf("restore performed Docker mutation for an owned container: pulls=%v creates=%d starts=%d", daemon.pulls, len(daemon.created), daemon.started)
+	}
+}
+
+func TestDeleteRejectsBackupWhileRestoreUsesIt(t *testing.T) {
+	directory := t.TempDir()
+	filename := "in-use.json"
+	data := `[{"Name":"in-use","Config":{"Image":"example/image:1"},"HostConfig":{}}]`
+	if err := os.WriteFile(filepath.Join(directory, filename), []byte(data), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	daemon := &restoreDaemon{pullEntered: make(chan struct{}, 1), pullRelease: make(chan struct{})}
+	service := newRestoreTestService(t, directory, daemon, operation.NewCoordinator())
+	finished := make(chan error, 1)
+	go func() {
+		_, err := service.RestoreWithResults(context.Background(), filename, "task-in-use")
+		finished <- err
+	}()
+	select {
+	case <-daemon.pullEntered:
+	case <-time.After(5 * time.Second):
+		close(daemon.pullRelease)
+		t.Fatal("restore did not begin pulling its image")
+	}
+	deleteErr := service.Delete(filename, ".json")
+	var inUse *FileInUseError
+	if !errors.As(deleteErr, &inUse) || inUse.HTTPStatus() != http.StatusConflict {
+		t.Fatalf("delete error=%v; want conflict while restore is active", deleteErr)
+	}
+	close(daemon.pullRelease)
+	select {
+	case err := <-finished:
+		if err != nil {
+			t.Fatalf("restore failed after release: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("restore did not finish after daemon resumed")
+	}
+	if err := service.Delete(filename, ".json"); err != nil {
+		t.Fatalf("delete should succeed after restore releases file: %v", err)
+	}
+}
+
+func TestBackupManagementRejectsSymlinkEscape(t *testing.T) {
+	directory := t.TempDir()
+	outside := filepath.Join(t.TempDir(), "outside.json")
+	if err := os.WriteFile(outside, []byte("[]"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(directory, "escape.json")); err != nil {
+		t.Skipf("symlinks are unavailable on this platform: %v", err)
+	}
+	service := NewService(nil, directory)
+	if _, err := service.Resolve("escape.json", ".json"); err == nil {
+		t.Fatal("Resolve accepted a symlink to an outside file")
+	}
+	if err := service.Delete("escape.json", ".json"); err == nil {
+		t.Fatal("Delete accepted a symlink to an outside file")
+	}
+	listed, err := service.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(listed) != 0 {
+		t.Fatalf("List included a symlink as a backup file: %v", listed)
+	}
+	if _, err := os.Stat(outside); err != nil {
+		t.Fatalf("outside target was affected: %v", err)
 	}
 }

@@ -9,7 +9,9 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
+	"sync"
 
 	dockerBackend "github.com/docker/docker/api/types/backend"
 	dockercontainer "github.com/docker/docker/api/types/container"
@@ -22,6 +24,7 @@ import (
 )
 
 var filenamePattern = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
+var containerNamePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]*$`)
 
 // Service owns backup storage and Docker export/restore source files.
 type Service struct {
@@ -31,7 +34,18 @@ type Service struct {
 	coordinator *operation.Coordinator
 	newSuffix   func() string
 	writeData   func(io.Writer, []byte) (int, error)
+	fileMu      sync.Mutex
+	activeFiles map[string]int
 }
+
+type FileInUseError struct{ Filename string }
+
+func (e *FileInUseError) Error() string {
+	return fmt.Sprintf("backup file %q is currently in use by a restore task", e.Filename)
+}
+
+func (*FileInUseError) HTTPStatus() int   { return 409 }
+func (*FileInUseError) ErrorCode() string { return "BACKUP_FILE_IN_USE" }
 
 type ProgressCallbacks struct {
 	Update func(string, types.TaskProgress)
@@ -41,8 +55,9 @@ type ProgressCallbacks struct {
 func NewService(docker *client.Client, directory string, coordinators ...*operation.Coordinator) *Service {
 	service := &Service{
 		docker: docker, dir: strings.TrimSpace(directory),
-		newSuffix: func() string { return strings.ReplaceAll(uuid.NewString(), "-", "") },
-		writeData: func(writer io.Writer, data []byte) (int, error) { return writer.Write(data) },
+		newSuffix:   func() string { return strings.ReplaceAll(uuid.NewString(), "-", "") },
+		writeData:   func(writer io.Writer, data []byte) (int, error) { return writer.Write(data) },
+		activeFiles: make(map[string]int),
 	}
 	if len(coordinators) > 0 {
 		service.coordinator = coordinators[0]
@@ -64,7 +79,8 @@ func (s *Service) List() ([]string, error) {
 	}
 	var result []string
 	for _, entry := range entries {
-		if !entry.IsDir() && (filepath.Ext(entry.Name()) == ".json" || filepath.Ext(entry.Name()) == ".yaml") {
+		extension := filepath.Ext(entry.Name())
+		if !entry.IsDir() && entry.Type()&os.ModeSymlink == 0 && (strings.EqualFold(extension, ".json") || strings.EqualFold(extension, ".yaml") || strings.EqualFold(extension, ".yml")) {
 			result = append(result, entry.Name())
 		}
 	}
@@ -93,6 +109,11 @@ func (s *Service) Resolve(filename string, extensions ...string) (string, error)
 	if full != base && !strings.HasPrefix(full, base+string(os.PathSeparator)) {
 		return "", fmt.Errorf("非法文件名")
 	}
+	if info, err := os.Lstat(full); err == nil && info.Mode()&os.ModeSymlink != 0 {
+		return "", fmt.Errorf("备份文件不能是符号链接")
+	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return "", fmt.Errorf("检查备份文件失败: %w", err)
+	}
 	return full, nil
 }
 
@@ -101,7 +122,59 @@ func (s *Service) Delete(filename string, extensions ...string) error {
 	if err != nil {
 		return err
 	}
+	s.fileMu.Lock()
+	defer s.fileMu.Unlock()
+	if s.activeFiles == nil {
+		s.activeFiles = make(map[string]int)
+	}
+	if s.activeFiles[activeFileKey(path)] > 0 {
+		return &FileInUseError{Filename: filepath.Base(path)}
+	}
 	return os.Remove(path)
+}
+
+func (s *Service) acquireRestoreFile(filename string) (string, func(), error) {
+	path, err := s.Resolve(filename, ".json")
+	if err != nil {
+		return "", nil, err
+	}
+	s.fileMu.Lock()
+	info, statErr := os.Lstat(path)
+	if statErr != nil {
+		s.fileMu.Unlock()
+		return "", nil, statErr
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+		s.fileMu.Unlock()
+		return "", nil, fmt.Errorf("backup file must be a regular file")
+	}
+	key := activeFileKey(path)
+	s.activeFiles[key]++
+	s.fileMu.Unlock()
+	return path, func() {
+		s.fileMu.Lock()
+		defer s.fileMu.Unlock()
+		if s.activeFiles[key] <= 1 {
+			delete(s.activeFiles, key)
+		} else {
+			s.activeFiles[key]--
+		}
+	}, nil
+}
+
+// AcquireRestoreFileLease protects a backup file from deletion for the full
+// lifetime of an accepted restore, including time spent queued by the runner.
+func (s *Service) AcquireRestoreFileLease(filename string) (func(), error) {
+	_, release, err := s.acquireRestoreFile(filename)
+	return release, err
+}
+
+func activeFileKey(path string) string {
+	clean := filepath.Clean(path)
+	if runtime.GOOS == "windows" {
+		return strings.ToLower(clean)
+	}
+	return clean
 }
 
 func (s *Service) Export(ctx context.Context) error {
@@ -145,10 +218,11 @@ func (s *Service) RestoreWithResults(ctx context.Context, filename, taskID strin
 		update()
 		return err
 	}
-	path, err := s.Resolve(filename, ".json")
+	path, releaseFile, err := s.acquireRestoreFile(filename)
 	if err != nil {
 		return result, fail("非法文件名", err)
 	}
+	defer releaseFile()
 	content, err := os.ReadFile(path)
 	if err != nil {
 		return result, fail("读取文件失败或者未找到文件。请确认文件名仅由大小写字母、数字和短横线组成", err)
@@ -161,7 +235,7 @@ func (s *Service) RestoreWithResults(ctx context.Context, filename, taskID strin
 		return result, fail("备份文件没有可恢复的容器", errors.New("backup contains no containers"))
 	}
 	for i, item := range configs {
-		if item.Config == nil || strings.TrimSpace(item.Config.Image) == "" || !validContainerName(item.Name) {
+		if item.Config == nil || strings.TrimSpace(item.Config.Image) == "" || item.Config.Image != strings.TrimSpace(item.Config.Image) || !validContainerName(item.Name) {
 			return result, fail("备份文件结构无效", fmt.Errorf("container entry %d must include a valid name and image", i+1))
 		}
 	}
@@ -267,16 +341,7 @@ func (s *Service) reserveRestore(ctx context.Context, name string) (*operation.L
 }
 
 func validContainerName(name string) bool {
-	name = strings.TrimSpace(name)
-	if name == "" || name != strings.TrimLeft(name, "/") || strings.ContainsAny(name, " \t\r\n") {
-		return false
-	}
-	for _, r := range name {
-		if !(r == '_' || r == '.' || r == '-' || r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9') {
-			return false
-		}
-	}
-	return true
+	return name == strings.TrimSpace(name) && containerNamePattern.MatchString(name)
 }
 
 func formatRestoreResults(items []RestoreItemResult) string {

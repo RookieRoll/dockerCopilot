@@ -94,6 +94,9 @@ func TestRestoreTaskPersistsPerContainerPartialResults(t *testing.T) {
 	if err != nil || record.Status != task.StatusFailed || len(record.Items) != 2 {
 		t.Fatalf("restore task status/items=%s/%+v err=%v", record.Status, record.Items, err)
 	}
+	if record.SuccessCount != 1 || record.FailedCount != 1 || record.SkippedCount != 0 {
+		t.Fatalf("unexpected restore counts: success=%d failed=%d skipped=%d", record.SuccessCount, record.FailedCount, record.SkippedCount)
+	}
 	if record.Items[0].Name != "pull-fails" || record.Items[0].Status != "failed" || record.Items[0].Error == "" || record.Items[1].Name != "create-succeeds" || record.Items[1].Status != "succeeded" {
 		t.Fatalf("task did not persist the per-container outcomes: %+v", record.Items)
 	}
