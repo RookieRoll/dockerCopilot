@@ -284,7 +284,22 @@ func cleanupEligible(record Record) bool {
 	if !record.Status.Terminal() || record.RequiresAttention || len(record.ProtectedNames) != 0 {
 		return false
 	}
-	return record.Recovery.Status == "not-needed" || record.Recovery.Status == "restored"
+	if record.Recovery.Status != "not-needed" && record.Recovery.Status != "restored" {
+		return false
+	}
+	for _, item := range record.Items {
+		if item.RequiresAttention || len(item.ProtectedNames) != 0 || itemRecoveryUnresolved(item) {
+			return false
+		}
+	}
+	return true
+}
+
+func itemRecoveryUnresolved(item Item) bool {
+	if item.Recovery.Status == "" && item.SnapshotRef == "" {
+		return false
+	}
+	return recoveryUnresolved(item.Recovery)
 }
 
 type StartupStore interface {

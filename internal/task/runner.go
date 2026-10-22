@@ -12,6 +12,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/onlyLTY/dockerCopilot/internal/observability"
+	"github.com/zeromicro/go-zero/core/logx"
 )
 
 var (
@@ -192,7 +193,7 @@ func (r *Runner) Submit(spec TaskSpec) (string, error) {
 		if err := invokeAccepted(spec.OnAccepted); err != nil {
 			r.queued--
 			cause := fmt.Errorf("task acceptance callback: %w", err)
-			r.finalizeWithoutExecution(rec, cause)
+			r.finalizeWithoutExecution(rec, cause, false)
 			r.markIdleLocked()
 			return "", cause
 		}
@@ -200,6 +201,8 @@ func (r *Runner) Submit(spec TaskSpec) (string, error) {
 	spec.Record = cloneRecord(rec)
 	select {
 	case r.queue <- queuedTask{spec: spec, accepted: rec}:
+		observability.LogTaskEvent(context.Background(), "task.accepted", rec.TaskID, rec.RequestID,
+			taskEventFields(rec, string(StatusQueued), nil, r.now())...)
 		return rec.TaskID, nil
 	default:
 		// Queue capacity is sized to the maximum admitted outstanding work.
@@ -242,9 +245,11 @@ func (r *Runner) execute(q queuedTask) {
 	rec.UpdatedAt = started
 	rec.Stage = "starting"
 	if err := r.store.Save(rec); err != nil {
-		r.finalizeWithoutExecution(rec, fmt.Errorf("persist running task: %w", err))
+		r.finalizeWithoutExecution(rec, fmt.Errorf("persist running task: %w", err), true)
 		return
 	}
+	observability.LogTaskEvent(context.Background(), "task.started", rec.TaskID, rec.RequestID,
+		taskEventFields(rec, string(StatusRunning), nil, r.now())...)
 	ctx, cancel := context.WithTimeout(context.Background(), r.taskTimeout)
 	e := &Execution{store: r.store, record: rec, ctx: ctx, cancel: cancel, now: r.now, report: r.writeOutput}
 	done := make(chan taskOutcome, 1)
@@ -334,6 +339,9 @@ func (r *Runner) finishExecution(e *Execution, out taskOutcome, recoverFn Recove
 				pendingHandoffFailed = true
 			} else {
 				e.deferFinalization()
+				rec := e.current()
+				observability.LogTaskEvent(context.Background(), "task.handoff_pending", rec.TaskID, rec.RequestID,
+					logx.Field("taskType", rec.Type), logx.Field("status", string(rec.Status)))
 				return
 			}
 		}
@@ -379,7 +387,9 @@ func (r *Runner) finishExecution(e *Execution, out taskOutcome, recoverFn Recove
 				status = StatusFailed
 				recovery = Recovery{Status: "failed", Detail: recoveryErr.Error()}
 			}
-			r.finish(e, status, cause, recovery, recoveryErr != nil || recovery.Status == "unknown" || recovery.Status == "failed")
+			attention := recoveryErr != nil || recovery.Status == "unknown" || recovery.Status == "failed"
+			r.logRecovery(e, recovery, attention)
+			r.finish(e, status, cause, recovery, attention)
 			return
 		case <-call.ctx.Done():
 			timeoutErr := call.ctx.Err()
@@ -401,7 +411,7 @@ func (r *Runner) finishExecution(e *Execution, out taskOutcome, recoverFn Recove
 		}
 		return
 	}
-	r.finish(e, status, nil, Recovery{}, false)
+	r.finish(e, status, nil, Recovery{Status: "not-needed"}, false)
 }
 
 func (r *Runner) runRecoveryAndReconcile(e *Execution, recoverFn RecoveryFunc, cause error, out taskOutcome, rollbackHandoff func(context.Context, Record) error) {
@@ -477,7 +487,19 @@ func (r *Runner) reconcileRecovery(e *Execution, recovery Recovery, attention bo
 	}
 	if err := store.Reconcile(e.taskID(), finding); err != nil {
 		r.writeOutput("task %s recovery finding not durably saved: %v\n", e.taskID(), err)
+		return
 	}
+	r.logRecovery(e, recovery, attention)
+}
+
+func (r *Runner) logRecovery(e *Execution, recovery Recovery, attention bool) {
+	e.mu.Lock()
+	rec := cloneRecord(e.record)
+	e.mu.Unlock()
+	observability.LogTaskEvent(context.Background(), "task.recovery", rec.TaskID, rec.RequestID,
+		append(taskEventFields(rec, recovery.Status, nil, r.now()),
+			logx.Field("recoveryStatus", recovery.Status),
+			logx.Field("requiresAttention", attention))...)
 }
 
 type recoveryResult struct {
@@ -568,10 +590,15 @@ func (r *Runner) finish(e *Execution, status Status, cause error, recovery Recov
 	e.cancel()
 	if err != nil {
 		r.writeOutput("task %s final result is not durably saved: %v\n", rec.TaskID, err)
+	} else {
+		observability.LogTaskEvent(context.Background(), "task.finished", rec.TaskID, rec.RequestID,
+			append(taskEventFields(rec, string(rec.Status), cause, r.now()),
+				logx.Field("recoveryStatus", rec.Recovery.Status),
+				logx.Field("requiresAttention", rec.RequiresAttention))...)
 	}
 }
 
-func (r *Runner) finalizeWithoutExecution(rec Record, cause error) {
+func (r *Runner) finalizeWithoutExecution(rec Record, cause error, accepted bool) {
 	rec.Status = StatusFailed
 	rec.IsDone = true
 	rec.Error = cause.Error()
@@ -581,6 +608,9 @@ func (r *Runner) finalizeWithoutExecution(rec Record, cause error) {
 	rec.UpdatedAt = finished
 	if err := r.store.Save(rec); err != nil {
 		r.writeOutput("task %s could not persist start failure or final result: %v\n", rec.TaskID, errors.Join(cause, err))
+	} else if accepted {
+		observability.LogTaskEvent(context.Background(), "task.finished", rec.TaskID, rec.RequestID,
+			taskEventFields(rec, string(rec.Status), cause, r.now())...)
 	}
 }
 
@@ -588,6 +618,57 @@ func (r *Runner) writeOutput(format string, args ...any) {
 	r.outputMu.Lock()
 	defer r.outputMu.Unlock()
 	_, _ = fmt.Fprintf(r.output, format, args...)
+}
+
+func taskEventFields(record Record, result string, cause error, now time.Time) []logx.LogField {
+	containerID := record.NewContainerID
+	if containerID == "" {
+		containerID = record.OldContainerID
+	}
+	if containerID == "" && len(record.ContainerIDs) > 0 {
+		containerID = record.ContainerIDs[0]
+	}
+	imageRef := record.ImageRef
+	if imageRef == "" {
+		imageRef = record.Options.Image
+	}
+	name := record.Name
+	if len(record.Items) > 0 {
+		if record.Items[0].Name != "" {
+			name = record.Items[0].Name
+		}
+		if imageRef == "" {
+			imageRef = record.Items[0].ImageRef
+		}
+	}
+	imageRef = observability.RedactText(imageRef)
+	imageID := ""
+	if len(record.ImageIDs) > 0 {
+		imageID = record.ImageIDs[len(record.ImageIDs)-1]
+	} else if len(record.Items) > 0 && len(record.Items[0].ImageIDs) > 0 {
+		imageID = record.Items[0].ImageIDs[len(record.Items[0].ImageIDs)-1]
+	}
+	fields := []logx.LogField{
+		logx.Field("taskType", record.Type),
+		logx.Field("operation", record.Type),
+		logx.Field("stage", record.Stage),
+		logx.Field("containerId", containerID),
+		logx.Field("name", name),
+		logx.Field("imageRef", imageRef),
+		logx.Field("imageId", imageID),
+		logx.Field("result", result),
+		logx.Field("status", result),
+	}
+	if record.StartedAt != nil {
+		fields = append(fields, logx.Field("durationMs", now.Sub(*record.StartedAt).Milliseconds()))
+	}
+	if cause != nil {
+		fields = append(fields,
+			logx.Field("errorCode", observability.SafeErrorCode(cause)),
+			logx.Field("error", observability.RedactText(cause.Error())),
+		)
+	}
+	return fields
 }
 
 func (r *Runner) markIdleLocked() {
@@ -702,25 +783,35 @@ func (e *Execution) TaskID() string { e.mu.Lock(); defer e.mu.Unlock(); return e
 
 func (e *Execution) Progress(stage string, percentage int, message string) error {
 	e.mu.Lock()
-	defer e.mu.Unlock()
 	if e.finalized {
+		e.mu.Unlock()
 		return ErrExecutionClosed
 	}
-	if err := e.ctx.Err(); err != nil {
+	if err := taskContextError(e.ctx); err != nil {
+		e.mu.Unlock()
 		return err
 	}
 	if e.criticalErr != nil {
+		e.mu.Unlock()
 		return e.criticalErr
 	}
 	next := cloneRecord(e.record)
+	previousStage := e.record.Stage
 	next.Stage = stage
 	next.Percentage = percentage
 	next.Message = message
 	next.UpdatedAt = e.now().UTC()
 	if err := e.store.Save(next); err != nil {
+		e.mu.Unlock()
 		return err
 	}
 	e.record = next
+	e.mu.Unlock()
+	if previousStage != stage {
+		observability.LogTaskEvent(context.Background(), "task.stage", next.TaskID, next.RequestID,
+			append(taskEventFields(next, string(next.Status), nil, e.now()),
+				logx.Field("percentage", percentage))...)
+	}
 	return nil
 }
 
@@ -764,6 +855,55 @@ func (e *Execution) Critical(stage string, mutate func(*Record)) error {
 // their parent task committed.
 func (e *Execution) CriticalCommit(stage string, mutate func(*Record)) error {
 	return e.critical(stage, mutate, true)
+}
+
+// CriticalItemCommit persists one batch item's commit fact together with its
+// checkpoint. The item is considered committed only after Save succeeds;
+// this does not commit the parent batch task.
+func (e *Execution) CriticalItemCommit(index int, stage string, mutate func(*Record)) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.finalized {
+		return ErrExecutionClosed
+	}
+	if e.criticalErr != nil {
+		return e.criticalErr
+	}
+	if err := taskContextError(e.ctx); err != nil {
+		e.cancel()
+		return err
+	}
+	if index < 0 || index >= len(e.record.Items) {
+		return errors.New("batch item index is invalid")
+	}
+	next := cloneRecord(e.record)
+	next.Stage = stage
+	if mutate != nil {
+		mutate(&next)
+	}
+	next.Items[index].Committed = true
+	if next.TaskID != e.record.TaskID || next.Type != e.record.Type || next.Status != StatusRunning || !next.CreatedAt.Equal(e.record.CreatedAt) || next.RequestID != e.record.RequestID || !optionsEqual(next.Options, e.record.Options) {
+		return errors.New("critical checkpoint cannot change task identity or status")
+	}
+	next.UpdatedAt = e.now().UTC()
+	if err := e.store.Save(next); err != nil {
+		e.criticalErr = fmt.Errorf("critical task checkpoint %q failed: %w", stage, err)
+		// Keep observations such as the replacement ID, but never promote an
+		// unpersisted commit. A previously durable commit remains true.
+		next.Items[index].Committed = e.record.Items[index].Committed
+		e.record = next
+		if e.report != nil {
+			e.report("task %s critical persistence failure: %v\n", next.TaskID, e.criticalErr)
+		}
+		e.cancel()
+		return e.criticalErr
+	}
+	e.record = next
+	if err := taskContextError(e.ctx); err != nil {
+		e.cancel()
+		return err
+	}
+	return nil
 }
 
 func (e *Execution) critical(stage string, mutate func(*Record), commit bool) error {
@@ -836,7 +976,8 @@ func (e *Execution) MarkPendingInstall(marker PendingInstallHandoff) error {
 	if !completePendingInstallMarker(&marker) {
 		return errors.New("pending install marker is incomplete or invalid")
 	}
-	if err := e.ctx.Err(); err != nil {
+	if err := taskContextError(e.ctx); err != nil {
+		e.cancel()
 		return err
 	}
 	next := cloneRecord(e.record)
@@ -889,6 +1030,19 @@ func (e *Execution) current() Record { e.mu.Lock(); defer e.mu.Unlock(); return 
 func (e *Execution) failure() error  { e.mu.Lock(); defer e.mu.Unlock(); return e.criticalErr }
 func (e *Execution) taskID() string  { e.mu.Lock(); defer e.mu.Unlock(); return e.record.TaskID }
 
+func taskContextError(ctx context.Context) error {
+	if ctx == nil {
+		return context.Canceled
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if deadline, ok := ctx.Deadline(); ok && !time.Now().Before(deadline) {
+		return context.DeadlineExceeded
+	}
+	return nil
+}
+
 func (e *Execution) reconciliation(recovery Recovery, attention bool) Reconciliation {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -900,6 +1054,12 @@ func settleBatchItems(rec *Record, status Status) {
 		return
 	}
 	for i := range rec.Items {
+		if rec.Items[i].Committed {
+			rec.Items[i].Status = "succeeded"
+			rec.Items[i].RequiresAttention = false
+			rec.Items[i].ProtectedNames = nil
+			continue
+		}
 		switch rec.Items[i].Status {
 		case "queued":
 			rec.Items[i].Status = "skipped"
@@ -912,8 +1072,53 @@ func settleBatchItems(rec *Record, status Status) {
 				rec.Items[i].Error = "item was running when task ended; outcome is uncertain"
 			}
 		}
+		if rec.Items[i].Status == "failed" && len(rec.Items[i].ProtectedNames) > 0 && rec.Items[i].Recovery.Status == "" {
+			rec.Items[i].Recovery = Recovery{Status: "unknown", Detail: "item recovery did not complete before the task ended"}
+			rec.Items[i].RequiresAttention = true
+		}
 	}
 	recountBatchItems(rec)
+}
+
+// batchRecoveryTimedOut saves an unresolved item recovery result before
+// cancelling the parent execution. It intentionally bypasses the expired task
+// context, but remains private to the runner and only updates the current
+// running record's item recovery facts.
+func (e *Execution) batchRecoveryTimedOut(index int, timeoutErr error) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.finalized {
+		return ErrExecutionClosed
+	}
+	if index < 0 || index >= len(e.record.Items) {
+		return errors.New("batch recovery item index is invalid")
+	}
+	next := cloneRecord(e.record)
+	item := &next.Items[index]
+	item.Recovery = Recovery{Status: "unknown", Detail: "item recovery exceeded its deadline; outcome is uncertain"}
+	item.RequiresAttention = true
+	if len(item.ProtectedNames) == 0 && item.Name != "" {
+		item.ProtectedNames = []string{item.Name}
+	}
+	if timeoutErr != nil && item.Error == "" {
+		item.Error = "item recovery timed out: " + timeoutErr.Error()
+	}
+	next.UpdatedAt = e.now().UTC()
+	recountBatchItems(&next)
+	if err := e.store.Save(next); err != nil {
+		e.criticalErr = fmt.Errorf("persist batch item recovery timeout: %w", err)
+		// Keep the in-memory fact for terminal persistence and cancellation even
+		// when this checkpoint itself could not be made durable.
+		e.record = next
+		if e.report != nil {
+			e.report("task %s recovery timeout persistence failure: %v\n", next.TaskID, e.criticalErr)
+		}
+		e.cancel()
+		return e.criticalErr
+	}
+	e.record = next
+	e.cancel()
+	return nil
 }
 
 func recountBatchItems(rec *Record) {
@@ -931,22 +1136,32 @@ func recountBatchItems(rec *Record) {
 }
 
 type BatchOperation struct {
-	Item       Item
-	SkipReason string
-	Run        func(context.Context, *Execution) error
+	Item               Item
+	SkipReason         string
+	InitialError       string
+	PreserveFinalStage bool
+	Run                func(context.Context, *Execution) error
+	Recover            RecoveryFunc
 }
 
 // SubmitBatch runs every item serially inside one worker. It never submits
 // child tasks to the same queue and therefore cannot deadlock by holding a
 // worker while awaiting another worker from that pool.
 func (r *Runner) SubmitBatch(record Record, operations []BatchOperation, recoverFn RecoveryFunc) (string, error) {
+	return r.SubmitBatchWithHooks(record, operations, recoverFn, nil, nil)
+}
+
+// SubmitBatchWithHooks is SubmitBatch plus the same narrow acceptance and
+// settlement hooks used by single tasks, so callers can bind batch-wide
+// leases for the full worker and recovery lifecycle.
+func (r *Runner) SubmitBatchWithHooks(record Record, operations []BatchOperation, recoverFn RecoveryFunc, onAccepted func() error, onSettled func()) (string, error) {
 	if len(operations) == 0 {
 		return "", errors.New("batch task needs at least one item")
 	}
 	operations = append([]BatchOperation(nil), operations...)
 	items := make([]Item, len(operations))
 	for i, operation := range operations {
-		if operation.Run == nil && operation.SkipReason == "" {
+		if operation.Run == nil && operation.SkipReason == "" && operation.InitialError == "" {
 			return "", fmt.Errorf("batch item %d has no callback", i)
 		}
 		items[i] = operation.Item
@@ -961,6 +1176,19 @@ func (r *Runner) SubmitBatch(record Record, operations []BatchOperation, recover
 		for i, operation := range operations {
 			if err := ctx.Err(); err != nil {
 				break
+			}
+			if operation.InitialError != "" {
+				initialError := operation.InitialError
+				if err := e.Critical("batch-item-preflight-failed", func(r *Record) {
+					r.Items[i].Status = "failed"
+					r.Items[i].Stage = "preflight"
+					r.Items[i].Error = initialError
+					recountBatchItems(r)
+				}); err != nil {
+					return errors.Join(errors.Join(failures...), err)
+				}
+				failures = append(failures, errors.New(initialError))
+				continue
 			}
 			if operation.SkipReason != "" {
 				if err := e.Critical("batch-item-skipped", func(r *Record) {
@@ -989,7 +1217,9 @@ func (r *Runner) SubmitBatch(record Record, operations []BatchOperation, recover
 			}
 			if err := e.Critical("batch-item-finished", func(r *Record) {
 				r.Items[i].Status = status
-				r.Items[i].Stage = "finished"
+				if !operation.PreserveFinalStage || r.Items[i].Stage == "" {
+					r.Items[i].Stage = "finished"
+				}
 				r.Items[i].Error = detail
 				recountBatchItems(r)
 			}); err != nil {
@@ -998,24 +1228,58 @@ func (r *Runner) SubmitBatch(record Record, operations []BatchOperation, recover
 			if e.failure() != nil {
 				return errors.Join(errors.Join(failures...), e.failure())
 			}
+			if status == "failed" && operation.Recover != nil {
+				cause := out.err
+				if cause == nil {
+					cause = errors.New("batch item failed")
+				}
+				call := r.startRecovery(operation.Recover, cause, e)
+				var result recoveryResult
+				select {
+				case result = <-call.done:
+					call.cancel()
+				case <-call.ctx.Done():
+					// Make the uncertain outcome queryable immediately and cancel the
+					// parent task. The batch callback still holds its worker/lease until
+					// this non-cooperative recovery function actually returns.
+					timeoutErr := call.ctx.Err()
+					persistErr := e.batchRecoveryTimedOut(i, timeoutErr)
+					call.cancel()
+					<-call.done
+					return errors.Join(errors.Join(failures...), fmt.Errorf("batch item recovery timed out: %w", timeoutErr), persistErr)
+				}
+				recovery := result.recovery
+				if result.err == nil && recovery.Status == "" {
+					recovery = Recovery{Status: "unknown", Detail: "recovery callback returned no status"}
+				}
+				if result.err != nil {
+					recovery = Recovery{Status: "failed", Detail: result.err.Error()}
+				}
+				attention := result.err != nil || recovery.Status == "unknown" || recovery.Status == "failed"
+				if err := e.Critical("batch-item-recovery-result", func(record *Record) {
+					item := &record.Items[i]
+					item.Recovery = recovery
+					item.RequiresAttention = attention
+					if attention {
+						if len(item.ProtectedNames) == 0 && item.Name != "" {
+							item.ProtectedNames = []string{item.Name}
+						}
+					} else {
+						item.ProtectedNames = nil
+					}
+					recountBatchItems(record)
+				}); err != nil {
+					return errors.Join(errors.Join(failures...), err)
+				}
+				if attention {
+					return errors.Join(errors.Join(failures...), errors.New("batch item recovery is unresolved; later items were not started"))
+				}
+			}
 		}
 		if ctx.Err() != nil {
 			return errors.Join(errors.Join(failures...), ctx.Err())
 		}
 		return errors.Join(failures...)
 	}
-	return r.Submit(TaskSpec{Record: record, Run: run, Recover: recoverFn})
-}
-
-func taskContextError(ctx context.Context) error {
-	if ctx == nil {
-		return context.Canceled
-	}
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	if deadline, ok := ctx.Deadline(); ok && !time.Now().Before(deadline) {
-		return context.DeadlineExceeded
-	}
-	return nil
+	return r.Submit(TaskSpec{Record: record, Run: run, Recover: recoverFn, OnAccepted: onAccepted, OnSettled: onSettled})
 }

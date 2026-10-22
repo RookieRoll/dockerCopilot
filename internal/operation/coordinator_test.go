@@ -7,6 +7,74 @@ import (
 	"time"
 )
 
+func TestReserveBatchContextCreatesSingleParentLeaseAcrossTargets(t *testing.T) {
+	c := NewCoordinator()
+	reservation, err := c.ReserveBatchContext(context.Background(), Request{TaskID: "batch-parent", Kind: "container-batch-restart"}, []Target{{ID: "id-1", Name: "one"}, {ID: "id-2", Name: "two"}, {ID: "id-1", Name: "one"}})
+	if err != nil || reservation.Lease == nil {
+		t.Fatalf("batch reservation=%+v err=%v", reservation, err)
+	}
+	if err := reservation.Lease.Confirm(); err != nil {
+		t.Fatal(err)
+	}
+	for _, target := range []Target{{ID: "id-1", Name: "one"}, {ID: "id-2", Name: "two"}} {
+		if !c.Owns("batch-parent", target) {
+			t.Fatalf("batch parent does not own %#v", target)
+		}
+	}
+	if _, err := c.Reserve(Request{TaskID: "other", Kind: "container-stop", Target: Target{ID: "id-2"}}); err == nil {
+		t.Fatal("expected conflict while batch lease is active")
+	} else {
+		var conflictErr *ConflictError
+		if !errors.As(err, &conflictErr) || conflictErr.TaskID != "batch-parent" {
+			t.Fatalf("conflict should point to parent task, got %v", err)
+		}
+	}
+	reservation.Lease.Release()
+	if c.Owns("batch-parent", Target{ID: "id-1"}) || c.Owns("batch-parent", Target{ID: "id-2"}) {
+		t.Fatal("release did not release every batch target")
+	}
+}
+
+func TestReserveBatchContextDoesNotPartiallyAcquireOnConflict(t *testing.T) {
+	c := NewCoordinator()
+	owner, err := c.Reserve(Request{TaskID: "owner", Kind: "container-stop", Target: Target{ID: "occupied", Name: "busy"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := owner.Lease.Confirm(); err != nil {
+		t.Fatal(err)
+	}
+	_, err = c.ReserveBatchContext(context.Background(), Request{TaskID: "batch", Kind: "container-batch-start"}, []Target{{ID: "free", Name: "free-name"}, {ID: "occupied", Name: "busy"}})
+	var conflictErr *ConflictError
+	if !errors.As(err, &conflictErr) || conflictErr.TaskID != "owner" {
+		t.Fatalf("batch conflict=%v", err)
+	}
+	if c.Owns("batch", Target{ID: "free", Name: "free-name"}) {
+		t.Fatal("failed batch reservation partially acquired an unconflicted target")
+	}
+}
+
+func TestReserveAvailableBatchContextReturnsPerTargetConflictAndReservesOthers(t *testing.T) {
+	c := NewCoordinator()
+	owner, err := c.Reserve(Request{TaskID: "busy-task", Kind: "container-stop", Target: Target{ID: "busy", Name: "busy-name"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := owner.Lease.Confirm(); err != nil {
+		t.Fatal(err)
+	}
+	reservation, err := c.ReserveAvailableBatchContext(context.Background(), Request{TaskID: "batch", Kind: "container-batch-start"}, []Target{{ID: "free", Name: "free-name"}, {ID: "busy", Name: "busy-name"}})
+	if err != nil || reservation.Lease == nil || len(reservation.Conflicts) != 1 {
+		t.Fatalf("partial reservation=%+v err=%v", reservation, err)
+	}
+	if reservation.Conflicts[0].TaskID != "busy-task" || reservation.Conflicts[0].Target.ID != "busy" {
+		t.Fatalf("conflict details=%+v", reservation.Conflicts)
+	}
+	if !c.Owns("batch", Target{ID: "free", Name: "free-name"}) || c.Owns("batch", Target{ID: "busy", Name: "busy-name"}) {
+		t.Fatal("partial lease did not protect exactly its available targets")
+	}
+}
+
 func TestReserveDeduplicatesEquivalentQueuedUpdateAndConflictsOtherwise(t *testing.T) {
 	c := NewCoordinator()
 	first, err := c.Reserve(Request{TaskID: "task-a", Kind: ContainerUpdate, Target: Target{ID: "abcdef", Name: "/web"}, EquivalenceKey: "nginx|delete=true"})

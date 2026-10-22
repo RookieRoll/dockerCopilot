@@ -108,6 +108,11 @@ export const versionAPI = {
 // 容器相关API
 export const containerAPI = {
   getContainers: () => apiClient.get('/api/containers'),
+  batchContainers: (action, containerIDs, deleteOldContainer) => apiClient.post('/api/containers/batch', {
+    action,
+    containerIDs,
+    ...(deleteOldContainer === undefined ? {} : { deleteOldContainer }),
+  }),
   saveConfiguredPorts: (id, ports) => apiClient.put(`/api/container/${id}/configured-ports`, { ports }),
   startContainer: (id) => apiClient.post(`/api/container/${id}/start`),
   stopContainer: (id) => apiClient.post(`/api/container/${id}/stop`),

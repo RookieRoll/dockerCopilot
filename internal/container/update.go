@@ -57,7 +57,10 @@ type UpdateCallbacks struct {
 	SaveSnapshot func([]byte) error
 	Checkpoint   func(UpdateCheckpoint) error
 	OnCreated    func(string) error
-	Validation   UpdateValidationOptions
+	// CandidateOwnerID isolates replacement labels when a parent batch task
+	// performs multiple serial updates. Empty uses the task ID.
+	CandidateOwnerID string
+	Validation       UpdateValidationOptions
 }
 
 type UpdateValidationOptions struct {
@@ -264,7 +267,11 @@ func (s *Service) UpdateWithOptions(ctx context.Context, id, name, imageRef stri
 	if createConfig.Labels == nil {
 		createConfig.Labels = make(map[string]string)
 	}
-	createConfig.Labels[updateTaskLabel] = taskID
+	candidateOwnerID := taskID
+	if callbacks.CandidateOwnerID != "" {
+		candidateOwnerID = callbacks.CandidateOwnerID
+	}
+	createConfig.Labels[updateTaskLabel] = candidateOwnerID
 	hostConfig := preserveObservedVolumes(before.HostConfig, before.Mounts)
 	networks := copyCreateNetworks(before.NetworkSettings)
 	created, err := s.docker.ContainerCreate(ctx, &createConfig, hostConfig, networks, nil, name)
@@ -353,6 +360,12 @@ func (s *Service) updateWarning(callback func(string), message, oldID string, ca
 // then restores the original container name and running state when possible.
 // Any ambiguity is reported as unknown without deleting or renaming anything.
 func (s *Service) RecoverUpdate(ctx context.Context, taskID string, snapshotBytes []byte, state UpdateRecoveryState, checkpoint func(UpdateCheckpoint) error) (UpdateRecoveryResult, error) {
+	return s.RecoverUpdateWithOwner(ctx, taskID, taskID, snapshotBytes, state, checkpoint)
+}
+
+// RecoverUpdateWithOwner separates the operation lease owner (the parent
+// task) from the unique replacement label owner (a batch item ID).
+func (s *Service) RecoverUpdateWithOwner(ctx context.Context, taskID, candidateOwnerID string, snapshotBytes []byte, state UpdateRecoveryState, checkpoint func(UpdateCheckpoint) error) (UpdateRecoveryResult, error) {
 	unknown := func(detail string) UpdateRecoveryResult {
 		return UpdateRecoveryResult{Status: "unknown", Detail: detail}
 	}
@@ -366,6 +379,9 @@ func (s *Service) RecoverUpdate(ctx context.Context, taskID string, snapshotByte
 	if before.ContainerJSONBase == nil || before.Config == nil || before.HostConfig == nil || before.ID == "" {
 		return unknown("私有容器快照缺少原容器身份或配置；未执行自动恢复"), errors.New("update snapshot is missing required original container facts")
 	}
+	if before.State == nil {
+		return unknown("私有容器快照缺少原容器运行状态；未执行自动恢复"), errors.New("update snapshot is missing original container state")
+	}
 	oldID := state.OldContainerID
 	if oldID == "" {
 		oldID = before.ID
@@ -378,7 +394,7 @@ func (s *Service) RecoverUpdate(ctx context.Context, taskID string, snapshotByte
 	case "", "preflight", "snapshot", "snapshot-saved", "pulling-image", "resolving-image", "image-resolved":
 		return UpdateRecoveryResult{Status: "not-needed", Detail: "更新尚未进入旧容器修改阶段"}, nil
 	case "replacement-committed", "removing-old", "old-removed", "cleanup-old":
-		return UpdateRecoveryResult{Status: "not-needed", Detail: "新容器替换已提交；清理结果需单独核对，不回滚已提交替换"}, nil
+		return UpdateRecoveryResult{Status: "not-needed", Detail: "新容器已持久提交；清理旧容器不会触发回滚"}, nil
 	case "stopping-old", "old-stopped", "renaming-old", "old-renamed", "creating-new", "created-new", "starting-new", "new-started", "validating-new", "recovery-new-discovered", "recovery-removing-new", "recovery-restoring-name", "recovery-starting-old", "recovery-stopping-old":
 	default:
 		return unknown("更新阶段无法识别；未执行自动恢复"), nil
@@ -416,7 +432,10 @@ func (s *Service) RecoverUpdate(ctx context.Context, taskID string, snapshotByte
 			return unknown("无法核对已记录的新容器ID；未执行自动恢复"), fmt.Errorf("inspect recorded replacement during recovery: %w", inspectErr)
 		}
 	}
-	args := filters.NewArgs(filters.Arg("label", updateTaskLabel+"="+taskID))
+	if strings.TrimSpace(candidateOwnerID) == "" {
+		return unknown("任务更新项缺少候选容器所有权标记；未执行自动恢复"), errors.New("candidate owner ID is required")
+	}
+	args := filters.NewArgs(filters.Arg("label", updateTaskLabel+"="+candidateOwnerID))
 	listed, listErr := s.docker.ContainerList(ctx, container.ListOptions{All: true, Filters: args})
 	if listErr != nil {
 		return unknown("无法按任务标签核对可能的新容器；未执行自动恢复"), fmt.Errorf("list task-labeled replacement containers: %w", listErr)
@@ -427,7 +446,7 @@ func (s *Service) RecoverUpdate(ctx context.Context, taskID string, snapshotByte
 		if inspectErr != nil {
 			return unknown("无法检查任务标签对应的新容器；未执行自动恢复"), fmt.Errorf("inspect task-labeled replacement: %w", inspectErr)
 		}
-		if !matchesUpdateCandidate(inspected, taskID, state.ResolvedImageID, originalName) {
+		if !matchesUpdateCandidate(inspected, candidateOwnerID, state.ResolvedImageID, originalName) {
 			return unknown("任务标签对应容器与持久化镜像或名称不匹配；未执行删除"), nil
 		}
 		if candidate != nil && candidate.ID != inspected.ID {
@@ -440,7 +459,7 @@ func (s *Service) RecoverUpdate(ctx context.Context, taskID string, snapshotByte
 		return unknown("记录的新容器未出现在唯一任务标签结果中；未执行自动恢复"), nil
 	}
 	if candidate != nil {
-		if !matchesUpdateCandidate(*candidate, taskID, state.ResolvedImageID, originalName) {
+		if !matchesUpdateCandidate(*candidate, candidateOwnerID, state.ResolvedImageID, originalName) {
 			return unknown("记录的新容器身份与任务标签、固定镜像ID或目标名称不匹配；未执行删除"), nil
 		}
 		if newID == "" {

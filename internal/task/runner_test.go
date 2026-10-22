@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1251,6 +1252,109 @@ func TestRunnerCriticalCheckpointDeadlinePreventsNextStep(t *testing.T) {
 	}
 }
 
+func TestRunnerDurableCommitSurvivesDeadlineDuringCheckpoint(t *testing.T) {
+	store := newRunnerMemoryStore()
+	store.saveErr = func(record Record, _ int) error {
+		if record.Stage == "replacement-committed" {
+			time.Sleep(45 * time.Millisecond)
+		}
+		return nil
+	}
+	runner := newTestRunner(t, store, RunnerOptions{MaxConcurrent: 1, QueueCapacity: 1, TaskTimeout: 20 * time.Millisecond})
+	var recoveryCalls atomic.Int32
+	id, err := runner.Submit(TaskSpec{Record: runnerRecord(), Run: func(ctx context.Context, execution *Execution) error {
+		return execution.CriticalCommit("replacement-committed", nil)
+	}, Recover: func(context.Context, error) (Recovery, error) {
+		recoveryCalls.Add(1)
+		return Recovery{Status: "restored"}, nil
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := runner.WaitIdle(testContext(t, time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	record, err := store.Get(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.Status != StatusSucceeded || record.Stage != "replacement-committed" || recoveryCalls.Load() != 0 || len(record.Warnings) == 0 {
+		t.Fatalf("deadline rolled back durable commit: record=%#v recovery calls=%d", record, recoveryCalls.Load())
+	}
+}
+
+func TestRunnerCommittedTimeoutIsQueryableButRetainsWorkerUntilRunReturns(t *testing.T) {
+	store := newRunnerMemoryStore()
+	runner := newTestRunner(t, store, RunnerOptions{MaxConcurrent: 1, QueueCapacity: 1, TaskTimeout: 30 * time.Millisecond})
+	blocked := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseRun := func() { releaseOnce.Do(func() { close(release) }) }
+	var settled atomic.Bool
+	t.Cleanup(releaseRun)
+	firstID, err := runner.Submit(TaskSpec{
+		Record: runnerRecord(),
+		Run: func(ctx context.Context, execution *Execution) error {
+			if err := execution.CriticalCommit("replacement-committed", nil); err != nil && !errors.Is(err, context.DeadlineExceeded) {
+				return err
+			}
+			<-ctx.Done()
+			close(blocked)
+			<-release
+			return ctx.Err()
+		},
+		OnSettled: func() { settled.Store(true) },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondStarted := make(chan struct{})
+	secondID, err := runner.Submit(TaskSpec{Record: runnerRecord(), Run: func(context.Context, *Execution) error {
+		close(secondStarted)
+		return nil
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-blocked:
+	case <-time.After(time.Second):
+		t.Fatal("committed callback did not reach its blocked cleanup")
+	}
+	waitFor(t, func() bool {
+		record, getErr := store.Get(firstID)
+		return getErr == nil && record.Status == StatusSucceeded
+	})
+	if settled.Load() {
+		t.Fatal("settlement released the lease before the callback actually returned")
+	}
+	select {
+	case <-secondStarted:
+		t.Fatal("second mutation started while committed callback still held its worker")
+	default:
+	}
+	releaseRun()
+	if err := runner.WaitIdle(testContext(t, time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if !settled.Load() {
+		t.Fatal("settlement callback did not run after the first Run returned")
+	}
+	select {
+	case <-secondStarted:
+	case <-time.After(time.Second):
+		t.Fatal("second task did not start after the first callback returned")
+	}
+	second, err := store.Get(secondID)
+	if err != nil || second.Status != StatusSucceeded {
+		t.Fatalf("second task status=%#v err=%v", second, err)
+	}
+	first, err := store.Get(firstID)
+	if err != nil || first.Status != StatusSucceeded || len(first.Warnings) == 0 {
+		t.Fatalf("first task commit/warning=%#v err=%v", first, err)
+	}
+}
+
 func TestRunnerPanicAndLateProgressCannotChangeTerminalResult(t *testing.T) {
 	store := newRunnerMemoryStore()
 	runner := newTestRunner(t, store, RunnerOptions{MaxConcurrent: 1, QueueCapacity: 1, TaskTimeout: time.Second})
@@ -1311,6 +1415,238 @@ func TestRunnerBatchUsesOneWorkerAndPersistsPartialCounts(t *testing.T) {
 	}
 	if maxActive.Load() != 1 {
 		t.Fatalf("batch item concurrency=%d", maxActive.Load())
+	}
+}
+
+func TestRunnerBatchRecoversFailedItemBeforeStartingNext(t *testing.T) {
+	store := newRunnerMemoryStore()
+	runner := newTestRunner(t, store, RunnerOptions{MaxConcurrent: 1, QueueCapacity: 1, TaskTimeout: time.Second, RecoveryTimeout: time.Second})
+	var mu sync.Mutex
+	var events []string
+	add := func(event string) {
+		mu.Lock()
+		events = append(events, event)
+		mu.Unlock()
+	}
+	_, err := runner.SubmitBatch(Record{SchemaVersion: SchemaVersion, TaskID: uuid.NewString(), Type: "batch", Status: StatusQueued}, []BatchOperation{
+		{Item: Item{ID: "A", Name: "alpha"}, Run: func(context.Context, *Execution) error {
+			add("A failed")
+			return errors.New("A update failed")
+		}, Recover: func(context.Context, error) (Recovery, error) {
+			add("A restored")
+			return Recovery{Status: "restored", Detail: "old A restored"}, nil
+		}},
+		{Item: Item{ID: "B", Name: "bravo"}, Run: func(context.Context, *Execution) error {
+			add("B started")
+			return nil
+		}},
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := runner.WaitIdle(testContext(t, time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	got := append([]string(nil), events...)
+	mu.Unlock()
+	want := []string{"A failed", "A restored", "B started"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("batch event order=%v want %v", got, want)
+	}
+}
+
+func TestRunnerBatchRecoveryTimeoutBlocksLaterItems(t *testing.T) {
+	store := newRunnerMemoryStore()
+	runner := newTestRunner(t, store, RunnerOptions{MaxConcurrent: 1, QueueCapacity: 2, TaskTimeout: time.Second, RecoveryTimeout: 20 * time.Millisecond})
+	recoveryEntered := make(chan struct{})
+	releaseRecovery := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(releaseRecovery) }) }
+	t.Cleanup(release)
+	bStarted := make(chan struct{})
+	id, err := runner.SubmitBatch(Record{SchemaVersion: SchemaVersion, TaskID: uuid.NewString(), Type: "batch", Status: StatusQueued}, []BatchOperation{
+		{Item: Item{ID: "A", Name: "alpha", ProtectedNames: []string{"alpha"}}, Run: func(context.Context, *Execution) error {
+			return errors.New("A update failed")
+		}, Recover: func(context.Context, error) (Recovery, error) {
+			close(recoveryEntered)
+			<-releaseRecovery
+			return Recovery{Status: "restored"}, nil
+		}},
+		{Item: Item{ID: "B", Name: "bravo"}, Run: func(context.Context, *Execution) error {
+			close(bStarted)
+			return nil
+		}},
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-recoveryEntered:
+	case <-time.After(time.Second):
+		t.Fatal("item recovery did not start")
+	}
+	waitFor(t, func() bool {
+		record, getErr := store.Get(id)
+		return getErr == nil && record.Status == StatusFailed && record.Items[0].Recovery.Status == "unknown"
+	})
+	record, err := store.Get(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !record.RequiresAttention || !record.Items[0].RequiresAttention {
+		t.Fatalf("recovery timeout was not queryable as attention-required: %#v", record)
+	}
+	secondStarted := make(chan struct{})
+	_, err = runner.Submit(TaskSpec{Record: runnerRecord(), Run: func(context.Context, *Execution) error {
+		close(secondStarted)
+		return nil
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-bStarted:
+		t.Fatal("later item started while previous recovery remained blocked")
+	default:
+	}
+	select {
+	case <-secondStarted:
+		t.Fatal("another task started while timed-out recovery callback remained blocked")
+	default:
+	}
+	release()
+	if err := runner.WaitIdle(testContext(t, time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-bStarted:
+		t.Fatal("later item started after recovery exceeded its deadline")
+	default:
+	}
+	record, err = store.Get(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.Items[0].Recovery.Status != "unknown" || !record.Items[0].RequiresAttention || record.Items[1].Status != "skipped" {
+		t.Fatalf("batch timeout state did not preserve the terminal uncertainty: %#v", record.Items)
+	}
+	select {
+	case <-secondStarted:
+	default:
+		t.Fatal("queued task did not start after timed-out recovery callback returned")
+	}
+}
+
+func TestRunnerBatchPreservesCommittedItemWhenCommitSaveOutlivesDeadline(t *testing.T) {
+	store := newRunnerMemoryStore()
+	commitSaveEntered := make(chan struct{})
+	releaseCommitSave := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(releaseCommitSave) }) }
+	t.Cleanup(release)
+	store.saveErr = func(record Record, _ int) error {
+		if record.Items != nil && len(record.Items) > 0 && record.Items[0].Committed && record.Stage == "replacement-committed" {
+			select {
+			case <-commitSaveEntered:
+			default:
+				close(commitSaveEntered)
+			}
+			<-releaseCommitSave
+		}
+		return nil
+	}
+	runner := newTestRunner(t, store, RunnerOptions{MaxConcurrent: 1, QueueCapacity: 1, TaskTimeout: 25 * time.Millisecond})
+	id, err := runner.SubmitBatch(runnerRecord(), []BatchOperation{{
+		Item: Item{ID: "committed-item", Name: "alpha"},
+		Run: func(_ context.Context, execution *Execution) error {
+			return execution.Critical("replacement-committed", func(record *Record) {
+				record.Items[0].Committed = true
+				record.Items[0].Stage = "replacement-committed"
+			})
+		},
+	}}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-commitSaveEntered:
+	case <-time.After(time.Second):
+		t.Fatal("commit checkpoint did not reach persistence")
+	}
+	// Let the task deadline expire while the commit save is in flight.
+	time.Sleep(40 * time.Millisecond)
+	release()
+	if err := runner.WaitIdle(testContext(t, time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	record, err := store.Get(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.Status != StatusFailed || record.Items[0].Status != "succeeded" || !record.Items[0].Committed || record.SuccessCount != 1 || record.FailedCount != 0 {
+		t.Fatalf("deadline changed a durable item commit: parent=%s counts=(%d,%d,%d) item=%#v", record.Status, record.SuccessCount, record.FailedCount, record.SkippedCount, record.Items[0])
+	}
+	if public := Public(record); len(public.Items) != 1 || !public.Items[0].Committed {
+		t.Fatalf("committed item fact missing from public projection: %#v", public.Items)
+	}
+}
+
+func TestRunnerBatchCommitSaveFailureDoesNotPromoteItemCommit(t *testing.T) {
+	store := newRunnerMemoryStore()
+	commitErr := errors.New("item commit save failed")
+	store.saveErr = func(record Record, _ int) error {
+		if record.Stage == "batch-item-replacement-committed" && record.Status == StatusRunning {
+			return commitErr
+		}
+		return nil
+	}
+	runner := newTestRunner(t, store, RunnerOptions{MaxConcurrent: 1, QueueCapacity: 1, TaskTimeout: time.Second, RecoveryTimeout: time.Second})
+	var recoverySawUncommitted atomic.Bool
+	var executionRef *Execution
+	record := runnerRecord()
+	record.Items = []Item{{ID: "old-id", Name: "old-name", Status: "queued", SnapshotRef: uuid.NewString()}}
+	id, err := runner.Submit(TaskSpec{
+		Record: record,
+		Run: func(_ context.Context, execution *Execution) error {
+			executionRef = execution
+			if err := execution.Critical("batch-item-start", func(current *Record) {
+				current.Items[0].Status = "running"
+			}); err != nil {
+				return err
+			}
+			return execution.CriticalItemCommit(0, "batch-item-replacement-committed", func(current *Record) {
+				current.Items[0].Stage = "replacement-committed"
+				current.Items[0].NewContainerID = "new-id"
+				current.Items[0].ProtectedNames = []string{"old-name"}
+			})
+		},
+		Recover: func(_ context.Context, cause error) (Recovery, error) {
+			if !errors.Is(cause, commitErr) {
+				return Recovery{}, errors.New("nondurable item commit was treated as committed")
+			}
+			// The failed checkpoint must retain the replacement identity for
+			// bounded rollback, while the success bit remains false.
+			latest := executionRef.Current()
+			if latest.Items[0].NewContainerID != "new-id" || latest.Items[0].Committed {
+				return Recovery{}, errors.New("observed item facts or commit state were incorrect")
+			}
+			recoverySawUncommitted.Store(true)
+			return Recovery{Status: "restored"}, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := runner.WaitIdle(testContext(t, time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	result, err := store.Get(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !recoverySawUncommitted.Load() || result.Status != StatusFailed || result.Items[0].Status != "failed" || result.Items[0].Committed || result.Items[0].NewContainerID != "new-id" || result.Recovery.Status != "restored" {
+		t.Fatalf("failed item commit was promoted or facts lost: %#v", result)
 	}
 }
 
@@ -1438,107 +1774,4 @@ func runBatchCounter(active, maxActive *atomic.Int32, err error) error {
 	time.Sleep(time.Millisecond)
 	active.Add(-1)
 	return err
-}
-
-func TestRunnerDurableCommitSurvivesDeadlineDuringCheckpoint(t *testing.T) {
-	store := newRunnerMemoryStore()
-	store.saveErr = func(record Record, _ int) error {
-		if record.Stage == "replacement-committed" {
-			time.Sleep(45 * time.Millisecond)
-		}
-		return nil
-	}
-	runner := newTestRunner(t, store, RunnerOptions{MaxConcurrent: 1, QueueCapacity: 1, TaskTimeout: 20 * time.Millisecond})
-	var recoveryCalls atomic.Int32
-	id, err := runner.Submit(TaskSpec{Record: runnerRecord(), Run: func(ctx context.Context, execution *Execution) error {
-		return execution.CriticalCommit("replacement-committed", nil)
-	}, Recover: func(context.Context, error) (Recovery, error) {
-		recoveryCalls.Add(1)
-		return Recovery{Status: "restored"}, nil
-	}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := runner.WaitIdle(testContext(t, time.Second)); err != nil {
-		t.Fatal(err)
-	}
-	record, err := store.Get(id)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if record.Status != StatusSucceeded || record.Stage != "replacement-committed" || recoveryCalls.Load() != 0 || len(record.Warnings) == 0 {
-		t.Fatalf("deadline rolled back durable commit: record=%#v recovery calls=%d", record, recoveryCalls.Load())
-	}
-}
-
-func TestRunnerCommittedTimeoutIsQueryableButRetainsWorkerUntilRunReturns(t *testing.T) {
-	store := newRunnerMemoryStore()
-	runner := newTestRunner(t, store, RunnerOptions{MaxConcurrent: 1, QueueCapacity: 1, TaskTimeout: 30 * time.Millisecond})
-	blocked := make(chan struct{})
-	release := make(chan struct{})
-	var releaseOnce sync.Once
-	releaseRun := func() { releaseOnce.Do(func() { close(release) }) }
-	var settled atomic.Bool
-	t.Cleanup(releaseRun)
-	firstID, err := runner.Submit(TaskSpec{
-		Record: runnerRecord(),
-		Run: func(ctx context.Context, execution *Execution) error {
-			if err := execution.CriticalCommit("replacement-committed", nil); err != nil && !errors.Is(err, context.DeadlineExceeded) {
-				return err
-			}
-			<-ctx.Done()
-			close(blocked)
-			<-release
-			return ctx.Err()
-		},
-		OnSettled: func() { settled.Store(true) },
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	secondStarted := make(chan struct{})
-	secondID, err := runner.Submit(TaskSpec{Record: runnerRecord(), Run: func(context.Context, *Execution) error {
-		close(secondStarted)
-		return nil
-	}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	select {
-	case <-blocked:
-	case <-time.After(time.Second):
-		t.Fatal("committed callback did not reach its blocked cleanup")
-	}
-	waitFor(t, func() bool {
-		record, getErr := store.Get(firstID)
-		return getErr == nil && record.Status == StatusSucceeded
-	})
-	if settled.Load() {
-		t.Fatal("settlement released the lease before the callback actually returned")
-	}
-	select {
-	case <-secondStarted:
-		t.Fatal("second mutation started while committed callback still held its worker")
-	default:
-	}
-	releaseRun()
-	if err := runner.WaitIdle(testContext(t, time.Second)); err != nil {
-		t.Fatal(err)
-	}
-	if !settled.Load() {
-		t.Fatal("settlement callback did not run after the first Run returned")
-	}
-	select {
-	case <-secondStarted:
-	case <-time.After(time.Second):
-		t.Fatal("second task did not start after the first callback returned")
-	}
-	second, err := store.Get(secondID)
-	if err != nil || second.Status != StatusSucceeded {
-		t.Fatalf("second task status=%#v err=%v", second, err)
-	}
-	first, err := store.Get(firstID)
-	if err != nil || first.Status != StatusSucceeded || len(first.Warnings) == 0 {
-		t.Fatalf("first task commit/warning=%#v err=%v", first, err)
-	}
 }

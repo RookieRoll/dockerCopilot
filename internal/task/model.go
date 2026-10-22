@@ -37,11 +37,21 @@ type Recovery struct {
 }
 
 type Item struct {
-	ID     string `json:"id,omitempty"`
-	Name   string `json:"name,omitempty"`
-	Status string `json:"status,omitempty"`
-	Stage  string `json:"stage,omitempty"`
-	Error  string `json:"error,omitempty"`
+	ID                  string   `json:"id,omitempty"`
+	Name                string   `json:"name,omitempty"`
+	Status              string   `json:"status,omitempty"`
+	Stage               string   `json:"stage,omitempty"`
+	Error               string   `json:"error,omitempty"`
+	ImageRef            string   `json:"imageRef,omitempty"`
+	OldContainerID      string   `json:"oldContainerID,omitempty"`
+	NewContainerID      string   `json:"newContainerID,omitempty"`
+	BackupContainerName string   `json:"backupContainerName,omitempty"`
+	ImageIDs            []string `json:"imageIDs,omitempty"`
+	ProtectedNames      []string `json:"protectedNames,omitempty"`
+	Recovery            Recovery `json:"recovery,omitempty"`
+	RequiresAttention   bool     `json:"requiresAttention,omitempty"`
+	Committed           bool     `json:"committed,omitempty"`
+	SnapshotRef         string   `json:"snapshotRef,omitempty"`
 }
 
 // ContainerCheck contains only the fields needed to display a startup
@@ -149,11 +159,20 @@ type PublicRecord struct {
 }
 
 type PublicItem struct {
-	ID     string `json:"id,omitempty"`
-	Name   string `json:"name,omitempty"`
-	Status string `json:"status,omitempty"`
-	Stage  string `json:"stage,omitempty"`
-	Error  string `json:"error,omitempty"`
+	ID                  string   `json:"id,omitempty"`
+	Name                string   `json:"name,omitempty"`
+	Status              string   `json:"status,omitempty"`
+	Stage               string   `json:"stage,omitempty"`
+	Error               string   `json:"error,omitempty"`
+	ImageRef            string   `json:"imageRef,omitempty"`
+	OldContainerID      string   `json:"oldContainerID,omitempty"`
+	NewContainerID      string   `json:"newContainerID,omitempty"`
+	BackupContainerName string   `json:"backupContainerName,omitempty"`
+	ImageIDs            []string `json:"imageIDs,omitempty"`
+	ProtectedNames      []string `json:"protectedNames,omitempty"`
+	Recovery            Recovery `json:"recovery,omitempty"`
+	RequiresAttention   bool     `json:"requiresAttention,omitempty"`
+	Committed           bool     `json:"committed,omitempty"`
 }
 
 func Public(r Record) PublicRecord {
@@ -173,7 +192,13 @@ func Public(r Record) PublicRecord {
 	if len(r.Items) != 0 {
 		out.Items = make([]PublicItem, 0, len(r.Items))
 		for _, item := range r.Items {
-			out.Items = append(out.Items, PublicItem{ID: item.ID, Name: item.Name, Status: item.Status, Stage: item.Stage, Error: observability.RedactText(item.Error)})
+			out.Items = append(out.Items, PublicItem{
+				ID: item.ID, Name: item.Name, Status: item.Status, Stage: item.Stage, Error: observability.RedactText(item.Error), ImageRef: item.ImageRef,
+				OldContainerID: item.OldContainerID, NewContainerID: item.NewContainerID, BackupContainerName: item.BackupContainerName,
+				ImageIDs: cloneStrings(item.ImageIDs), ProtectedNames: cloneStrings(item.ProtectedNames),
+				Recovery: publicRecovery(item.Recovery), RequiresAttention: item.RequiresAttention,
+				Committed: item.Committed,
+			})
 		}
 	}
 	return out
@@ -205,6 +230,11 @@ func cloneRecord(r Record) Record {
 	out.Options = cloneOptions(r.Options)
 	out.Warnings = cloneStrings(r.Warnings)
 	out.Items = append([]Item(nil), r.Items...)
+	for i := range out.Items {
+		out.Items[i].ImageIDs = cloneStrings(r.Items[i].ImageIDs)
+		out.Items[i].ProtectedNames = cloneStrings(r.Items[i].ProtectedNames)
+		out.Items[i].Recovery = publicRecovery(r.Items[i].Recovery)
+	}
 	out.ContainerChecks = append([]ContainerCheck(nil), r.ContainerChecks...)
 	if r.PendingInstall != nil {
 		handoff := *r.PendingInstall
@@ -235,6 +265,18 @@ func (r Record) validate() error {
 	}
 	if r.BackupContainerName != "" && !safeContainerName.MatchString(r.BackupContainerName) {
 		return errors.New("backup container name must be a valid Docker name without a leading slash")
+	}
+	itemSnapshots := make(map[string]struct{})
+	for i, item := range r.Items {
+		if item.SnapshotRef != "" {
+			if !validTaskID(item.SnapshotRef) {
+				return fmt.Errorf("item %d has invalid private snapshot reference", i)
+			}
+			if _, exists := itemSnapshots[item.SnapshotRef]; exists {
+				return fmt.Errorf("item %d duplicates a private snapshot reference", i)
+			}
+			itemSnapshots[item.SnapshotRef] = struct{}{}
+		}
 	}
 	return nil
 }

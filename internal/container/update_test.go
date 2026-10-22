@@ -460,6 +460,7 @@ func TestUpdateCleanupFailureAfterCommitIsSuccessfulWithWarning(t *testing.T) {
 	var committed atomic.Bool
 	var cleanupCalls atomic.Int32
 	var cleanupWarning string
+	var finalProgressWarning string
 	service := newUpdateTestService(t, func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.Method == http.MethodGet && r.URL.Path == "/_ping":
@@ -499,6 +500,19 @@ func TestUpdateCleanupFailureAfterCommitIsSuccessfulWithWarning(t *testing.T) {
 		return nil
 	}
 	callbacks.Warning = func(message string) { cleanupWarning = message }
+	callbacks.Progress = func(stage string, _ int, _ string) error {
+		if stage == "completed" {
+			return errors.New("final progress save fault")
+		}
+		return nil
+	}
+	callbacks.Warning = func(message string) {
+		if strings.Contains(message, "最终进度") {
+			finalProgressWarning = message
+			return
+		}
+		cleanupWarning = message
+	}
 	err := service.UpdateWithOptions(context.Background(), "old-canonical-id", "web", "web:next", true, "task-cleanup-warning", callbacks)
 	if err != nil {
 		t.Fatalf("cleanup failure changed successful replacement into task error: %v", err)
@@ -508,6 +522,77 @@ func TestUpdateCleanupFailureAfterCommitIsSuccessfulWithWarning(t *testing.T) {
 	}
 	if !strings.Contains(cleanupWarning, "old-canonical-id") || !strings.Contains(cleanupWarning, "daemon cleanup refused") {
 		t.Fatalf("cleanup failure warning omitted retained old ID or cause: %q", cleanupWarning)
+	}
+	if !strings.Contains(finalProgressWarning, "final progress save fault") {
+		t.Fatalf("post-commit final progress save fault was not downgraded to a warning: %q", finalProgressWarning)
+	}
+}
+
+func TestUpdateCleanupDeadlineDoesNotRollbackCommittedReplacement(t *testing.T) {
+	deleteStarted := make(chan struct{})
+	var oldStartCalls atomic.Int32
+	var cleanupWarning string
+	service := newUpdateTestService(t, func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/_ping":
+			w.Header().Set("API-Version", "1.45")
+			fmt.Fprint(w, "OK")
+		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/v1.45/containers/") && strings.HasSuffix(r.URL.Path, "/json"):
+			id := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/v1.45/containers/"), "/json")
+			if id == "new-id" {
+				fmt.Fprint(w, `{"Id":"new-id","Name":"/web","Image":"sha256:resolved-image-id","State":{"Running":true,"Status":"running","StartedAt":"2026-10-22T00:00:00Z"},"Config":{"Image":"sha256:resolved-image-id"},"HostConfig":{},"NetworkSettings":{"Networks":{}}}`)
+			} else {
+				serveUpdateInspect(w)
+			}
+		case r.Method == http.MethodPost && r.URL.Path == "/v1.45/images/create":
+			fmt.Fprintln(w, `{"status":"pulled"}`)
+		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/v1.45/images/") && strings.HasSuffix(r.URL.Path, "/json"):
+			fmt.Fprint(w, `{"Id":"sha256:resolved-image-id"}`)
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/stop"), r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/rename"):
+			w.WriteHeader(http.StatusNoContent)
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/start"):
+			if strings.Contains(r.URL.Path, "old-canonical-id") {
+				oldStartCalls.Add(1)
+			}
+			w.WriteHeader(http.StatusNoContent)
+		case r.Method == http.MethodPost && r.URL.Path == "/v1.45/containers/create":
+			fmt.Fprint(w, `{"Id":"new-id","Warnings":[]}`)
+		case r.Method == http.MethodDelete && r.URL.Path == "/v1.45/containers/old-canonical-id":
+			close(deleteStarted)
+			<-r.Context().Done()
+		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/v1.45/containers/"):
+			serveUpdateInspect(w)
+		default:
+			http.NotFound(w, r)
+		}
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	callbacks := testUpdateCallbacks(func(string) error { return nil })
+	callbacks.Validation = UpdateValidationOptions{RunningObservation: time.Millisecond, PollInterval: time.Millisecond}
+	callbacks.Warning = func(message string) { cleanupWarning = message }
+	finished := make(chan error, 1)
+	go func() {
+		finished <- service.UpdateWithOptions(ctx, "old-canonical-id", "web", "web:next", true, "task-cleanup-deadline", callbacks)
+	}()
+	select {
+	case <-deleteStarted:
+	case <-time.After(time.Second):
+		t.Fatal("cleanup request did not start")
+	}
+	select {
+	case err := <-finished:
+		if err != nil {
+			t.Fatalf("cleanup deadline changed committed update result: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("update did not finish after cleanup deadline")
+	}
+	if oldStartCalls.Load() != 0 {
+		t.Fatalf("old container was restarted after committed replacement: %d starts", oldStartCalls.Load())
+	}
+	if !strings.Contains(cleanupWarning, "旧容器仍存在") {
+		t.Fatalf("cleanup warning did not report independently inspected old-container state: %q", cleanupWarning)
 	}
 }
 
@@ -708,73 +793,5 @@ func TestUpdateKeepsOriginallyStoppedReplacementStopped(t *testing.T) {
 	}
 	if !strings.Contains(completed, "保持停止") || !strings.Contains(completed, "未执行运行验证") {
 		t.Fatalf("result did not explain stopped-container behavior: %q", completed)
-	}
-}
-
-func TestUpdateCleanupDeadlineDoesNotRollbackCommittedReplacement(t *testing.T) {
-	deleteStarted := make(chan struct{})
-	var oldStartCalls atomic.Int32
-	var cleanupWarning string
-	service := newUpdateTestService(t, func(w http.ResponseWriter, r *http.Request) {
-		switch {
-		case r.Method == http.MethodGet && r.URL.Path == "/_ping":
-			w.Header().Set("API-Version", "1.45")
-			fmt.Fprint(w, "OK")
-		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/v1.45/containers/") && strings.HasSuffix(r.URL.Path, "/json"):
-			id := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/v1.45/containers/"), "/json")
-			if id == "new-id" {
-				fmt.Fprint(w, `{"Id":"new-id","Name":"/web","Image":"sha256:resolved-image-id","State":{"Running":true,"Status":"running","StartedAt":"2026-10-22T00:00:00Z"},"Config":{"Image":"sha256:resolved-image-id"},"HostConfig":{},"NetworkSettings":{"Networks":{}}}`)
-			} else {
-				serveUpdateInspect(w)
-			}
-		case r.Method == http.MethodPost && r.URL.Path == "/v1.45/images/create":
-			fmt.Fprintln(w, `{"status":"pulled"}`)
-		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/v1.45/images/") && strings.HasSuffix(r.URL.Path, "/json"):
-			fmt.Fprint(w, `{"Id":"sha256:resolved-image-id"}`)
-		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/stop"), r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/rename"):
-			w.WriteHeader(http.StatusNoContent)
-		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/start"):
-			if strings.Contains(r.URL.Path, "old-canonical-id") {
-				oldStartCalls.Add(1)
-			}
-			w.WriteHeader(http.StatusNoContent)
-		case r.Method == http.MethodPost && r.URL.Path == "/v1.45/containers/create":
-			fmt.Fprint(w, `{"Id":"new-id","Warnings":[]}`)
-		case r.Method == http.MethodDelete && r.URL.Path == "/v1.45/containers/old-canonical-id":
-			close(deleteStarted)
-			<-r.Context().Done()
-		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/v1.45/containers/"):
-			serveUpdateInspect(w)
-		default:
-			http.NotFound(w, r)
-		}
-	})
-	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
-	defer cancel()
-	callbacks := testUpdateCallbacks(func(string) error { return nil })
-	callbacks.Validation = UpdateValidationOptions{RunningObservation: time.Millisecond, PollInterval: time.Millisecond}
-	callbacks.Warning = func(message string) { cleanupWarning = message }
-	finished := make(chan error, 1)
-	go func() {
-		finished <- service.UpdateWithOptions(ctx, "old-canonical-id", "web", "web:next", true, "task-cleanup-deadline", callbacks)
-	}()
-	select {
-	case <-deleteStarted:
-	case <-time.After(time.Second):
-		t.Fatal("cleanup request did not start")
-	}
-	select {
-	case err := <-finished:
-		if err != nil {
-			t.Fatalf("cleanup deadline changed committed update result: %v", err)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("update did not finish after cleanup deadline")
-	}
-	if oldStartCalls.Load() != 0 {
-		t.Fatalf("old container was restarted after committed replacement: %d starts", oldStartCalls.Load())
-	}
-	if !strings.Contains(cleanupWarning, "旧容器仍存在") {
-		t.Fatalf("cleanup warning did not report independently inspected old-container state: %q", cleanupWarning)
 	}
 }

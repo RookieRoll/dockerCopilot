@@ -199,7 +199,7 @@ func (l *UpdateLogic) Update(req *types.ContainerUpdateReq) (resp *types.Resp, e
 			if err != nil {
 				return err
 			}
-			return execution.Progress("completed", 100, "容器更新完成")
+			return nil
 		},
 		Recover: func(recoveryCtx context.Context, cause error) (task.Recovery, error) {
 			if l.taskStore == nil {

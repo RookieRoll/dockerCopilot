@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -232,6 +233,108 @@ func (s *Store) List() ([]Record, error) {
 	return records, nil
 }
 
+type ProtectedImage struct {
+	TaskID  string
+	ImageID string
+}
+
+// ProtectedImages returns immutable image IDs referenced by active tasks or
+// tasks whose recovery/attention state is unresolved. It fails closed if any
+// task record cannot be read, because a corrupt record may contain a needed
+// recovery image fact. Tags and image options are deliberately excluded.
+func (s *Store) ProtectedImages() ([]ProtectedImage, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.ready(); err != nil {
+		return nil, err
+	}
+	entries, err := os.ReadDir(s.dir)
+	if err != nil {
+		return nil, err
+	}
+	protected := make(map[string]map[string]struct{})
+	for _, entry := range entries {
+		name := entry.Name()
+		if !strings.HasSuffix(name, ".json") {
+			continue
+		}
+		id := strings.TrimSuffix(name, ".json")
+		if !validTaskID(id) {
+			return nil, fmt.Errorf("invalid task record filename %q while listing protected images", name)
+		}
+		record, readErr := s.readRecord(id)
+		if readErr != nil {
+			return nil, fmt.Errorf("read task %s while listing protected images: %w", id, readErr)
+		}
+		if !protectsRecoveryImages(record) {
+			continue
+		}
+		addImage := func(imageID string) {
+			imageID = strings.TrimSpace(imageID)
+			if imageID == "" {
+				return
+			}
+			if protected[record.TaskID] == nil {
+				protected[record.TaskID] = make(map[string]struct{})
+			}
+			protected[record.TaskID][imageID] = struct{}{}
+		}
+		for _, imageID := range record.ImageIDs {
+			addImage(imageID)
+		}
+		for _, item := range record.Items {
+			for _, imageID := range item.ImageIDs {
+				addImage(imageID)
+			}
+		}
+	}
+	result := make([]ProtectedImage, 0)
+	for taskID, imageIDs := range protected {
+		for imageID := range imageIDs {
+			result = append(result, ProtectedImage{TaskID: taskID, ImageID: imageID})
+		}
+	}
+	sort.Slice(result, func(i, j int) bool {
+		if result[i].TaskID == result[j].TaskID {
+			return result[i].ImageID < result[j].ImageID
+		}
+		return result[i].TaskID < result[j].TaskID
+	})
+	return result, nil
+}
+
+// ProtectedImageIDs is a convenience projection for callers that only need
+// the deny-list and do not need to attribute protection to a task.
+func (s *Store) ProtectedImageIDs() ([]string, error) {
+	protected, err := s.ProtectedImages()
+	if err != nil {
+		return nil, err
+	}
+	unique := make(map[string]struct{}, len(protected))
+	for _, image := range protected {
+		unique[image.ImageID] = struct{}{}
+	}
+	result := make([]string, 0, len(unique))
+	for imageID := range unique {
+		result = append(result, imageID)
+	}
+	sort.Strings(result)
+	return result, nil
+}
+
+func protectsRecoveryImages(record Record) bool {
+	if record.Status == StatusQueued || record.Status == StatusRunning || record.RequiresAttention || record.PendingInstall != nil ||
+		recoveryUnresolved(record.Recovery) {
+		return true
+	}
+	for _, item := range record.Items {
+		if item.RequiresAttention || itemRecoveryUnresolved(item) {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *Store) SaveSnapshot(id string, content []byte) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -254,6 +357,57 @@ func (s *Store) SaveSnapshot(id string, content []byte) error {
 		return err
 	}
 	return s.atomicWrite(s.snapshotPath(id), content)
+}
+
+// SaveItemSnapshot stores an independent private rollback snapshot referenced
+// by one batch item. The reference is an opaque UUID, never a path.
+func (s *Store) SaveItemSnapshot(taskID, snapshotID string, content []byte) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.ready(); err != nil {
+		return err
+	}
+	if !validTaskID(taskID) || !validTaskID(snapshotID) {
+		return errors.New("invalid task or item snapshot ID")
+	}
+	record, err := s.readRecord(taskID)
+	if err != nil {
+		return err
+	}
+	if record.Status != StatusQueued && record.Status != StatusRunning {
+		return errors.New("item snapshots can only be saved for active tasks")
+	}
+	if !recordReferencesItemSnapshot(record, snapshotID) {
+		return errors.New("item snapshot reference is not owned by the task")
+	}
+	path := s.itemSnapshotPath(taskID, snapshotID)
+	if _, err := os.Lstat(path); err == nil {
+		return os.ErrExist
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return s.atomicWrite(path, content)
+}
+
+// ReadItemSnapshot reads a private snapshot only when the parent record still
+// references that exact opaque snapshot ID.
+func (s *Store) ReadItemSnapshot(taskID, snapshotID string) ([]byte, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.ready(); err != nil {
+		return nil, err
+	}
+	if !validTaskID(taskID) || !validTaskID(snapshotID) {
+		return nil, errors.New("invalid task or item snapshot ID")
+	}
+	record, err := s.readRecord(taskID)
+	if err != nil {
+		return nil, err
+	}
+	if !recordReferencesItemSnapshot(record, snapshotID) {
+		return nil, errors.New("item snapshot reference is not owned by the task")
+	}
+	return readRegularFile(s.itemSnapshotPath(taskID, snapshotID))
 }
 
 func (s *Store) ReadSnapshot(id string) ([]byte, error) {
@@ -307,6 +461,14 @@ func (s *Store) Delete(id string) error {
 	if err := removeRegularFile(s.snapshotPath(id)); err != nil {
 		return err
 	}
+	for _, item := range r.Items {
+		if item.SnapshotRef == "" {
+			continue
+		}
+		if err := removeRegularFile(s.itemSnapshotPath(id, item.SnapshotRef)); err != nil {
+			return err
+		}
+	}
 	return removeRegularFile(s.recordPath(id))
 }
 
@@ -318,6 +480,18 @@ func (s *Store) ready() error {
 }
 func (s *Store) recordPath(id string) string   { return filepath.Join(s.dir, id+".json") }
 func (s *Store) snapshotPath(id string) string { return filepath.Join(s.dir, id+".snapshot") }
+func (s *Store) itemSnapshotPath(taskID, snapshotID string) string {
+	return filepath.Join(s.dir, taskID+".item-"+snapshotID+".snapshot")
+}
+
+func recordReferencesItemSnapshot(record Record, snapshotID string) bool {
+	for _, item := range record.Items {
+		if item.SnapshotRef == snapshotID {
+			return true
+		}
+	}
+	return false
+}
 
 func (s *Store) writeRecord(r Record) error {
 	b, err := encodeRecord(r)
@@ -411,6 +585,11 @@ func (s *Store) restoreFile(path string, data []byte) error {
 func (r Record) snapshotDeletionAllowed() error {
 	if !r.Status.Terminal() || r.RequiresAttention || len(r.ProtectedNames) > 0 || recoveryUnresolved(r.Recovery) {
 		return errors.New("snapshot or task is still protected by active recovery work")
+	}
+	for _, item := range r.Items {
+		if item.RequiresAttention || len(item.ProtectedNames) > 0 || itemRecoveryUnresolved(item) {
+			return errors.New("snapshot or task is still protected by batch item recovery work")
+		}
 	}
 	return nil
 }

@@ -43,6 +43,19 @@ export function taskIdentifiers(task) {
   }
 }
 
+export function taskBatchSummary(task) {
+  if (!Array.isArray(task?.items) || task.items.length === 0) return null
+  const count = (field, status) => Number.isFinite(Number(task[field]))
+    ? Number(task[field])
+    : task.items.filter((item) => item?.status === status).length
+  return {
+    success: count('successCount', 'succeeded'),
+    failed: count('failedCount', 'failed'),
+    skipped: count('skippedCount', 'skipped'),
+    total: task.items.length,
+  }
+}
+
 export function taskSubmissionOutcome(status) {
   const definitelyRejected = Number.isFinite(status) && status >= 400 && status < 500 && status !== 408 && status !== 429
   return definitelyRejected

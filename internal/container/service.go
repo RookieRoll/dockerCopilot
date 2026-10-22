@@ -5,6 +5,8 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"strings"
 	"sync"
 
@@ -163,6 +165,50 @@ func (s *Service) Restart(ctx context.Context, id string) error {
 	defer lease.Release()
 	timeout := 10
 	return s.docker.ContainerRestart(ctx, canonicalID, container.StopOptions{Signal: "SIGINT", Timeout: &timeout})
+}
+
+type Action string
+
+const (
+	ActionStart   Action = "start"
+	ActionStop    Action = "stop"
+	ActionRestart Action = "restart"
+)
+
+// OperateOwned re-inspects the exact accepted target before applying an
+// operation under the caller's already-confirmed lease. It is used by batch
+// tasks, whose one parent lease protects multiple targets until OnSettled.
+func (s *Service) OperateOwned(ctx context.Context, taskID string, expected operation.Target, action Action) error {
+	if taskID == "" || expected.ID == "" || expected.Name == "" {
+		return errors.New("owned container operation needs its task ID and canonical target")
+	}
+	current, err := s.Inspect(ctx, expected.ID)
+	if err != nil {
+		return err
+	}
+	currentID := current.ID
+	if currentID == "" {
+		currentID = expected.ID
+	}
+	currentName := strings.TrimLeft(strings.TrimSpace(current.Name), "/")
+	if currentID != expected.ID || currentName != expected.Name {
+		return fmt.Errorf("container identity changed after batch acceptance (expected %s/%s, found %s/%s)", expected.ID, expected.Name, currentID, currentName)
+	}
+	if !s.Operations().Owns(taskID, operation.Target{ID: currentID, Name: currentName}) {
+		return errors.New("batch task no longer owns the container operation lease")
+	}
+	switch action {
+	case ActionStart:
+		return s.docker.ContainerStart(ctx, currentID, container.StartOptions{})
+	case ActionStop:
+		timeout := 10
+		return s.docker.ContainerStop(ctx, currentID, container.StopOptions{Signal: "SIGINT", Timeout: &timeout})
+	case ActionRestart:
+		timeout := 10
+		return s.docker.ContainerRestart(ctx, currentID, container.StopOptions{Signal: "SIGINT", Timeout: &timeout})
+	default:
+		return fmt.Errorf("unsupported batch container action %q", action)
+	}
 }
 
 func (s *Service) Rename(ctx context.Context, id, name string) error {

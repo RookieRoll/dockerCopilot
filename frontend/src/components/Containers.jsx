@@ -18,7 +18,7 @@ import {
   Trash2,
   Save
 } from 'lucide-react'
-import { containerAPI, progressAPI, taskAPI } from '../api/client.js'
+import { containerAPI, taskAPI } from '../api/client.js'
 import { cn } from '../utils/cn.js'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { IMAGE_ICON_MAX_BYTES, IMAGE_ICON_SUPPORTED_FORMATS, useImageIcons, uploadImageIcon } from '../hooks/useImageIcons.js'
@@ -90,6 +90,7 @@ const CONTAINER_LABEL = '\u5bb9\u5668'
 const MAX_VISIBLE_PORTS = 4
 const CONTAINER_UPDATE_TASK_STORAGE_KEY = 'docker_copilot_container_update_task'
 const CONTAINER_UPDATE_TASKS_KEY = `${CONTAINER_UPDATE_TASK_STORAGE_KEY}:active-by-name`
+const CONTAINER_BATCH_TASK_STORAGE_KEY = 'docker_copilot_container_batch_task'
 
 function readSavedUpdateTasks() {
   try {
@@ -174,6 +175,41 @@ function ContainerUpdateTaskTracker({ entry, onAccepted, onSubmissionError, onTa
       submitError={tracker.submitError}
       isTracking={tracker.isTracking}
       containerName={entry.name}
+    />
+  )
+}
+
+function ContainerBatchTaskTracker({ submission, onAccepted, onSubmissionError, onTaskUpdate, onTerminal }) {
+  const tracker = useTask({
+    storageKey: CONTAINER_BATCH_TASK_STORAGE_KEY,
+    invalidateKeys: [['containers'], ['tasks']],
+    onTerminal,
+  })
+  const submitted = React.useRef(new Set())
+  const callbacks = React.useRef({ onAccepted, onSubmissionError, onTaskUpdate })
+  callbacks.current = { onAccepted, onSubmissionError, onTaskUpdate }
+
+  React.useEffect(() => {
+    if (!submission || submitted.current.has(submission.nonce)) return
+    submitted.current.add(submission.nonce)
+    tracker.submit(() => containerAPI.batchContainers(submission.action, submission.containerIDs, submission.deleteOldContainer))
+      .then(({ taskID }) => callbacks.current.onAccepted?.(taskID))
+      .catch((error) => callbacks.current.onSubmissionError?.(error))
+  }, [submission?.nonce, tracker.submit])
+
+  React.useEffect(() => {
+    if (tracker.task) callbacks.current.onTaskUpdate?.(tracker.task)
+  }, [tracker.task])
+
+  return (
+    <TaskStatusPanel
+      task={tracker.task}
+      taskId={tracker.taskId}
+      connectionError={tracker.connectionError}
+      unauthorized={tracker.unauthorized}
+      submitError={tracker.submitError}
+      isTracking={tracker.isTracking}
+      containerName={submission ? `批量${({ start: '启动', stop: '停止', restart: '重启', update: '更新' })[submission.action] || '操作'}` : '批量容器操作'}
     />
   )
 }
@@ -345,8 +381,9 @@ export function Containers() {
   const [isBatchMode, setIsBatchMode] = useState(false)
   // 添加操作状态跟踪
   const [containerActions, setContainerActions] = useState({}) // 跟踪每个容器的操作状态
-  const [updateTasks, setUpdateTasks] = useState({}) // 跟踪更新任务
   const [taskTrackers, setTaskTrackers] = useState(readSavedUpdateTasks)
+  const [batchSubmission, setBatchSubmission] = useState(null)
+  const [batchTask, setBatchTask] = useState(null)
   const recoveryStarted = React.useRef(false)
   // 添加筛选状态
   const [filterStatus, setFilterStatus] = useState(null) // null 表示显示全部
@@ -495,127 +532,43 @@ export function Containers() {
 
   // 批量操作处理函数
   const handleBatchAction = async (action) => {
-    try {
-      // 为所有选中的容器设置加载状态
-      selectedContainers.forEach(containerId => {
-        setContainerActions(prev => ({
-          ...prev,
-          [containerId]: { action, loading: true }
-        }))
-      })
+    if (!selectedContainers.length || batchSubmission || (batchTask && ['queued', 'running'].includes(batchTask.status))) return
+    const request = {
+      nonce: submissionNonce(),
+      action,
+      containerIDs: [...selectedContainers],
+      // Preserve the established bulk-update behavior explicitly.
+      ...(action === 'update' ? { deleteOldContainer: true } : {}),
+    }
+    setBatchSubmission(request)
+  }
 
-      // 立即更新本地状态提供即时反馈
-      if (action === 'start' || action === 'stop' || action === 'restart') {
-        queryClient.setQueryData(['containers'], (oldData) => {
-          if (!oldData) return oldData
+  const handleBatchAccepted = () => {
+    setSelectedContainers([])
+    setIsBatchMode(false)
+  }
 
-          return oldData.map(container => {
-            if (selectedContainers.includes(container.id)) {
-              let newStatus = container.status
-              switch (action) {
-                case 'start':
-                  newStatus = 'running'
-                  break
-                case 'stop':
-                  newStatus = 'stopped'
-                  break
-                case 'restart':
-                  newStatus = 'running'
-                  break
-                default:
-                  break
-              }
-              return { ...container, status: newStatus }
-            }
-            return container
-          })
-        })
-      }
-
-      // 对每个选中的容器执行操作
-      for (const containerId of selectedContainers) {
-        try {
-          const container = containers.find(c => c.id === containerId)
-
-          switch (action) {
-            case 'start':
-              await containerAPI.startContainer(containerId)
-              break
-            case 'stop':
-              await containerAPI.stopContainer(containerId)
-              break
-            case 'restart':
-              await containerAPI.restartContainer(containerId)
-              break
-            case 'update':
-              if (container) {
-                const response = await containerAPI.updateContainer(
-                  containerId,
-                  container.name,
-                  container.usingImage,
-                  true
-                )
-
-                if (response.data.code === 200 || response.data.code === 0) {
-                  const taskID = response.data.data?.taskID
-                  if (taskID) {
-                    // 保存任务ID并开始轮询进度
-                    setUpdateTasks(prev => ({
-                      ...prev,
-                      [containerId]: taskID
-                    }))
-                    // 调用轮询进度函数
-                    pollProgress(containerId, taskID)
-                  }
-                }
-              }
-              break
-            default:
-              break
-          }
-        } finally {
-          // 对于非更新操作，立即清除操作状态
-          if (action !== 'update') {
-            setContainerActions(prev => {
-              const newState = { ...prev }
-              delete newState[containerId]
-              return newState
-            })
-          }
+  const handleBatchTaskUpdate = (task) => {
+    setBatchTask(task)
+    const items = Array.isArray(task.items) ? task.items : []
+    setContainerActions((previous) => {
+      const next = { ...previous }
+      for (const item of items) {
+        const ids = [item.id, item.oldContainerID, item.newContainerID].filter(Boolean)
+        if (item.status === 'queued' || item.status === 'running') {
+          for (const id of ids) next[id] = { action: 'batch', loading: true, progress: item.stage || task.message || '批量任务执行中', percentage: task.percentage || 0 }
+        } else {
+          for (const id of ids) delete next[id]
         }
       }
+      return next
+    })
+  }
 
-      // 如果不是更新操作，延迟刷新以获取最新数据
-      if (action !== 'update') {
-        setTimeout(() => {
-          refetch()
-        }, 1500)
-      }
-
-      // 清除选中状态
-      setSelectedContainers([])
-      setIsBatchMode(false)
-    } catch (error) {
-      console.error('批量操作失败:', error)
-      // 清除所有操作状态
-      selectedContainers.forEach(containerId => {
-        setContainerActions(prev => {
-          const newState = { ...prev }
-          delete newState[containerId]
-          return newState
-        })
-      })
-
-      // 使用自定义弹窗显示错误信息
-      setConfirmModal({
-        isOpen: true,
-        title: '操作失败',
-        message: '批量操作失败: ' + (error.response?.data?.msg || error.message || '未知错误'),
-        onConfirm: () => setConfirmModal({ isOpen: false }),
-        onCancel: null,
-        type: 'danger'
-      });
-    }
+  const handleBatchTerminal = (task) => {
+    handleBatchTaskUpdate(task)
+    setBatchTask(task)
+    void refetch()
   }
 
   const handleRenameContainer = async (containerId, newName) => {
@@ -737,136 +690,6 @@ export function Containers() {
       return next
     })
     void refetch()
-  }
-
-  // 轮询进度
-  const pollProgress = async (containerId, taskID) => {
-    const maxAttempts = 60 // 最多轮询60次 (2分钟)
-    let attempts = 0
-    let pollTimer = null
-
-    const clearPollState = () => {
-      if (pollTimer) {
-        clearTimeout(pollTimer)
-        pollTimer = null
-      }
-      setContainerActions(prev => {
-        const newState = { ...prev }
-        delete newState[containerId]
-        return newState
-      })
-      setUpdateTasks(prev => {
-        const newState = { ...prev }
-        delete newState[containerId]
-        return newState
-      })
-    }
-
-    const poll = async () => {
-      try {
-        attempts++
-        const response = await progressAPI.getProgress(taskID)
-        console.log(`进度查询[${attempts}/${maxAttempts}]:`, response.data)
-
-        const data = response.data
-
-        // 提取进度信息
-        let progressMsg = '处理中...'
-        let percentage = 0
-
-        if (data.data?.progress) {
-          progressMsg = data.data.progress
-        } else if (data.data?.message) {
-          progressMsg = data.data.message
-        } else if (data.msg) {
-          progressMsg = data.msg
-        }
-
-        // 提取百分比
-        if (data.data?.percentage !== undefined) {
-          percentage = Math.min(100, Math.max(0, parseFloat(data.data.percentage)))
-        } else if (data.data?.percent !== undefined) {
-          percentage = Math.min(100, Math.max(0, parseFloat(data.data.percent)))
-        } else {
-          // 尝试从进度消息中提取百分比
-          const percentMatch = progressMsg.match(/(\d+(?:\.\d+)?)\s*%/)
-          if (percentMatch) {
-            percentage = Math.min(100, Math.max(0, parseFloat(percentMatch[1])))
-          } else {
-            // 根据轮询次数估算进度
-            percentage = Math.min(95, (attempts / maxAttempts) * 100)
-          }
-        }
-
-        // 检查是否完成 - 兼容多种响应格式
-        const status = data.data?.status || data.status
-        const isDone = data.data?.isDone === true ||
-          status === 'completed' ||
-          status === 'success' ||
-          status === 'done' ||
-          status === 'finish' ||
-          status === 'finished'
-
-        // 检查是否失败
-        const isFailed = status === 'failed' ||
-          status === 'error' ||
-          progressMsg.includes('失败') ||
-          progressMsg.includes('错误') ||
-          data.code === 500 ||
-          data.code === 400
-
-        const isCompleted = isDone && !isFailed
-
-        if (isCompleted) {
-          // 任务完成 - 立即停止轮询
-          console.log('容器更新完成，停止轮询')
-          clearPollState()
-          await refetch()
-          console.log('✅ 容器更新完成!')
-          return // 确保不再继续执行
-        }
-
-        if (isFailed) {
-          // 任务失败 - 立即停止轮询
-          console.log('容器更新失败，停止轮询')
-          clearPollState()
-          // 添加更详细的错误信息
-          const errorMsg = data.data?.error || data.data?.message || data.msg || '更新失败'
-          console.error(`❌ 更新失败: ${errorMsg}`)
-
-          return // 确保不再继续执行
-        }
-
-        // 更新容器操作状态，显示进度
-        setContainerActions(prev => ({
-          ...prev,
-          [containerId]: {
-            action: 'update',
-            loading: true,
-            progress: progressMsg,
-            percentage: percentage
-          }
-        }))
-
-        // 继续轮询
-        if (attempts < maxAttempts) {
-          pollTimer = setTimeout(poll, 2000) // 2秒后再次查询
-        } else {
-          clearPollState()
-          console.error('⏱️ 更新超时，请检查容器状态')
-
-        }
-      } catch (error) {
-        console.error('查询进度失败:', error)
-        clearPollState()
-        console.error(`❌ 更新失败: ${error.response?.data?.msg || error.message}`)
-        // 显示网络错误或其他异常情况的友好提示
-
-      }
-    }
-
-    // 开始轮询
-    poll()
   }
 
   // 容器选择处理函数
@@ -1043,7 +866,7 @@ export function Containers() {
             </button>
             <button
               className={`btn-primary flex items-center justify-center px-3 sm:px-4 py-2 gap-1 sm:gap-2 ${selectedContainers.length === 0 ? 'opacity-50 cursor-not-allowed' : ''}`}
-              disabled={selectedContainers.length === 0}
+              disabled={selectedContainers.length === 0 || Boolean(batchSubmission) || Boolean(batchTask && ['queued', 'running'].includes(batchTask.status))}
               onClick={() => handleBatchAction('start')}
               title="启动"
             >
@@ -1052,7 +875,7 @@ export function Containers() {
             </button>
             <button
               className={`btn-secondary flex items-center justify-center px-3 sm:px-4 py-2 gap-1 sm:gap-2 ${selectedContainers.length === 0 ? 'opacity-50 cursor-not-allowed' : ''}`}
-              disabled={selectedContainers.length === 0}
+              disabled={selectedContainers.length === 0 || Boolean(batchSubmission) || Boolean(batchTask && ['queued', 'running'].includes(batchTask.status))}
               onClick={() => handleBatchAction('stop')}
               title="停止"
             >
@@ -1061,7 +884,7 @@ export function Containers() {
             </button>
             <button
               className={`btn-secondary flex items-center justify-center px-3 sm:px-4 py-2 gap-1 sm:gap-2 ${selectedContainers.length === 0 ? 'opacity-50 cursor-not-allowed' : ''}`}
-              disabled={selectedContainers.length === 0}
+              disabled={selectedContainers.length === 0 || Boolean(batchSubmission) || Boolean(batchTask && ['queued', 'running'].includes(batchTask.status))}
               onClick={() => handleBatchAction('restart')}
               title="重启"
             >
@@ -1070,7 +893,7 @@ export function Containers() {
             </button>
             <button
               className={`btn-secondary flex items-center justify-center px-3 sm:px-4 py-2 gap-1 sm:gap-2 ${selectedContainers.length === 0 ? 'opacity-50 cursor-not-allowed' : ''}`}
-              disabled={selectedContainers.length === 0}
+              disabled={selectedContainers.length === 0 || Boolean(batchSubmission) || Boolean(batchTask && ['queued', 'running'].includes(batchTask.status))}
               onClick={() => handleBatchAction('update')}
               title="更新"
             >
@@ -1101,6 +924,17 @@ export function Containers() {
           onTerminal={handleTaskTerminal}
         />
       ))}
+      <ContainerBatchTaskTracker
+        submission={batchSubmission}
+        onAccepted={(taskID) => {
+          setBatchTask({ taskID, status: 'queued', items: [] })
+          setBatchSubmission(null)
+          handleBatchAccepted()
+        }}
+        onSubmissionError={() => setBatchSubmission(null)}
+        onTaskUpdate={handleBatchTaskUpdate}
+        onTerminal={handleBatchTerminal}
+      />
 
       {/* 统计信息 */}
       <div className="px-2 sm:px-6 py-4">

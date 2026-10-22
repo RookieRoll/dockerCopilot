@@ -47,6 +47,17 @@ func (e *Execution) RecoveryCheckpoint(ctx context.Context, stage string, mutate
 	expected.NewContainerID = next.NewContainerID
 	expected.ContainerIDs = cloneStrings(next.ContainerIDs)
 	expected.BackupContainerName = next.BackupContainerName
+	if len(expected.Items) != len(next.Items) {
+		return errors.New("recovery checkpoint cannot change batch item identities")
+	}
+	for i := range expected.Items {
+		expected.Items[i].Stage = next.Items[i].Stage
+		expected.Items[i].NewContainerID = next.Items[i].NewContainerID
+		expected.Items[i].BackupContainerName = next.Items[i].BackupContainerName
+		expected.Items[i].ProtectedNames = cloneStrings(next.Items[i].ProtectedNames)
+		expected.Items[i].Recovery = next.Items[i].Recovery
+		expected.Items[i].RequiresAttention = next.Items[i].RequiresAttention
+	}
 	expected.UpdatedAt = next.UpdatedAt
 	if !reflect.DeepEqual(next, expected) {
 		return errors.New("recovery checkpoint may only change stage and confirmed container identity facts")
@@ -118,6 +129,17 @@ func (s *Store) saveRecoveryCheckpoint(next Record) error {
 	expected.NewContainerID = next.NewContainerID
 	expected.ContainerIDs = cloneStrings(next.ContainerIDs)
 	expected.BackupContainerName = next.BackupContainerName
+	if len(expected.Items) != len(next.Items) {
+		return errors.New("recovery checkpoint cannot change batch item identities")
+	}
+	for i := range expected.Items {
+		expected.Items[i].Stage = next.Items[i].Stage
+		expected.Items[i].NewContainerID = next.Items[i].NewContainerID
+		expected.Items[i].BackupContainerName = next.Items[i].BackupContainerName
+		expected.Items[i].ProtectedNames = cloneStrings(next.Items[i].ProtectedNames)
+		expected.Items[i].Recovery = next.Items[i].Recovery
+		expected.Items[i].RequiresAttention = next.Items[i].RequiresAttention
+	}
 	expected.UpdatedAt = next.UpdatedAt
 	if !reflect.DeepEqual(next, expected) {
 		return errors.New("recovery checkpoint contains fields outside the recovery allowlist")

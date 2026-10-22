@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { taskDiagnosticEntries, taskIdentifiers, taskStatusLabel, taskSubmissionOutcome } from './taskStatusModel.js'
+import { taskBatchSummary, taskDiagnosticEntries, taskIdentifiers, taskStatusLabel, taskSubmissionOutcome } from './taskStatusModel.js'
 
 test('task diagnostics preserve failure, recovery, warnings, and identifier fields', () => {
   const task = {
@@ -45,4 +45,14 @@ test('server errors and timeouts keep submission outcome uncertain', () => {
   assert.equal(taskSubmissionOutcome(503).title, '提交结果待确认')
   assert.equal(taskSubmissionOutcome(408).title, '提交结果待确认')
   assert.equal(taskSubmissionOutcome(undefined).title, '提交结果待确认')
+})
+
+test('batch summary uses durable counts and falls back to visible item states', () => {
+  assert.deepEqual(taskBatchSummary({
+    items: [{ status: 'succeeded' }, { status: 'failed' }, { status: 'skipped' }, { status: 'queued' }],
+  }), { success: 1, failed: 1, skipped: 1, total: 4 })
+  assert.deepEqual(taskBatchSummary({
+    successCount: 2, failedCount: 1, skippedCount: 0, items: [{ status: 'queued' }],
+  }), { success: 2, failed: 1, skipped: 0, total: 1 })
+  assert.equal(taskBatchSummary({ items: [] }), null)
 })

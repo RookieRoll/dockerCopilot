@@ -42,7 +42,7 @@ type classifiedHTTPError struct {
 
 func (e classifiedHTTPError) Error() string     { return e.cause.Error() }
 func (e classifiedHTTPError) Unwrap() error     { return e.cause }
-func (e classifiedHTTPError) HTTPStatus() int  { return e.status }
+func (e classifiedHTTPError) HTTPStatus() int   { return e.status }
 func (e classifiedHTTPError) ErrorCode() string { return e.code }
 
 func BadRequest(err error) error {
@@ -57,6 +57,16 @@ func ServiceUnavailable(err error) error {
 		err = errors.New("service dependency is unavailable")
 	}
 	return classifiedHTTPError{status: http.StatusServiceUnavailable, code: "DEPENDENCY_UNAVAILABLE", cause: err}
+}
+
+// SafeErrorCode returns a stable, non-freeform classification suitable for
+// structured logs. It never includes the underlying error message.
+func SafeErrorCode(err error) string {
+	if err == nil {
+		return ""
+	}
+	_, _, _, code := classifyHTTPError(err)
+	return code
 }
 
 // WriteAPIResult preserves the existing application envelope while ensuring
@@ -196,6 +206,9 @@ func legalHTTPStatus(value int) int {
 
 func requestID(r *http.Request) string {
 	if r != nil {
+		if id := requestIDFromContext(r.Context()); id != "" {
+			return id
+		}
 		value := strings.TrimSpace(r.Header.Get("X-Request-ID"))
 		if len(value) <= 128 && value != "" {
 			valid := true

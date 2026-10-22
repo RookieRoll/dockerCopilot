@@ -1,6 +1,6 @@
 import React from 'react'
 import { AlertTriangle, CheckCircle2, CircleDashed, Clipboard, LoaderCircle, XCircle } from 'lucide-react'
-import { taskDiagnosticEntries, taskIdentifiers, taskStatusLabel, taskSubmissionOutcome } from './taskStatusModel.js'
+import { taskBatchSummary, taskDiagnosticEntries, taskIdentifiers, taskStatusLabel, taskSubmissionOutcome } from './taskStatusModel.js'
 
 const STATUS_STYLES = {
   queued: 'border-blue-200 bg-blue-50 text-blue-800 dark:border-blue-900 dark:bg-blue-950/40 dark:text-blue-200',
@@ -16,6 +16,14 @@ const STATUS_ICONS = {
   succeeded: CheckCircle2,
   failed: XCircle,
   interrupted: AlertTriangle,
+}
+
+const ITEM_STATUS_LABELS = {
+  queued: '排队中',
+  running: '执行中',
+  succeeded: '成功',
+  failed: '失败',
+  skipped: '跳过',
 }
 
 function CopyValue({ label, value }) {
@@ -85,6 +93,7 @@ export function TaskStatusPanel({ task, taskId = '', connectionError, unauthoriz
   const tone = STATUS_STYLES[status] || 'border-gray-200 bg-gray-50 text-gray-800 dark:border-gray-700 dark:bg-gray-900/60 dark:text-gray-200'
   const diagnostics = taskDiagnosticEntries(task)
   const identifiers = taskIdentifiers(task)
+  const batchSummary = taskBatchSummary(task)
   const message = typeof task?.message === 'string' ? task.message : ''
   const submitOutcome = taskSubmissionOutcome(submitError?.status)
 
@@ -107,6 +116,23 @@ export function TaskStatusPanel({ task, taskId = '', connectionError, unauthoriz
         {!task && isTracking && !connectionError && !unauthorized && <p className="text-sm text-gray-600 dark:text-gray-300">正在查询任务状态…</p>}
         {task?.stage && <p className="text-sm"><span className="font-medium">阶段：</span>{task.stage}</p>}
         {message && <p className="text-sm text-gray-700 dark:text-gray-200">{message}</p>}
+
+        {batchSummary && (
+          <div className="space-y-2" aria-label="批量任务项目结果">
+            <p className="text-sm font-medium">
+              共 {batchSummary.total} 项 · 成功 {batchSummary.success} · 失败 {batchSummary.failed} · 跳过 {batchSummary.skipped}
+            </p>
+            <ul className="max-h-64 space-y-1 overflow-auto rounded-md border border-gray-200 p-2 text-xs dark:border-gray-700">
+              {task.items.map((item) => (
+                <li key={item.id} className="flex flex-wrap items-start justify-between gap-2 border-b border-gray-100 py-1 last:border-0 dark:border-gray-700">
+                  <span className="min-w-0 break-all font-mono">{item.name || item.id}</span>
+                  <span className="shrink-0">{ITEM_STATUS_LABELS[item.status] || '状态未知'}{item.stage ? ` · ${item.stage}` : ''}</span>
+                  {item.error && <span className="basis-full break-words text-red-700 dark:text-red-300">{item.error}</span>}
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
 
         {(connectionError || unauthorized) && (
           <div role="alert" className="rounded-md border border-amber-300 bg-amber-50 p-3 text-sm text-amber-900 dark:border-amber-800 dark:bg-amber-950/40 dark:text-amber-200">

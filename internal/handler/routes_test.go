@@ -63,6 +63,35 @@ func TestTaskListRouteRequiresJWT(t *testing.T) {
 	}
 }
 
+func TestBatchRouteRequiresJWT(t *testing.T) {
+	port := getFreePort(t)
+	cfg := config.Config{}
+	cfg.Host = "127.0.0.1"
+	cfg.Port = port
+	cfg.Auth.AccessSecret = "test-secret"
+
+	server := rest.MustNewServer(cfg.RestConf)
+	RegisterHandlers(server, &svc.ServiceContext{Config: cfg})
+	defer server.Stop()
+
+	go server.Start()
+	waitForServer(t, port)
+
+	req, err := http.NewRequest(http.MethodPost, fmt.Sprintf("http://127.0.0.1:%d/api/containers/batch", port), bytes.NewBufferString(`{"action":"stop","containerIDs":["container-id"]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("failed to call batch route: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 401 without JWT, got %d", resp.StatusCode)
+	}
+}
+
 func TestConfiguredPortsRouteRequiresJWT(t *testing.T) {
 	port := getFreePort(t)
 	cfg := config.Config{}
