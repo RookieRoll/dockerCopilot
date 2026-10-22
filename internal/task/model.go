@@ -78,6 +78,9 @@ type Record struct {
 	RequiresAttention bool        `json:"requiresAttention,omitempty"`
 	Recovery          Recovery    `json:"recovery,omitempty"`
 	Items             []Item      `json:"items,omitempty"`
+	SuccessCount      int         `json:"successCount"`
+	FailedCount       int         `json:"failedCount"`
+	SkippedCount      int         `json:"skippedCount"`
 	Error             string      `json:"error,omitempty"`
 	Warnings          []string    `json:"warnings,omitempty"`
 	SnapshotRef       string      `json:"snapshotRef,omitempty"`
@@ -110,6 +113,9 @@ type PublicRecord struct {
 	RequiresAttention bool         `json:"requiresAttention,omitempty"`
 	Recovery          Recovery     `json:"recovery,omitempty"`
 	Items             []PublicItem `json:"items,omitempty"`
+	SuccessCount      int          `json:"successCount"`
+	FailedCount       int          `json:"failedCount"`
+	SkippedCount      int          `json:"skippedCount"`
 	Error             string       `json:"error,omitempty"`
 	Warnings          []string     `json:"warnings,omitempty"`
 }
@@ -133,6 +139,7 @@ func Public(r Record) PublicRecord {
 		ProtectedNames: cloneStrings(r.ProtectedNames), ImageIDs: cloneStrings(r.ImageIDs),
 		Options: cloneOptions(r.Options), RequestID: r.RequestID, RequiresAttention: r.RequiresAttention,
 		Recovery: r.Recovery, Error: r.Error, Warnings: cloneStrings(r.Warnings),
+		SuccessCount: r.SuccessCount, FailedCount: r.FailedCount, SkippedCount: r.SkippedCount,
 	}
 	if len(r.Items) != 0 {
 		out.Items = make([]PublicItem, 0, len(r.Items))
@@ -140,6 +147,19 @@ func Public(r Record) PublicRecord {
 			out.Items = append(out.Items, PublicItem{ID: item.ID, Name: item.Name, Status: item.Status, Stage: item.Stage, Error: item.Error})
 		}
 	}
+	return out
+}
+
+func cloneRecord(r Record) Record {
+	out := r
+	out.StartedAt = cloneTime(r.StartedAt)
+	out.FinishedAt = cloneTime(r.FinishedAt)
+	out.ContainerIDs = cloneStrings(r.ContainerIDs)
+	out.ProtectedNames = cloneStrings(r.ProtectedNames)
+	out.ImageIDs = cloneStrings(r.ImageIDs)
+	out.Options = cloneOptions(r.Options)
+	out.Warnings = cloneStrings(r.Warnings)
+	out.Items = append([]Item(nil), r.Items...)
 	return out
 }
 
