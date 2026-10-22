@@ -38,7 +38,10 @@ func TestPinnedVersionTagSkipped(t *testing.T) {
 		ImageName: host + "/app",
 		ImageTag:  "v2.2.0",
 	}
-	data := NewImageCheck()
+	data, err := NewImageCheckWithOptions(ImageCheckOptions{Client: registry.Client()})
+	if err != nil {
+		t.Fatal(err)
+	}
 	data.CheckUpdate([]types.Image{img})
 	if _, ok := data.Get(img.ID); ok {
 		t.Fatal("pinned version tag should be skipped by update check")
@@ -65,7 +68,10 @@ func TestRollingTagDigestMismatchReportsUpdate(t *testing.T) {
 		ImageName: host + "/app",
 		ImageTag:  "latest",
 	}
-	data := NewImageCheck()
+	data, err := NewImageCheckWithOptions(ImageCheckOptions{Client: registry.Client()})
+	if err != nil {
+		t.Fatal(err)
+	}
 	data.CheckUpdate([]types.Image{img})
 	result, ok := data.Get(img.ID)
 	if !ok || !result.NeedUpdate {

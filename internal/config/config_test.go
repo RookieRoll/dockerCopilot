@@ -78,6 +78,8 @@ func TestEnvironmentOverridesAndRequestDeleteOldContainer(t *testing.T) {
 	t.Setenv("DelOldContainer", "false")
 	t.Setenv("githubProxy", "https://proxy.example/prefix/")
 	t.Setenv("CONTAINER_PORT_OVERRIDES_PATH", filepath.Join(t.TempDir(), "ports.json"))
+	registryCA := filepath.Join(t.TempDir(), "registry-ca.pem")
+	t.Setenv("DOCKERCOPILOT_REGISTRY_CA_FILE", registryCA)
 	t.Setenv("DOCKERCOPILOT_TASK_MAX_CONCURRENT", "3")
 	t.Setenv("DOCKERCOPILOT_TASK_TIMEOUT", "45m")
 	if err := cfg.ApplyEnvironment(); err != nil {
@@ -86,7 +88,7 @@ func TestEnvironmentOverridesAndRequestDeleteOldContainer(t *testing.T) {
 	if err := cfg.Validate(); err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Backup.Directory != os.Getenv("BACKUP_DIR") || cfg.Updates.GitHubProxy != os.Getenv("githubProxy") || cfg.Docker.PortOverridesPath != os.Getenv("CONTAINER_PORT_OVERRIDES_PATH") {
+	if cfg.Backup.Directory != os.Getenv("BACKUP_DIR") || cfg.Updates.GitHubProxy != os.Getenv("githubProxy") || cfg.Docker.PortOverridesPath != os.Getenv("CONTAINER_PORT_OVERRIDES_PATH") || cfg.UpdateSource().RegistryCAFile != registryCA {
 		t.Fatalf("legacy environment overrides not applied: %#v", cfg)
 	}
 	if *cfg.Tasks.MaxConcurrent != 3 || cfg.Tasks.Timeout != "45m" {

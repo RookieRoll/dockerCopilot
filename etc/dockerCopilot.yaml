@@ -27,6 +27,7 @@ Updates:
   Repository: RookieRoll/dockerCopilot
   GitHubProxy: ""
   WorkDir: ""
+  RegistryCAFile: ""
 Backup:
   Directory: /data/backups
 Docker:

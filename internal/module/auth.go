@@ -1,6 +1,7 @@
 package module
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -26,6 +27,10 @@ var DefaultAcceleratorHostList = []string{"docker.1ms.run", "docker.m.daocloud.i
 	"docker.anye.in", "hub.rat.dev", "docker.amingg.com"}
 
 func GetToken(image types.Image, registryAuth string) (string, error) {
+	return getTokenWithClient(context.Background(), image, registryAuth, &http.Client{Timeout: 15 * time.Second})
+}
+
+func getTokenWithClient(ctx context.Context, image types.Image, registryAuth string, client *http.Client) (string, error) {
 	logx.Infof("image name %s", image.ImageName)
 	normalizedRef, err := ref.ParseNormalizedNamed(image.ImageName)
 	if err != nil {
@@ -38,8 +43,8 @@ func GetToken(image types.Image, registryAuth string) (string, error) {
 	if req, err = GetChallengeRequest(URL); err != nil {
 		return "", err
 	}
+	req = req.WithContext(ctx)
 
-	client := &http.Client{Timeout: 15 * time.Second}
 	var res *http.Response
 	if res, err = client.Do(req); err != nil {
 		return "", err
@@ -51,17 +56,23 @@ func GetToken(image types.Image, registryAuth string) (string, error) {
 		}
 	}(res.Body)
 	v := res.Header.Get(ChallengeHeader)
+	if v == "" && res.StatusCode >= http.StatusOK && res.StatusCode < http.StatusMultipleChoices {
+		return "", nil
+	}
+	if v == "" {
+		return "", fmt.Errorf("registry challenge endpoint returned %s without %s", res.Status, ChallengeHeader)
+	}
 
-	challenge := strings.ToLower(v)
-	if strings.HasPrefix(challenge, "basic") {
+	challengeType := strings.ToLower(v)
+	if strings.HasPrefix(challengeType, "basic") {
 		if registryAuth == "" {
 			return "", fmt.Errorf("no credentials available")
 		}
 
 		return fmt.Sprintf("Basic %s", registryAuth), nil
 	}
-	if strings.HasPrefix(challenge, "bearer") {
-		return GetBearerHeader(challenge, normalizedRef, registryAuth)
+	if strings.HasPrefix(challengeType, "bearer") {
+		return getBearerHeaderWithClient(ctx, v, normalizedRef, registryAuth, client)
 	}
 
 	return "", errors.New("unsupported challenge type from registry")
@@ -78,15 +89,21 @@ func GetChallengeRequest(URL url.URL) (*http.Request, error) {
 }
 
 func GetBearerHeader(challenge string, imageRef ref.Named, registryAuth string) (string, error) {
-	client := http.Client{Timeout: 15 * time.Second}
+	return getBearerHeaderWithClient(context.Background(), challenge, imageRef, registryAuth, &http.Client{Timeout: 15 * time.Second})
+}
+
+func getBearerHeaderWithClient(ctx context.Context, challenge string, imageRef ref.Named, registryAuth string, client *http.Client) (string, error) {
 	authURL, err := GetAuthURL(challenge, imageRef)
 
 	if err != nil {
 		return "", err
 	}
+	if authURL.Scheme != "https" || authURL.User != nil {
+		return "", errors.New("Bearer token realm must use HTTPS without URL credentials")
+	}
 
 	var r *http.Request
-	if r, err = http.NewRequest("GET", authURL.String(), nil); err != nil {
+	if r, err = http.NewRequestWithContext(ctx, "GET", authURL.String(), nil); err != nil {
 		return "", err
 	}
 
@@ -107,8 +124,17 @@ func GetBearerHeader(challenge string, imageRef ref.Named, registryAuth string) 
 			logx.Error("GetBearerHeader关闭Body失败" + err.Error())
 		}
 	}(authResponse.Body)
+	if authResponse.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("registry token endpoint returned %s", authResponse.Status)
+	}
 
-	body, _ := io.ReadAll(authResponse.Body)
+	body, err := io.ReadAll(io.LimitReader(authResponse.Body, 1<<20+1))
+	if err != nil {
+		return "", fmt.Errorf("read registry token response: %w", err)
+	}
+	if len(body) > 1<<20 {
+		return "", errors.New("registry token response exceeds 1 MiB limit")
+	}
 	tokenResponse := &types.TokenResponse{}
 
 	err = json.Unmarshal(body, tokenResponse)
@@ -120,8 +146,11 @@ func GetBearerHeader(challenge string, imageRef ref.Named, registryAuth string) 
 }
 
 func GetAuthURL(challenge string, imageRef ref.Named) (*url.URL, error) {
-	loweredChallenge := strings.ToLower(challenge)
-	raw := strings.TrimPrefix(loweredChallenge, "bearer")
+	trimmedChallenge := strings.TrimSpace(challenge)
+	scheme, raw, ok := strings.Cut(trimmedChallenge, " ")
+	if !ok || !strings.EqualFold(scheme, "bearer") {
+		return nil, fmt.Errorf("challenge is not a Bearer challenge")
+	}
 
 	pairs := strings.Split(raw, ",")
 	values := make(map[string]string, len(pairs))
@@ -129,7 +158,7 @@ func GetAuthURL(challenge string, imageRef ref.Named) (*url.URL, error) {
 	for _, pair := range pairs {
 		trimmed := strings.Trim(pair, " ")
 		if key, val, ok := strings.Cut(trimmed, "="); ok {
-			values[key] = strings.Trim(val, `"`)
+			values[strings.ToLower(strings.TrimSpace(key))] = strings.Trim(val, `"`)
 		}
 	}
 	if values["realm"] == "" || values["service"] == "" {
@@ -137,7 +166,10 @@ func GetAuthURL(challenge string, imageRef ref.Named) (*url.URL, error) {
 		return nil, fmt.Errorf("challenge header did not include all values needed to construct an auth url")
 	}
 
-	authURL, _ := url.Parse(values["realm"])
+	authURL, err := url.Parse(values["realm"])
+	if err != nil || authURL.Scheme == "" || authURL.Host == "" {
+		return nil, fmt.Errorf("Bearer challenge has an invalid realm URL")
+	}
 	q := authURL.Query()
 	q.Add("service", values["service"])
 

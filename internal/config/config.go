@@ -49,9 +49,10 @@ type LoggingConfig struct {
 }
 
 type UpdateConfig struct {
-	Repository  string `json:",optional,default=RookieRoll/dockerCopilot"`
-	GitHubProxy string `json:",optional"`
-	WorkDir     string `json:",optional"`
+	Repository     string `json:",optional,default=RookieRoll/dockerCopilot"`
+	GitHubProxy    string `json:",optional"`
+	WorkDir        string `json:",optional"`
+	RegistryCAFile string `json:",optional"`
 }
 
 type BackupConfig struct {
@@ -211,6 +212,7 @@ func (c *Config) ApplyEnvironment() error {
 		{"DOCKERCOPILOT_LOG_DIR", &c.Logging.Directory},
 		{"DOCKERCOPILOT_LOG_LEVEL", &c.Logging.Level},
 		{"DOCKERCOPILOT_UPDATE_REPOSITORY", &c.Updates.Repository},
+		{"DOCKERCOPILOT_REGISTRY_CA_FILE", &c.Updates.RegistryCAFile},
 		{"WORKDIR", &c.Updates.WorkDir},
 		{"DOCKERCOPILOT_SELF_CONTAINER", &c.Docker.SelfContainer},
 		{"githubProxy", &c.Updates.GitHubProxy},
@@ -237,6 +239,10 @@ func (c *Config) ApplyEnvironment() error {
 
 func (c *Config) Validate() error {
 	c.ApplyDefaults()
+	c.Updates.RegistryCAFile = strings.TrimSpace(c.Updates.RegistryCAFile)
+	if strings.ContainsRune(c.Updates.RegistryCAFile, '\x00') {
+		return fmt.Errorf("Updates.RegistryCAFile must be a valid filesystem path")
+	}
 	if *c.Tasks.MaxConcurrent < 1 || *c.Tasks.MaxConcurrent > 64 {
 		return fmt.Errorf("Tasks.MaxConcurrent must be between 1 and 64")
 	}

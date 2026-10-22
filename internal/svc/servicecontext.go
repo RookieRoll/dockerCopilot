@@ -109,7 +109,10 @@ func NewServiceContextChecked(c config.Config) (*ServiceContext, error) {
 }
 
 func newServiceContext(c config.Config, cli *client.Client) (*ServiceContext, error) {
-	updates := module.NewImageCheck()
+	updates, err := module.NewImageCheckWithOptions(module.ImageCheckOptions{TrustedCAFile: c.UpdateSource().RegistryCAFile})
+	if err != nil {
+		return nil, fmt.Errorf("configure trusted registry certificate for application digest checks: %w", err)
+	}
 	progressStore := make(ProgressStoreType)
 	progress := legacyprogress.NewStore(progressStore)
 	containers := containerService.NewService(cli, updates)
