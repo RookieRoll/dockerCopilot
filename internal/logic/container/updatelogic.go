@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 	"sync"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/google/uuid"
 	containerService "github.com/onlyLTY/dockerCopilot/internal/container"
+	imageService "github.com/onlyLTY/dockerCopilot/internal/image"
 	"github.com/onlyLTY/dockerCopilot/internal/observability"
 	"github.com/onlyLTY/dockerCopilot/internal/operation"
 	"github.com/onlyLTY/dockerCopilot/internal/svc"
@@ -27,6 +29,7 @@ type UpdateLogic struct {
 	taskRunner         *task.Runner
 	taskStore          *task.Store
 	service            *containerService.Service
+	imageGate          *imageService.AdmissionGate
 	mutationGate       *operation.MutationGate
 	deleteOldDefault   bool
 	healthcheckWait    time.Duration
@@ -42,6 +45,7 @@ func NewUpdateLogic(ctx context.Context, svcCtx *svc.ServiceContext) *UpdateLogi
 		taskRunner:       svcCtx.TaskRunner,
 		taskStore:        svcCtx.TaskStore,
 		service:          serviceFromContext(svcCtx),
+		imageGate:        svcCtx.ImageService().AdmissionGate(),
 		mutationGate:     svcCtx.MutationGate(),
 		deleteOldDefault: svcCtx.Config.ResolveDeleteOldContainer(nil),
 		healthcheckWait:  options.HealthcheckWait, runningObservation: options.RunningObservation, optionsErr: optionsErr,
@@ -91,6 +95,8 @@ func (l *UpdateLogic) Update(req *types.ContainerUpdateReq) (resp *types.Resp, e
 	delOldContainer := l.effectiveDeleteOld(req.DelOldContainer)
 	deleteOption := delOldContainer
 	imageNameAndTag := req.ImageNameAndTag
+	l.imageGate.Lock()
+	defer l.imageGate.Unlock()
 	taskID := uuid.NewString()
 	lease, existingID, reserveErr := l.service.ReserveUpdate(l.ctx, req.Id, taskID, updateEquivalenceKey(req.ContainerName, imageNameAndTag, delOldContainer))
 	if reserveErr != nil {
@@ -104,6 +110,15 @@ func (l *UpdateLogic) Update(req *types.ContainerUpdateReq) (resp *types.Resp, e
 	if lease == nil {
 		return nil, errors.New("container update reservation did not return a lease")
 	}
+	inspected, inspectErr := l.service.Inspect(l.ctx, req.Id)
+	if inspectErr != nil {
+		lease.Release()
+		return resp, fmt.Errorf("inspect original image before update admission: %w", inspectErr)
+	}
+	if inspected.ContainerJSONBase == nil || strings.TrimSpace(inspected.Image) == "" {
+		lease.Release()
+		return resp, errors.New("inspect original image before update admission: Docker returned no immutable image ID")
+	}
 	var gateMu sync.Mutex
 	var gateLease *operation.MutationLease
 	var executionMu sync.Mutex
@@ -112,7 +127,7 @@ func (l *UpdateLogic) Update(req *types.ContainerUpdateReq) (resp *types.Resp, e
 	acceptedTaskID, err := l.taskRunner.Submit(task.TaskSpec{
 		Record: task.Record{
 			Type: "container-update", Name: req.ContainerName, ImageRef: imageNameAndTag,
-			OldContainerID: req.Id, ContainerIDs: []string{req.Id},
+			OldContainerID: req.Id, ContainerIDs: []string{req.Id}, ImageIDs: []string{inspected.Image},
 			TaskID: taskID, RequestID: observability.RequestIDFromContext(l.ctx),
 			Options: task.TaskOptions{Image: imageNameAndTag, DeleteOldContainer: &deleteOption, HealthWaitSeconds: durationSeconds(l.healthcheckWait)},
 		},

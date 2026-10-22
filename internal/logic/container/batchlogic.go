@@ -11,6 +11,7 @@ import (
 
 	"github.com/google/uuid"
 	containerService "github.com/onlyLTY/dockerCopilot/internal/container"
+	imageService "github.com/onlyLTY/dockerCopilot/internal/image"
 	"github.com/onlyLTY/dockerCopilot/internal/observability"
 	"github.com/onlyLTY/dockerCopilot/internal/operation"
 	"github.com/onlyLTY/dockerCopilot/internal/svc"
@@ -27,6 +28,7 @@ type BatchLogic struct {
 	logx.Logger
 	ctx                context.Context
 	service            *containerService.Service
+	imageGate          *imageService.AdmissionGate
 	runner             *task.Runner
 	store              *task.Store
 	mutationGate       *operation.MutationGate
@@ -38,6 +40,7 @@ type BatchLogic struct {
 
 func NewBatchLogic(ctx context.Context, svcCtx *svc.ServiceContext) *BatchLogic {
 	var service *containerService.Service
+	var imageGate *imageService.AdmissionGate
 	var runner *task.Runner
 	var gate *operation.MutationGate
 	var store *task.Store
@@ -46,6 +49,7 @@ func NewBatchLogic(ctx context.Context, svcCtx *svc.ServiceContext) *BatchLogic 
 	var optionsErr error
 	if svcCtx != nil {
 		service, runner, gate = svcCtx.ContainerService(), svcCtx.TaskRunner, svcCtx.MutationGate()
+		imageGate = svcCtx.ImageService().AdmissionGate()
 		store = svcCtx.TaskStore
 		deleteOldDefault = svcCtx.Config.ResolveDeleteOldContainer(nil)
 		if options, err := svcCtx.Config.TaskOptions(); err != nil {
@@ -54,7 +58,7 @@ func NewBatchLogic(ctx context.Context, svcCtx *svc.ServiceContext) *BatchLogic 
 			healthcheckWait, runningObservation = options.HealthcheckWait, options.RunningObservation
 		}
 	}
-	return &BatchLogic{Logger: logx.WithContext(ctx), ctx: ctx, service: service, runner: runner, store: store, mutationGate: gate, deleteOldDefault: deleteOldDefault, healthcheckWait: healthcheckWait, runningObservation: runningObservation, optionsErr: optionsErr}
+	return &BatchLogic{Logger: logx.WithContext(ctx), ctx: ctx, service: service, imageGate: imageGate, runner: runner, store: store, mutationGate: gate, deleteOldDefault: deleteOldDefault, healthcheckWait: healthcheckWait, runningObservation: runningObservation, optionsErr: optionsErr}
 }
 
 type batchRequestError string
@@ -244,6 +248,10 @@ func (l *BatchLogic) Submit(req *BatchRequest) (string, error) {
 			executionMu.Unlock()
 			return l.recoverBatchUpdates(recoveryCtx, taskID, execution, cause)
 		}
+	}
+	if action == "update" {
+		l.imageGate.Lock()
+		defer l.imageGate.Unlock()
 	}
 	acceptedID, err := l.runner.SubmitBatchWithHooks(record, operations, recoverFn, func() error {
 		gate, acquireErr := l.mutationGate.Acquire(context.Background(), taskID)
