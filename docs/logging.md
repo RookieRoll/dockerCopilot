@@ -20,3 +20,9 @@ go test .
 ```
 
 包内测试使用临时目录和可注入时钟验证按日/按大小轮转、每次写入清理过期文件、总容量（含活动文件）限制、过大记录、文件故障降级和目录恢复；子进程集成测试验证 JSON 输出双写一致及凭据/env/inspect/备份/panic 文本脱敏。根包的 HTTP 集成测试使用本地假服务，验证 go-zero 不转储 500、慢请求及 panic 请求的 header、query 或 body。测试不访问 Docker daemon 或固定运行时数据目录。
+
+## 事件与级别
+
+任务接受、执行开始、阶段变化、恢复尝试和恢复结果、终态均以结构化事件关联同一 taskId 和提交 requestId。适用字段包含 operation、stage、containerId/name、imageRef/imageId、durationMs、result、errorCode 和经脱敏的原始错误。短容器修改也记录请求标识、目标、结果与耗时；错误展开有界的 cause 链后脱敏，页面仍显示简明错误。
+
+默认 INFO 仅记录阶段及结果。镜像拉取细节使用 DEBUG，每个任务最多每秒一条；启用配置 Logs.Level=debug 后可查看节流后的进度，仍不记录请求体、环境变量或完整 inspect。成功的任务轮询不产生重复错误日志。失败和恢复失败使用 ERROR；清理警告、状态未知和中断使用 WARN。go-zero 没有独立 WARN 输出接口，WARN 事件的传输 level 为 info，结构化 severity 为 WARN；检索时以 severity 字段为准。

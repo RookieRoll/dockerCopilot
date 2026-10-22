@@ -104,6 +104,7 @@ func (l *UpdateLogic) Update(req *types.ContainerUpdateReq) (resp *types.Resp, e
 		return resp, reserveErr
 	}
 	if existingID != "" {
+		observability.LogTaskEvent(l.ctx, "task.deduplicated", existingID, observability.RequestIDFromContext(l.ctx))
 		resp.Code, resp.Msg, resp.Data = http.StatusOK, "success", map[string]string{"taskID": existingID}
 		return resp, nil
 	}
@@ -164,9 +165,19 @@ func (l *UpdateLogic) Update(req *types.ContainerUpdateReq) (resp *types.Resp, e
 			if err := execution.Progress("updating", 0, "容器更新已开始"); err != nil {
 				return err
 			}
+			pullProgress := newPullProgressThrottle(time.Second)
 			err := l.service.UpdateWithOptions(ctx, req.Id, req.ContainerName, imageNameAndTag, delOldContainer, execution.TaskID(), containerService.UpdateCallbacks{
-				Progress: execution.Progress,
-				Warning:  execution.Warning,
+				Progress: func(stage string, percentage int, message string) error {
+					if stage == "pulling-image" {
+						if !pullProgress.Allow(time.Now()) {
+							return nil
+						}
+						record := execution.Current()
+						observability.LogTaskPullProgress(ctx, record.TaskID, record.RequestID, stage, percentage, message)
+					}
+					return execution.Progress(stage, percentage, message)
+				},
+				Warning: execution.Warning,
 				SaveSnapshot: func(snapshot []byte) error {
 					if l.taskStore == nil {
 						return errors.New("private task snapshot store is unavailable")
@@ -214,6 +225,8 @@ func (l *UpdateLogic) Update(req *types.ContainerUpdateReq) (resp *types.Resp, e
 			if err != nil {
 				return err
 			}
+			// UpdateWithOptions already published its final progress. Do not
+			// perform a second fallible write after its durable commit boundary.
 			return nil
 		},
 		Recover: func(recoveryCtx context.Context, cause error) (task.Recovery, error) {

@@ -302,8 +302,12 @@ func (l *BatchLogic) runBatchUpdate(ctx context.Context, taskID string, executio
 	callbacks := containerService.UpdateCallbacks{
 		CandidateOwnerID: item.SnapshotRef,
 		Progress: func(stage string, percentage int, message string) error {
-			if stage == "pulling-image" && !pullProgress.Allow(time.Now()) {
-				return nil
+			if stage == "pulling-image" {
+				if !pullProgress.Allow(time.Now()) {
+					return nil
+				}
+				record := execution.Current()
+				observability.LogTaskPullProgress(ctx, record.TaskID, record.RequestID, stage, percentage, message)
 			}
 			batchPercentage := (itemIndex*100 + percentage) / totalItems
 			if batchPercentage > 99 {
