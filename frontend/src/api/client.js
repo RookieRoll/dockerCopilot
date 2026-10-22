@@ -1,4 +1,5 @@
 import axios from 'axios'
+import { createBusinessApiError, hasApiEnvelope, isSuccessApiCode, normalizeHttpError } from './errors.js'
 
 // 动态获取 API 基础地址
 // 优先级：环境变量 > window.__API_BASE_URL > localStorage > 当前主机 > 默认值
@@ -62,7 +63,12 @@ apiClient.interceptors.request.use(
 
 // 响应拦截器 - 处理认证过期
 apiClient.interceptors.response.use(
-  (response) => response,
+  (response) => {
+    if (hasApiEnvelope(response.data) && !isSuccessApiCode(response.data.code)) {
+      throw createBusinessApiError(response)
+    }
+    return response
+  },
   (error) => {
     if (error.response?.status === 401) {
       // 只在有token的情况下移除它
@@ -72,7 +78,7 @@ apiClient.interceptors.response.use(
         window.dispatchEvent(new CustomEvent('authChange', { detail: { authenticated: false } }))
       }
     }
-    return Promise.reject(error)
+    return Promise.reject(normalizeHttpError(error))
   }
 )
 
@@ -147,7 +153,12 @@ export const imageAPI = {
 
 // 进度查询API
 export const progressAPI = {
-  getProgress: (taskid) => apiClient.get(`/api/progress/${taskid}`),
+  getProgress: (taskid, config) => apiClient.get(`/api/progress/${encodeURIComponent(taskid)}`, config),
+}
+
+export const taskAPI = {
+  getTask: (taskId, config) => progressAPI.getProgress(taskId, config),
+  listTasks: (params = {}, config) => apiClient.get('/api/tasks', { ...config, params }),
 }
 
 // GitHub API - 用于检查前端更新
