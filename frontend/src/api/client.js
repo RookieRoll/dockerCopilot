@@ -143,6 +143,7 @@ export const containerAPI = {
 // 镜像相关API
 export const imageAPI = {
   getImages: () => apiClient.get('/api/images'),
+  cleanupImages: (policy) => apiClient.post('/api/images/cleanup', { policy }),
   getIcons: (config) => apiClient.get('/api/icons', config),
   deleteImage: (id, force = false) => apiClient.delete(`/api/image/${id}?force=${force}`),
   uploadIcon: (file, imageName, containerName) => {

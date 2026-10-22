@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	dockerClient "github.com/docker/docker/client"
+	"github.com/onlyLTY/dockerCopilot/internal/module"
 	"github.com/onlyLTY/dockerCopilot/internal/svc"
 	"github.com/onlyLTY/dockerCopilot/internal/types"
 )
@@ -41,7 +42,9 @@ func TestImageListAndDeleteCompatibilityWithFakeDaemon(t *testing.T) {
 		t.Fatalf("create fake Docker client: %v", err)
 	}
 	defer docker.Close()
-	service := &svc.ServiceContext{DockerClient: docker}
+	checks := module.NewImageCheck()
+	checks.Data["sha256:compat-image"] = module.ImageCheckList{Known: true, NeedUpdate: true, Stale: true, Error: "registry timeout"}
+	service := &svc.ServiceContext{DockerClient: docker, HubImageInfo: checks}
 
 	listResp, err := NewImagesListLogic(context.Background(), service).ImagesList()
 	if err != nil {
@@ -55,11 +58,17 @@ func TestImageListAndDeleteCompatibilityWithFakeDaemon(t *testing.T) {
 		Code int    `json:"code"`
 		Msg  string `json:"msg"`
 		Data []struct {
-			ID     string `json:"id"`
-			Name   string `json:"name"`
-			Tag    string `json:"tag"`
-			Size   string `json:"size"`
-			InUsed bool   `json:"inUsed"`
+			ID          string `json:"id"`
+			Name        string `json:"name"`
+			Tag         string `json:"tag"`
+			Size        string `json:"size"`
+			InUsed      bool   `json:"inUsed"`
+			UpdateCheck struct {
+				Known      bool   `json:"known"`
+				NeedUpdate bool   `json:"needUpdate"`
+				Stale      bool   `json:"stale"`
+				Error      string `json:"error"`
+			} `json:"updateCheck"`
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(encoded, &list); err != nil {
@@ -70,6 +79,9 @@ func TestImageListAndDeleteCompatibilityWithFakeDaemon(t *testing.T) {
 	}
 	if list.Data[0].ID != "sha256:compat-image" || list.Data[0].Name != "example/app" || list.Data[0].Tag != "v1" || list.Data[0].Size != "1 Mb" || list.Data[0].InUsed {
 		t.Fatalf("unexpected image fields: %s", encoded)
+	}
+	if !list.Data[0].UpdateCheck.Known || !list.Data[0].UpdateCheck.NeedUpdate || !list.Data[0].UpdateCheck.Stale || list.Data[0].UpdateCheck.Error != "registry timeout" {
+		t.Fatalf("image response hid stale registry failure or prior update fact: %s", encoded)
 	}
 
 	removeResp, err := NewRemoveLogic(context.Background(), service).Remove(&types.RemoveImageReq{IdReq: types.IdReq{Id: "sha256:compat-image"}})

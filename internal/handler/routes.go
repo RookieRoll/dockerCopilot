@@ -112,7 +112,6 @@ func RegisterHandlers(server *rest.Server, serverCtx *svc.ServiceContext) {
 				Path:    "/containers",
 				Handler: container.ContainersListHandler(serverCtx),
 			},
-
 			{
 				Method:  http.MethodPost,
 				Path:    "/containers/batch",
@@ -151,6 +150,11 @@ func RegisterHandlers(server *rest.Server, serverCtx *svc.ServiceContext) {
 				Method:  http.MethodGet,
 				Path:    "/images",
 				Handler: image.ImagesListHandler(serverCtx),
+			},
+			{
+				Method:  http.MethodPost,
+				Path:    "/images/cleanup",
+				Handler: image.CleanupHandler(serverCtx),
 			},
 		}...),
 		rest.WithJwt(serverCtx.Config.Auth.AccessSecret),
