@@ -18,10 +18,14 @@ import {
   Trash2,
   Save
 } from 'lucide-react'
-import { containerAPI, progressAPI } from '../api/client.js'
+import { containerAPI, progressAPI, taskAPI } from '../api/client.js'
 import { cn } from '../utils/cn.js'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { IMAGE_ICON_MAX_BYTES, IMAGE_ICON_SUPPORTED_FORMATS, useImageIcons, uploadImageIcon } from '../hooks/useImageIcons.js'
+import { useTask } from '../hooks/useTask.js'
+import { taskListPayload, validateTaskRecord } from '../hooks/taskPolling.js'
+import { TaskStatusPanel } from './tasks/TaskStatusPanel.jsx'
+import { startTaskRecoveryDiscovery } from './tasks/taskRecoveryDiscovery.js'
 import { getImageLogo } from '../config/imageLogos.js'
 import icons8Img from '../assets/icons8.png'
 import { formatContainerPort, getConfiguredPortUrl, getContainerPortTitle, getContainerPortUrl, isHostNetworkMode, normalizeConfiguredPorts, normalizeContainerPorts, stopContainerPortEvent } from '../utils/containerPorts.js'
@@ -84,6 +88,95 @@ const NO_CONFIGURED_PORTS_LABEL = '\u6682\u672a\u914d\u7f6e\u8bbf\u95ee\u7aef\u5
 const DECLARED_PORTS_LABEL = '\u955c\u50cf\u58f0\u660e'
 const CONTAINER_LABEL = '\u5bb9\u5668'
 const MAX_VISIBLE_PORTS = 4
+const CONTAINER_UPDATE_TASK_STORAGE_KEY = 'docker_copilot_container_update_task'
+const CONTAINER_UPDATE_TASKS_KEY = `${CONTAINER_UPDATE_TASK_STORAGE_KEY}:active-by-name`
+
+function readSavedUpdateTasks() {
+  try {
+    const value = JSON.parse(globalThis.localStorage?.getItem(CONTAINER_UPDATE_TASKS_KEY) || '{}')
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return {}
+    return Object.fromEntries(Object.entries(value).filter(([, entry]) => entry && typeof entry === 'object' && typeof entry.taskID === 'string').map(([key, entry]) => [key, { ...entry, key }]))
+  } catch { return {} }
+}
+
+function saveUpdateTasksByName(tasks) {
+  const active = Object.fromEntries(Object.entries(tasks).flatMap(([key, value]) =>
+    value?.taskID && !value.terminal ? [[key, { name: value.name, taskID: value.taskID, containerId: value.containerId, createdAt: value.createdAt }]] : []))
+  try {
+    if (Object.keys(active).length) globalThis.localStorage?.setItem(CONTAINER_UPDATE_TASKS_KEY, JSON.stringify(active))
+    else globalThis.localStorage?.removeItem(CONTAINER_UPDATE_TASKS_KEY)
+  } catch {
+    // The page keeps tracking active tasks in memory when browser storage is unavailable.
+  }
+}
+
+function submissionNonce() {
+  return globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random()}`
+}
+
+function updateTaskKey(name, containerId) {
+  const stableName = String(name || '').trim().replace(/^\/+/, '')
+  return stableName ? `name:${stableName}` : `id:${containerId}`
+}
+
+async function listActiveContainerUpdateTasks() {
+  const records = []
+  for (const status of ['queued', 'running']) {
+    for (let page = 1; ; page += 1) {
+      const response = await taskAPI.listTasks({ status, type: 'container-update', page, limit: 100 })
+      const items = taskListPayload(response).map((record) => validateTaskRecord(record, response))
+      records.push(...items.filter((record) => record.status === status && record.type === 'container-update'))
+      if (!response.data?.data?.hasMore && items.length < 100) break
+      if (!response.data?.data?.hasMore) break
+    }
+  }
+  records.sort((a, b) => Date.parse(b.createdAt || '') - Date.parse(a.createdAt || ''))
+  return records
+}
+
+function ContainerUpdateTaskTracker({ entry, onAccepted, onSubmissionError, onTaskUpdate, onTerminal }) {
+  const tracker = useTask({
+    taskId: entry.taskID || undefined,
+    containerName: entry.name || undefined,
+    storageKey: CONTAINER_UPDATE_TASK_STORAGE_KEY,
+    invalidateKeys: [['containers']],
+    onTerminal: (task) => onTerminal?.(entry.key, task),
+  })
+  const handledSubmissions = React.useRef(new Set())
+  const callbacks = React.useRef({ onAccepted, onSubmissionError, onTaskUpdate })
+  callbacks.current = { onAccepted, onSubmissionError, onTaskUpdate }
+
+  React.useEffect(() => {
+    if (!entry.submission || handledSubmissions.current.has(entry.submission.nonce)) return
+    handledSubmissions.current.add(entry.submission.nonce)
+    if (entry.submission.existingTaskID) {
+      tracker.track(entry.submission.existingTaskID)
+      callbacks.current.onAccepted?.(entry.key, entry.submission.existingTaskID)
+      return
+    }
+    tracker.submit(entry.submission.request).then(({ taskID }) => {
+      callbacks.current.onAccepted?.(entry.key, taskID)
+    }).catch((error) => {
+      callbacks.current.onSubmissionError?.(entry.key, entry.containerId, error)
+    })
+  }, [entry.key, entry.submission?.nonce, tracker.submit, tracker.track])
+
+  React.useEffect(() => {
+    if (tracker.task) callbacks.current.onTaskUpdate?.(entry.key, entry, tracker.task)
+  }, [entry.key, entry.containerId, tracker.task])
+
+  return (
+    <TaskStatusPanel
+      task={tracker.task}
+      taskId={tracker.taskId}
+      connectionError={tracker.connectionError}
+      unauthorized={tracker.unauthorized}
+      submitError={tracker.submitError}
+      isTracking={tracker.isTracking}
+      containerName={entry.name}
+    />
+  )
+}
 
 function PortMappingTile({ port }) {
   const targetUrl = getContainerPortUrl(port)
@@ -253,6 +346,8 @@ export function Containers() {
   // 添加操作状态跟踪
   const [containerActions, setContainerActions] = useState({}) // 跟踪每个容器的操作状态
   const [updateTasks, setUpdateTasks] = useState({}) // 跟踪更新任务
+  const [taskTrackers, setTaskTrackers] = useState(readSavedUpdateTasks)
+  const recoveryStarted = React.useRef(false)
   // 添加筛选状态
   const [filterStatus, setFilterStatus] = useState(null) // null 表示显示全部
 
@@ -286,6 +381,36 @@ export function Containers() {
     },
     refetchInterval: 10000, // 每10秒自动刷新一次
   })
+
+  const containersRef = React.useRef(containers)
+  containersRef.current = containers
+
+  React.useEffect(() => {
+    if (isLoading || recoveryStarted.current) return
+    recoveryStarted.current = true
+    const cancelDiscovery = startTaskRecoveryDiscovery(listActiveContainerUpdateTasks, () => containersRef.current, (records, latestContainers) => {
+      setTaskTrackers((previous) => {
+        const next = { ...previous }
+        for (const task of records) {
+          const name = String(task.name || '').replace(/^\/+/, '')
+          const container = latestContainers.find((candidate) => candidate.name === name || (task.containerIDs || []).includes(candidate.id))
+          const key = updateTaskKey(name, task.oldContainerID || container?.id || task.taskID)
+          const existing = next[key]
+          if (existing?.submission || existing?.taskID === (task.taskID || task.taskId) || (existing?.taskID && !existing.terminal)) continue
+          next[key] = {
+            key, name, containerId: container?.id || task.oldContainerID || '',
+            taskID: task.taskID || task.taskId, createdAt: task.createdAt, recovered: true,
+          }
+        }
+        saveUpdateTasksByName(next)
+        return next
+      })
+    })
+    return () => {
+      cancelDiscovery()
+      recoveryStarted.current = false
+    }
+  }, [isLoading])
 
   // 获取自定义图标配置
   const { data: customIcons = {}, isError: customIconsError, error: customIconsQueryError } = useImageIcons()
@@ -506,100 +631,112 @@ export function Containers() {
     }
   }
 
-  const handleUpdateContainer = async (containerId, existingTaskID = null) => {
-    try {
-      const container = containers.find(c => c.id === containerId)
-      if (!container) {
-        console.error('容器未找到')
-        return
-      }
-
-      console.log(`开始更新容器 "${container.name}"，使用镜像: ${container.usingImage}`)
-
-      setContainerActions(prev => ({
-        ...prev,
-        [containerId]: { action: 'update', loading: true, progress: '正在准备更新...', percentage: 0 }
-      }))
-
-      if (existingTaskID) {
-        console.log('复用已有更新任务, taskID:', existingTaskID)
-        setUpdateTasks(prev => ({
-          ...prev,
-          [containerId]: existingTaskID
-        }))
-        pollProgress(containerId, existingTaskID)
-        return
-      }
-
-      // 注意参数顺序: id, containerName, imageNameAndTag, delOldContainer
-      const response = await containerAPI.updateContainer(
-        containerId,
-        container.name,
-        container.usingImage,
-        true
-      )
-
-      console.log('更新容器响应:', response.data)
-
-      if (response.data.code === 200 || response.data.code === 0) {
-        const taskID = response.data.data?.taskID
-
-        if (taskID) {
-          console.log('开始轮询进度, taskID:', taskID)
-          // 保存任务ID并开始轮询进度
-          setUpdateTasks(prev => ({
-            ...prev,
-            [containerId]: taskID
-          }))
-
-          pollProgress(containerId, taskID)
-        } else {
-          // 如果没有返回taskID,说明更新可能立即完成
-          setContainerActions(prev => {
-            const newState = { ...prev }
-            delete newState[containerId]
-            return newState
-          })
-          await refetch()
-
-        }
-      } else {
-        throw new Error(response.data.msg || '更新失败')
-      }
-    } catch (error) {
-      console.error('更新容器失败:', error)
-      setContainerActions(prev => {
-        const newState = { ...prev }
-        delete newState[containerId]
-        return newState
+  const handleUpdateContainer = (containerId, existingTaskID = null, requestedImage = null) => {
+    const container = containers.find(c => c.id === containerId)
+    if (!container) {
+      setConfirmModal({
+        isOpen: true,
+        title: '无法更新容器',
+        message: '容器当前不在列表中，请刷新列表后重试。',
+        onConfirm: () => setConfirmModal({ isOpen: false }),
+        onCancel: null,
+        type: 'danger',
       })
-
-      // 增加超时错误的处理
-      if (error.code === 'ECONNABORTED' || error.message.includes('timeout')) {
-        console.error(`更新操作已提交，但连接超时。请稍后手动刷新页面查看操作结果`)
-        // 即使超时也触发轮询，因为操作可能仍在进行中
-        // 这里我们不知道taskID，所以无法启动轮询，只能提示用户稍后查看
-      } else {
-        // 针对名称冲突提供特定的解决方案
-        let errorMessage = error.response?.data?.msg || error.message;
-        if (errorMessage.includes('重命名') || errorMessage.includes('name conflict') || errorMessage.includes('名称冲突')) {
-          errorMessage += '\n\n检测到容器名称冲突问题，建议解决方案：\n' +
-            '1. 手动删除或重命名冲突的容器\n' +
-            '2. 使用不同的容器名称进行更新\n' +
-            '3. 先停止并重命名当前容器，再进行更新操作';
-        }
-
-        // 使用自定义弹窗显示错误信息
-        setConfirmModal({
-          isOpen: true,
-          title: '更新失败',
-          message: errorMessage,
-          onConfirm: () => setConfirmModal({ isOpen: false }),
-          onCancel: null,
-          type: 'danger'
-        });
-      }
+      return
     }
+
+    const key = updateTaskKey(container.name, container.id)
+    setTaskTrackers((previous) => {
+      const next = {
+        ...previous,
+        [key]: {
+          key, name: container.name, containerId,
+          taskID: existingTaskID || '',
+          submission: existingTaskID ? null : {
+            nonce: submissionNonce(),
+            request: () => containerAPI.updateContainer(
+              containerId,
+              container.name,
+              requestedImage ?? container.usingImage,
+              true,
+            ),
+          },
+        },
+      }
+      saveUpdateTasksByName(next)
+      return next
+    })
+    setContainerActions(prev => ({
+      ...prev,
+      [containerId]: { action: 'update', loading: true, progress: '正在提交更新请求', percentage: 0 },
+    }))
+  }
+
+  const handleTaskAccepted = (key, taskID) => {
+    setTaskTrackers((previous) => {
+      const entry = previous[key]
+      if (!entry) return previous
+      const next = { ...previous, [key]: { ...entry, taskID, submission: null } }
+      saveUpdateTasksByName(next)
+      return next
+    })
+  }
+
+  const handleTaskSubmissionError = (key, containerId, error) => {
+    setTaskTrackers((previous) => {
+      const entry = previous[key]
+      if (!entry) return previous
+      const next = { ...previous, [key]: { ...entry, submission: null } }
+      saveUpdateTasksByName(next)
+      return next
+    })
+    const status = Number(error?.status)
+    const definitelyRejected = status >= 400 && status < 500 && status !== 408 && status !== 429
+    setContainerActions(prev => {
+      const next = { ...prev }
+      if (definitelyRejected) delete next[containerId]
+      else next[containerId] = { action: 'update', loading: true, progress: '提交结果待确认', percentage: 0 }
+      return next
+    })
+  }
+
+  const handleTaskUpdate = (key, entry, task) => {
+    if (task.status !== 'queued' && task.status !== 'running') return
+    const taskID = task.taskID || task.taskId
+    if (taskID && taskID !== entry.taskID) {
+      setTaskTrackers((previous) => {
+        const current = previous[key]
+        if (!current || current.taskID === taskID) return previous
+        const next = { ...previous, [key]: { ...current, taskID, createdAt: task.createdAt || current.createdAt, submission: null } }
+        saveUpdateTasksByName(next)
+        return next
+      })
+    }
+    const ids = new Set([entry.containerId, task.oldContainerID, task.newContainerID, ...(task.containerIDs || [])].filter(Boolean))
+    const message = task.message || task.detailMsg || '更新任务正在执行'
+    const percentage = Math.max(0, Math.min(100, Number(task.percentage) || 0))
+    setContainerActions((previous) => {
+      const next = { ...previous }
+      for (const id of ids) next[id] = { action: 'update', loading: true, progress: message, percentage }
+      return next
+    })
+  }
+
+  const handleTaskTerminal = (key, task) => {
+    const ids = new Set([taskTrackers[key]?.containerId, task.oldContainerID, task.newContainerID, ...(task.containerIDs || [])].filter(Boolean))
+    setContainerActions(prev => {
+      const next = { ...prev }
+      for (const id of ids) delete next[id]
+      return next
+    })
+    setTaskTrackers((previous) => {
+      const entry = previous[key]
+      if (!entry) return previous
+      const next = { ...previous, [key]: { ...entry, terminal: true, submission: null } }
+      saveUpdateTasksByName(next)
+      return next
+    })
+    void refetch()
   }
 
   // 轮询进度
@@ -953,6 +1090,17 @@ export function Containers() {
           </div>
         )}
       </div>
+
+      {Object.values(taskTrackers).map((entry) => (
+        <ContainerUpdateTaskTracker
+          key={entry.key}
+          entry={entry}
+          onAccepted={handleTaskAccepted}
+          onSubmissionError={handleTaskSubmissionError}
+          onTaskUpdate={handleTaskUpdate}
+          onTerminal={handleTaskTerminal}
+        />
+      ))}
 
       {/* 统计信息 */}
       <div className="px-2 sm:px-6 py-4">
@@ -1748,50 +1896,11 @@ function ContainerDetailModal({ container, onClose, onRename, onUpdate, onAction
         console.log(`原镜像: ${currentContainer.usingImage}`)
         console.log(`新镜像: ${imageNameAndTag}`)
 
-        // 直接调用API更新容器
-        const response = await containerAPI.updateContainer(
-          container.id,
-          container.name,
-          imageNameAndTag,
-          true // 删除旧容器
-        )
-
-        console.log('更新容器响应:', response.data)
-
-        if (response.data.code === 200 || response.data.code === 0) {
-          const taskID = response.data.data?.taskID
-
-          if (taskID) {
-            // 如果返回了taskID，我们需要触发进度轮询
-            console.log('更新任务已创建，taskID:', taskID)
-
-            // 关闭弹窗
-            onClose()
-
-            // 触发父组件中的进度轮询
-            onUpdate(container.id, taskID)
-
-            console.log('✅ 容器更新任务已启动，请在列表中查看进度')
-          } else {
-            // 没有taskID，更新完成
-            await queryClient.invalidateQueries(['containers'])
-            setImageNameAndTag(imageNameAndTag) // 更新本地状态
-            console.log('✅ 容器镜像更新完成')
-          }
-        } else {
-          throw new Error(response.data.msg || '更新失败')
-        }
-
+        await onUpdate(container.id, null, imageNameAndTag)
+        onClose()
         setIsUpdating(false)
       } catch (error) {
         console.error('更新容器镜像失败:', error)
-        // 增加超时错误的处理
-        if (error.code === 'ECONNABORTED' || error.message.includes('timeout')) {
-          console.error(`更新操作已提交，但连接超时。请稍后手动刷新页面查看操作结果`)
-          // 即使超时也关闭弹窗并触发轮询，因为操作可能仍在进行中
-          onClose()
-          onUpdate(container.id)
-        }
         setIsUpdating(false)
       }
     }
