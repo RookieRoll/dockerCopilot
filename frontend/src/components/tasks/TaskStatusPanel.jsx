@@ -1,6 +1,7 @@
 import React from 'react'
-import { AlertTriangle, CheckCircle2, CircleDashed, Clipboard, LoaderCircle, XCircle } from 'lucide-react'
+import { AlertTriangle, CheckCircle2, ChevronDown, ChevronUp, CircleDashed, Clipboard, LoaderCircle, X, XCircle } from 'lucide-react'
 import { taskBatchSummary, taskDiagnosticEntries, taskIdentifiers, taskStatusLabel, taskSubmissionOutcome } from './taskStatusModel.js'
+import { taskPanelControls } from './taskPanelModel.js'
 
 const STATUS_STYLES = {
   queued: 'border-blue-200 bg-blue-50 text-blue-800 dark:border-blue-900 dark:bg-blue-950/40 dark:text-blue-200',
@@ -85,6 +86,14 @@ function TextBlock({ label, children, tone = 'normal' }) {
 }
 
 export function TaskStatusPanel({ task, taskId = '', connectionError, unauthorized = false, submitError, isTracking = false, containerName = '' }) {
+  const identity = task?.taskID || task?.taskId || taskId || submitError?.requestId || ''
+  const [collapsed, setCollapsed] = React.useState(false)
+  const [dismissed, setDismissed] = React.useState(false)
+  React.useEffect(() => {
+    setCollapsed(false)
+    setDismissed(false)
+  }, [identity])
+
   if (!task && !connectionError && !unauthorized && !submitError && !isTracking) return null
 
   const status = task?.status
@@ -96,6 +105,8 @@ export function TaskStatusPanel({ task, taskId = '', connectionError, unauthoriz
   const batchSummary = taskBatchSummary(task)
   const message = typeof task?.message === 'string' ? task.message : ''
   const submitOutcome = taskSubmissionOutcome(submitError?.status)
+  const controls = taskPanelControls(task, submitError)
+  if (dismissed && controls.canDismiss) return null
 
   return (
     <section className="my-4 rounded-xl border border-gray-200 bg-white shadow-sm dark:border-gray-700 dark:bg-gray-800" aria-label="任务状态" data-testid="task-status-panel">
@@ -107,12 +118,35 @@ export function TaskStatusPanel({ task, taskId = '', connectionError, unauthoriz
             {containerName && <p className="truncate text-xs opacity-80">容器：{containerName}</p>}
           </div>
         </div>
-        {task?.percentage !== undefined && active && (
-          <span className="shrink-0 text-xs font-semibold">{Math.max(0, Math.min(100, Number(task.percentage) || 0))}%</span>
-        )}
+        <div className="flex shrink-0 items-center gap-2">
+          {task?.percentage !== undefined && active && (
+            <span className="text-xs font-semibold">{Math.max(0, Math.min(100, Number(task.percentage) || 0))}%</span>
+          )}
+          {controls.canCollapse && (
+            <button
+              type="button"
+              className="rounded p-1 hover:bg-black/5 focus-visible:outline focus-visible:outline-2 focus-visible:outline-primary-500 dark:hover:bg-white/10"
+              aria-expanded={!collapsed}
+              aria-label={collapsed ? '展开任务详情' : '收起任务详情'}
+              onClick={() => setCollapsed((value) => !value)}
+            >
+              {collapsed ? <ChevronDown className="h-4 w-4" aria-hidden="true" /> : <ChevronUp className="h-4 w-4" aria-hidden="true" />}
+            </button>
+          )}
+          {controls.canDismiss && (
+            <button
+              type="button"
+              className="rounded p-1 hover:bg-black/5 focus-visible:outline focus-visible:outline-2 focus-visible:outline-primary-500 dark:hover:bg-white/10"
+              aria-label="关闭终态任务面板"
+              onClick={() => setDismissed(true)}
+            >
+              <X className="h-4 w-4" aria-hidden="true" />
+            </button>
+          )}
+        </div>
       </div>
 
-      <div className="space-y-3 p-4">
+      {!collapsed && <div className="space-y-3 p-4">
         {!task && isTracking && !connectionError && !unauthorized && <p className="text-sm text-gray-600 dark:text-gray-300">正在查询任务状态…</p>}
         {task?.stage && <p className="text-sm"><span className="font-medium">阶段：</span>{task.stage}</p>}
         {message && <p className="text-sm text-gray-700 dark:text-gray-200">{message}</p>}
@@ -167,7 +201,7 @@ export function TaskStatusPanel({ task, taskId = '', connectionError, unauthoriz
           </TextBlock>
         ))}
         {task?.requiresAttention && <p className="text-sm font-medium text-amber-800 dark:text-amber-300">该任务仍需人工核对处理。</p>}
-      </div>
+      </div>}
     </section>
   )
 }

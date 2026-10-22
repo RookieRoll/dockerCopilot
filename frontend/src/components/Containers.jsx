@@ -120,11 +120,11 @@ function updateTaskKey(name, containerId) {
   return stableName ? `name:${stableName}` : `id:${containerId}`
 }
 
-async function listActiveContainerUpdateTasks() {
+async function listActiveContainerUpdateTasks({ signal } = {}) {
   const records = []
   for (const status of ['queued', 'running']) {
     for (let page = 1; ; page += 1) {
-      const response = await taskAPI.listTasks({ status, type: 'container-update', page, limit: 100 })
+      const response = await taskAPI.listTasks({ status, type: 'container-update', page, limit: 100 }, { signal })
       const items = taskListPayload(response).map((record) => validateTaskRecord(record, response))
       records.push(...items.filter((record) => record.status === status && record.type === 'container-update'))
       if (!response.data?.data?.hasMore && items.length < 100) break
@@ -384,6 +384,8 @@ export function Containers() {
   const [taskTrackers, setTaskTrackers] = useState(readSavedUpdateTasks)
   const [batchSubmission, setBatchSubmission] = useState(null)
   const [batchTask, setBatchTask] = useState(null)
+  const [taskDiscoveryError, setTaskDiscoveryError] = useState(null)
+  const [taskDiscoveryAttempt, setTaskDiscoveryAttempt] = useState(0)
   const recoveryStarted = React.useRef(false)
   // 添加筛选状态
   const [filterStatus, setFilterStatus] = useState(null) // null 表示显示全部
@@ -442,12 +444,12 @@ export function Containers() {
         saveUpdateTasksByName(next)
         return next
       })
-    })
+    }, { onError: setTaskDiscoveryError })
     return () => {
       cancelDiscovery()
       recoveryStarted.current = false
     }
-  }, [isLoading])
+  }, [isLoading, taskDiscoveryAttempt])
 
   // 获取自定义图标配置
   const { data: customIcons = {}, isError: customIconsError, error: customIconsQueryError } = useImageIcons()
@@ -771,6 +773,14 @@ export function Containers() {
         <div role="alert" className="mb-4 rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-800 dark:border-red-900 dark:bg-red-900/20 dark:text-red-200">
           图标映射加载失败：{customIconsQueryError?.message || '请检查服务后重试'}
           <button className="ml-3 underline" onClick={() => queryClient.invalidateQueries({ queryKey: ['customIcons'] })}>重试</button>
+        </div>
+      )}
+
+      {taskDiscoveryError && (
+        <div role="alert" className="mb-4 rounded-lg border border-amber-300 bg-amber-50 p-3 text-sm text-amber-900 dark:border-amber-800 dark:bg-amber-950/40 dark:text-amber-200">
+          <span>无法查询刷新后仍在执行的容器任务；页面会继续重试，现有任务不会自动重放。</span>
+          {taskDiscoveryError.message && <p className="mt-1 break-words text-xs">查询错误：{taskDiscoveryError.message}</p>}
+          <button className="ml-3 underline" onClick={() => setTaskDiscoveryAttempt((value) => value + 1)}>立即重试</button>
         </div>
       )}
 
