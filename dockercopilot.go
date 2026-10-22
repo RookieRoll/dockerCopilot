@@ -9,10 +9,10 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"strings"
 
 	"github.com/onlyLTY/dockerCopilot/internal/config"
 	"github.com/onlyLTY/dockerCopilot/internal/handler"
+	"github.com/onlyLTY/dockerCopilot/internal/observability"
 	"github.com/onlyLTY/dockerCopilot/internal/svc"
 	"github.com/onlyLTY/dockerCopilot/internal/utiles"
 	"github.com/robfig/cron/v3"
@@ -176,42 +176,12 @@ func RegisterHandlers(engine *rest.Server) {
 	)
 }
 
-// 检查并创建日志目录
-func ensureLogDirectory(logDir string) error {
-	if _, err := os.Stat(logDir); os.IsNotExist(err) {
-		return os.MkdirAll(logDir, 0755) // 创建目录并设置权限
-	}
-	return nil
-}
-
 // SetupLog 初始化日志设置
 func SetupLog(logDir string) error {
 	return SetupLogWithOptions(config.LogOptions{Directory: logDir, Level: "info", RetentionDays: 7, MaxFileSizeMiB: 20, MaxTotalSizeMiB: 200})
 }
 
 func SetupLogWithOptions(options config.LogOptions) error {
-	logDir := options.Directory
-	// 检查日志目录是否存在
-	if err := ensureLogDirectory(logDir); err != nil {
-		return fmt.Errorf("failed to create log directory: %v", err)
-	}
-
-	logConf := logx.LogConf{
-		Path:     logDir,
-		Level:    options.Level,
-		KeepDays: options.RetentionDays,
-		Compress: true,
-		Mode:     "file",
-	}
-	logx.MustSetup(logConf)
-	logx.AddWriter(logx.NewWriter(os.Stdout))
-	switch strings.ToLower(options.Level) {
-	case "debug":
-		logx.SetLevel(logx.DebugLevel)
-	case "error", "severe":
-		logx.SetLevel(logx.ErrorLevel)
-	default:
-		logx.SetLevel(logx.InfoLevel)
-	}
-	return nil
+	const mib = int64(1024 * 1024)
+	return observability.Setup(options.Directory, options.Level, options.RetentionDays, options.MaxFileSizeMiB*mib, options.MaxTotalSizeMiB*mib)
 }
