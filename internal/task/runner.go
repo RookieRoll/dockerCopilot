@@ -259,6 +259,7 @@ func (r *Runner) execute(q queuedTask) {
 	}()
 	select {
 	case out := <-done:
+		e.markRunReturned()
 		if cause := e.failure(); cause != nil {
 			out.err = cause
 		} else if deadlineErr := taskContextError(ctx); deadlineErr != nil {
@@ -277,7 +278,11 @@ func (r *Runner) execute(q queuedTask) {
 			// the worker and its lease remain occupied until Run really returns.
 			e.Warning("主操作已持久提交，但任务期限已到；清理结果尚未确认")
 			r.finish(e, StatusSucceeded, nil, Recovery{Status: "not-needed"}, false)
-			<-done
+			out := <-done
+			e.markRunReturned()
+			if out.err == nil && !out.panicked {
+				r.releaseSettledNameProtection(e)
+			}
 			cancel()
 			return
 		}
@@ -303,6 +308,7 @@ func (r *Runner) execute(q queuedTask) {
 		// really returned. The failed terminal result is durable immediately,
 		// while its pending-install marker preserves the cleanup facts.
 		out := <-done
+		e.markRunReturned()
 		if criticalErr := e.failure(); criticalErr != nil {
 			cause = errors.Join(cause, criticalErr)
 		}
@@ -323,6 +329,7 @@ func (r *Runner) execute(q queuedTask) {
 		}
 		out.err = cause
 		r.runRecoveryAndReconcile(e, q.spec.Recover, cause, out, q.spec.RollbackHandoff)
+		r.releaseSettledNameProtection(e)
 		cancel()
 	}
 }
@@ -605,6 +612,9 @@ func (r *Runner) finish(e *Execution, status Status, cause error, recovery Recov
 	if cause != nil {
 		rec.Error = cause.Error()
 	}
+	if e.canReleaseSettledNameProtectionLocked(rec, status) {
+		rec.ProtectedNames = nil
+	}
 	settleBatchItems(&rec, status)
 	e.record = cloneRecord(rec)
 	err := e.store.Save(rec)
@@ -619,6 +629,45 @@ func (r *Runner) finish(e *Execution, status Status, cause error, recovery Recov
 				logx.Field("requiresAttention", rec.RequiresAttention),
 				logx.Field("warningCount", len(rec.Warnings)))...)
 	}
+}
+
+// releaseSettledNameProtection handles the committed-timeout path, where the
+// successful primary result is persisted before an uncooperative callback
+// returns. Names stay protected until that callback really settles; afterward
+// a terminal reconciliation removes only the temporary name lease. A failed
+// reconciliation leaves the task protected and does not rewrite its result.
+func (r *Runner) releaseSettledNameProtection(e *Execution) {
+	e.mu.Lock()
+	eligible := e.runReturned
+	taskID := e.record.TaskID
+	e.mu.Unlock()
+	if !eligible {
+		return
+	}
+	record, err := r.store.Get(taskID)
+	if err != nil {
+		r.writeOutput("task %s settled but could not inspect name protection state: %v\n", taskID, err)
+		return
+	}
+	if !nameProtectionCanBeReleased(record) || len(record.ProtectedNames) == 0 {
+		return
+	}
+	store, ok := r.store.(ReconciliationStore)
+	if !ok {
+		r.writeOutput("task %s settled successfully but name protection could not be released: store does not support reconciliation\n", record.TaskID)
+		return
+	}
+	finding := Reconciliation{
+		Recovery: record.Recovery, RequiresAttention: false,
+		ProtectedNames: nil,
+	}
+	if err := store.Reconcile(record.TaskID, finding); err != nil {
+		r.writeOutput("task %s settled successfully but name protection could not be released: %v\n", record.TaskID, err)
+		return
+	}
+	e.mu.Lock()
+	e.record.ProtectedNames = nil
+	e.mu.Unlock()
 }
 
 func (r *Runner) finalizeWithoutExecution(rec Record, cause error, accepted bool) {
@@ -801,6 +850,25 @@ type Execution struct {
 	recoveryCtx     context.Context
 	committed       bool
 	uncertainCommit bool
+	runReturned     bool
+}
+
+func (e *Execution) markRunReturned() {
+	e.mu.Lock()
+	e.runReturned = true
+	e.mu.Unlock()
+}
+
+func (e *Execution) canReleaseSettledNameProtectionLocked(record Record, status Status) bool {
+	record.Status = status
+	return e.runReturned && nameProtectionCanBeReleased(record)
+}
+
+func nameProtectionCanBeReleased(record Record) bool {
+	settledStatus := record.Status == StatusSucceeded || record.Status == StatusFailed
+	settledRecovery := record.Recovery.Status == "not-needed" || record.Recovery.Status == "restored"
+	return record.Type == "container-update" && settledStatus && settledRecovery &&
+		!record.RequiresAttention && record.PendingInstall == nil
 }
 
 func (e *Execution) TaskID() string { e.mu.Lock(); defer e.mu.Unlock(); return e.record.TaskID }
