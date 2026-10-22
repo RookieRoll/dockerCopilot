@@ -46,6 +46,8 @@ services:
 
 日志配置预设写入 `/data/logs`、级别为 `info`、保留 7 天，单文件与目录容量上限分别为 20 MiB 和 200 MiB；轮转和容量清理由后续日志任务接入。备份默认写入 `/data/backups`，端口覆盖配置默认写入 `/data/config/container-port-overrides.json`。在线更新源默认为 `RookieRoll/dockerCopilot`。旧的 `BACKUP_DIR`、`DelOldContainer`、`githubProxy` 和 `CONTAINER_PORT_OVERRIDES_PATH` 环境变量继续生效；对应环境变量优先于 YAML。`DelOldContainer` 接受 `true` 或 `false`，单次更新请求显式提供 `delOldContainer` 时优先使用请求值。
 
+JSON 与 Compose 备份保存容器配置（包括环境变量、挂载定义和网络配置），不复制挂载卷中的文件或应用数据；恢复会按备份配置创建容器，但不会自动启动。备份文件使用限制性权限保存，请按敏感配置数据管理。
+
 任务、日志和更新配置也可使用 `DOCKERCOPILOT_TASK_*`、`DOCKERCOPILOT_LOG_*`、`DOCKERCOPILOT_UPDATE_REPOSITORY` 与 `DOCKERCOPILOT_GITHUB_PROXY` 覆盖。任务超时、保留期和恢复/健康检查时间使用 Go duration 格式，例如 `30m`、`168h` 和 `120s`。更新仓库使用 `owner/repository` 格式；代理地址必须是没有凭据、查询参数或片段的 HTTP(S) URL。
 
 关键默认值可在 YAML 中显式调整：

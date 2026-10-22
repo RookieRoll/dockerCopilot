@@ -91,6 +91,7 @@ func newServiceContext(c config.Config, cli *client.Client) (*ServiceContext, er
 	updates := module.NewImageCheck()
 	progressStore := make(ProgressStoreType)
 	progress := legacyprogress.NewStore(progressStore)
+	containers := containerService.NewService(cli, updates)
 	ctx := &ServiceContext{
 		Config:         c,
 		HubImageInfo:   updates,
@@ -98,9 +99,9 @@ func newServiceContext(c config.Config, cli *client.Client) (*ServiceContext, er
 		LegacyProgress: progress,
 		DockerClient:   cli,
 		Mutations:      operation.NewMutationGate(),
-		Containers:     containerService.NewService(cli, updates),
+		Containers:     containers,
 		Images:         imageService.NewService(cli),
-		Backups:        backupService.NewService(cli, c.BackupDirectory()),
+		Backups:        backupService.NewService(cli, c.BackupDirectory(), containers.Operations()),
 		Ports:          settings.NewPortOverridesService(c.PortOverridesFilePath()),
 	}
 	icons, err := settings.NewIconService(settings.IconOptions{ImageDir: settings.DefaultImageDir, MappingPath: settings.DefaultImageLogosPath})
@@ -160,7 +161,10 @@ func (ctx *ServiceContext) BackupService() *backupService.Service {
 	ctx.mu.Lock()
 	defer ctx.mu.Unlock()
 	if ctx.Backups == nil {
-		ctx.Backups = backupService.NewService(ctx.DockerClient, ctx.Config.BackupDirectory())
+		if ctx.Containers == nil {
+			ctx.Containers = containerService.NewService(ctx.DockerClient, ctx.HubImageInfo)
+		}
+		ctx.Backups = backupService.NewService(ctx.DockerClient, ctx.Config.BackupDirectory(), ctx.Containers.Operations())
 		progress := ctx.progressServiceLocked()
 		ctx.Backups.SetProgressCallbacks(backupService.ProgressCallbacks{Update: progress.Update, Get: progress.Get})
 	}

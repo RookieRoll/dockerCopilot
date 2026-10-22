@@ -9,26 +9,26 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
-	"time"
 
-	dockertypes "github.com/docker/docker/api/types"
 	dockerBackend "github.com/docker/docker/api/types/backend"
-	"github.com/docker/docker/api/types/container"
 	dockerimage "github.com/docker/docker/api/types/image"
-	"github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/client"
 	dockerMsgType "github.com/docker/docker/pkg/jsonmessage"
+	"github.com/google/uuid"
+	"github.com/onlyLTY/dockerCopilot/internal/operation"
 	"github.com/onlyLTY/dockerCopilot/internal/types"
-	"github.com/onlyLTY/dockerCopilot/internal/utiles/backup_compose"
 )
 
 var filenamePattern = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
 
 // Service owns backup storage and Docker export/restore source files.
 type Service struct {
-	docker   *client.Client
-	dir      string
-	progress ProgressCallbacks
+	docker      *client.Client
+	dir         string
+	progress    ProgressCallbacks
+	coordinator *operation.Coordinator
+	newSuffix   func() string
+	writeData   func(io.Writer, []byte) (int, error)
 }
 
 type ProgressCallbacks struct {
@@ -36,12 +36,24 @@ type ProgressCallbacks struct {
 	Get    func(string) (types.TaskProgress, bool)
 }
 
-func NewService(docker *client.Client, directory string) *Service {
-	return &Service{docker: docker, dir: strings.TrimSpace(directory)}
+func NewService(docker *client.Client, directory string, coordinators ...*operation.Coordinator) *Service {
+	service := &Service{
+		docker: docker, dir: strings.TrimSpace(directory),
+		newSuffix: func() string { return strings.ReplaceAll(uuid.NewString(), "-", "") },
+		writeData: func(writer io.Writer, data []byte) (int, error) { return writer.Write(data) },
+	}
+	if len(coordinators) > 0 {
+		service.coordinator = coordinators[0]
+	}
+	return service
 }
 
 func (s *Service) Directory() string                                { return s.dir }
 func (s *Service) SetProgressCallbacks(callbacks ProgressCallbacks) { s.progress = callbacks }
+
+// SetCoordinator injects the shared container-operation coordinator so a
+// snapshot cannot inspect a container while an in-process replacement owns it.
+func (s *Service) SetCoordinator(coordinator *operation.Coordinator) { s.coordinator = coordinator }
 
 func (s *Service) List() ([]string, error) {
 	entries, err := os.ReadDir(s.dir)
@@ -91,48 +103,13 @@ func (s *Service) Delete(filename string, extensions ...string) error {
 }
 
 func (s *Service) Export(ctx context.Context) error {
-	items, err := s.docker.ContainerList(ctx, container.ListOptions{All: true})
-	if err != nil {
-		return err
-	}
-	list := make([]dockerBackend.ContainerCreateConfig, 0, len(items))
-	for _, item := range items {
-		inspected, err := s.docker.ContainerInspect(ctx, item.ID)
-		if err != nil {
-			return err
-		}
-		name := "get container name error"
-		if len(item.Names) > 0 {
-			name = strings.TrimPrefix(item.Names[0], "/")
-		}
-		inspected.Config.Hostname = ""
-		inspected.Image = inspected.Config.Image
-		list = append(list, dockerBackend.ContainerCreateConfig{Config: inspected.Config, HostConfig: inspected.HostConfig, NetworkingConfig: &network.NetworkingConfig{EndpointsConfig: inspected.NetworkSettings.Networks}, Name: name})
-	}
-	data, err := json.MarshalIndent(list, "", "  ")
-	if err != nil {
-		return err
-	}
-	if err := os.MkdirAll(s.dir, 0o755); err != nil {
-		return err
-	}
-	return os.WriteFile(filepath.Join(s.dir, "backup-"+time.Now().Format("2006-01-02")+".json"), data, 0o644)
+	_, err := s.ExportJSON(ctx)
+	return err
 }
 
 func (s *Service) ExportCompose(ctx context.Context) error {
-	items, err := s.docker.ContainerList(ctx, container.ListOptions{All: true})
-	if err != nil {
-		return err
-	}
-	configs := make([]dockertypes.ContainerJSON, 0, len(items))
-	for _, item := range items {
-		inspected, err := s.docker.ContainerInspect(ctx, item.ID)
-		if err != nil {
-			return err
-		}
-		configs = append(configs, inspected)
-	}
-	return backupCompose.DockerConfig2ComposeYamlInDir(configs, s.dir)
+	_, err := s.ExportComposeSnapshot(ctx)
+	return err
 }
 
 func (s *Service) Restore(ctx context.Context, filename, taskID string) error {
