@@ -502,6 +502,14 @@ func (r *Runner) logRecovery(e *Execution, recovery Recovery, attention bool) {
 			logx.Field("requiresAttention", attention))...)
 }
 
+func (r *Runner) logRecoveryAttempt(e *Execution, cause error) {
+	e.mu.Lock()
+	rec := cloneRecord(e.record)
+	e.mu.Unlock()
+	observability.LogTaskEvent(context.Background(), "task.recovery_attempt", rec.TaskID, rec.RequestID,
+		append(taskEventFields(rec, "attempting", cause, r.now()), logx.Field("recoveryStatus", "attempting"))...)
+}
+
 type recoveryResult struct {
 	recovery Recovery
 	err      error
@@ -523,6 +531,9 @@ func (r *Runner) startRecovery(fn RecoveryFunc, cause error, execution *Executio
 func (r *Runner) startRecoveryWithContext(parent context.Context, fn RecoveryFunc, cause error, execution *Execution) recoveryCall {
 	ctx, cancel := context.WithCancel(parent)
 	done := make(chan recoveryResult, 1)
+	if execution != nil {
+		r.logRecoveryAttempt(execution, cause)
+	}
 	go func() {
 		if execution != nil {
 			execution.authorizeRecovery(ctx)
@@ -594,7 +605,8 @@ func (r *Runner) finish(e *Execution, status Status, cause error, recovery Recov
 		observability.LogTaskEvent(context.Background(), "task.finished", rec.TaskID, rec.RequestID,
 			append(taskEventFields(rec, string(rec.Status), cause, r.now()),
 				logx.Field("recoveryStatus", rec.Recovery.Status),
-				logx.Field("requiresAttention", rec.RequiresAttention))...)
+				logx.Field("requiresAttention", rec.RequiresAttention),
+				logx.Field("warningCount", len(rec.Warnings)))...)
 	}
 }
 

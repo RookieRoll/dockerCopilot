@@ -3,8 +3,10 @@ package container
 import (
 	"context"
 	containerService "github.com/onlyLTY/dockerCopilot/internal/container"
+	"github.com/onlyLTY/dockerCopilot/internal/observability"
 	"github.com/onlyLTY/dockerCopilot/internal/svc"
 	"github.com/onlyLTY/dockerCopilot/internal/types"
+	"time"
 
 	"github.com/zeromicro/go-zero/core/logx"
 )
@@ -25,7 +27,13 @@ func NewRestartLogic(ctx context.Context, svcCtx *svc.ServiceContext) *RestartLo
 
 func (l *RestartLogic) Restart(req *types.IdReq) (resp *types.Resp, err error) {
 	resp = &types.Resp{}
+	started := time.Now()
 	err = l.service.Restart(l.ctx, req.Id)
+	if err != nil {
+		observability.LogOperationResultWithDuration(l.ctx, "container.restart", req.Id, "failed", time.Since(started), err)
+	} else {
+		observability.LogOperationResultWithDuration(l.ctx, "container.restart", req.Id, "succeeded", time.Since(started))
+	}
 	if err != nil {
 		resp.Code = 400
 		resp.Msg = err.Error()

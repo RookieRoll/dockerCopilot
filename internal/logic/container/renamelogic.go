@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"time"
 
 	containerService "github.com/onlyLTY/dockerCopilot/internal/container"
 	"github.com/onlyLTY/dockerCopilot/internal/observability"
@@ -58,6 +59,7 @@ func NewRenameLogic(ctx context.Context, svcCtx *svc.ServiceContext) *RenameLogi
 
 func (l *RenameLogic) Rename(req *types.ContainerRenameReq) (resp *types.Resp, err error) {
 	resp = &types.Resp{}
+	started := time.Now()
 	var prepared, renamed bool
 	oldName := ""
 	err = l.service.RenameWithLifecycle(l.ctx, req.Id, req.NewName,
@@ -79,7 +81,7 @@ func (l *RenameLogic) Rename(req *types.ContainerRenameReq) (resp *types.Resp, e
 	)
 	if err != nil {
 		if renamed {
-			observability.LogOperationResult(l.ctx, "container.rename_ports", req.Id, "warning", err)
+			observability.LogOperationResultWithDuration(l.ctx, "container.rename_ports", req.Id, "warning", time.Since(started), err)
 			resp.Code = http.StatusInternalServerError
 			resp.Msg = err.Error()
 			resp.Data = map[string]interface{}{"renamed": true, "oldName": oldName, "containerName": req.NewName, "portsMigrated": false, "renamePending": true}
@@ -87,13 +89,13 @@ func (l *RenameLogic) Rename(req *types.ContainerRenameReq) (resp *types.Resp, e
 		}
 		if prepared {
 			unknown := portRenameOutcomeError{cause: err}
-			observability.LogOperationResult(l.ctx, "container.rename", req.Id, "warning", unknown)
+			observability.LogOperationResultWithDuration(l.ctx, "container.rename", req.Id, "warning", time.Since(started), unknown)
 			resp.Code = unknown.HTTPStatus()
 			resp.Msg = unknown.Error()
 			resp.Data = map[string]interface{}{"renamed": false, "containerName": req.NewName, "renamePending": true, "oldName": oldName}
 			return resp, unknown
 		}
-		observability.LogOperationResult(l.ctx, "container.rename", req.Id, "failed", err)
+		observability.LogOperationResultWithDuration(l.ctx, "container.rename", req.Id, "failed", time.Since(started), err)
 		var classified observability.ClassifiedError
 		if errors.As(err, &classified) {
 			resp.Code = classified.HTTPStatus()
@@ -104,7 +106,7 @@ func (l *RenameLogic) Rename(req *types.ContainerRenameReq) (resp *types.Resp, e
 		resp.Data = map[string]interface{}{}
 		return resp, err
 	}
-	observability.LogOperationResult(l.ctx, "container.rename", req.Id, "succeeded")
+	observability.LogOperationResultWithDuration(l.ctx, "container.rename", req.Id, "succeeded", time.Since(started))
 	resp.Code = 200
 	resp.Msg = "success"
 	resp.Data = map[string]interface{}{"renamed": true, "containerName": req.NewName, "portsMigrated": true}

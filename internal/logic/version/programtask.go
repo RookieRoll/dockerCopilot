@@ -236,7 +236,6 @@ func (l *UpdateProgramLogic) submitProgramUpdate() (*types.Resp, error) {
 		return nil, err
 	}
 	releaseReservation = false
-	observability.LogTaskEvent(l.ctx, "task.accepted", taskID, requestID)
 	return &types.Resp{Code: 200, Msg: "程序更新任务已接受", Data: map[string]any{"taskID": taskID, "status": task.StatusQueued}}, nil
 }
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"github.com/google/uuid"
 	backupService "github.com/onlyLTY/dockerCopilot/internal/backup"
+	"github.com/onlyLTY/dockerCopilot/internal/observability"
 	"github.com/onlyLTY/dockerCopilot/internal/operation"
 
 	"github.com/onlyLTY/dockerCopilot/internal/svc"
@@ -38,7 +39,7 @@ func (l *Backup2composeLogic) Submit() (*types.Resp, error) {
 	taskID := uuid.NewString()
 	var mutationLease *operation.MutationLease
 	id, err := l.taskRunner.Submit(task.TaskSpec{
-		Record: task.Record{TaskID: taskID, Type: "backup-compose-export", Name: "compose"},
+		Record: task.Record{TaskID: taskID, Type: "backup-compose-export", Name: "compose", RequestID: observability.RequestIDFromContext(l.ctx)},
 		OnAccepted: func() error {
 			var acquireErr error
 			mutationLease, acquireErr = l.gate.Acquire(l.ctx, taskID)

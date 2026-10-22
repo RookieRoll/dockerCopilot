@@ -43,6 +43,8 @@ func main() {
 	}
 	disableDefaultRequestLogging(&c)
 	server := rest.MustNewServer(c.RestConf, rest.WithCors("*"), rest.WithUnauthorizedCallback(unauthorizedCallback))
+	server.Use(observability.RequestIDMiddleware)
+	server.Use(observability.MutationResultMiddleware)
 	defer server.Stop()
 	ctx, err := svc.NewServiceContextChecked(c)
 	if err != nil {
