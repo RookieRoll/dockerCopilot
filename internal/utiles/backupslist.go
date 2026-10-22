@@ -1,9 +1,8 @@
 package utiles
 
 import (
+	backupService "github.com/onlyLTY/dockerCopilot/internal/backup"
 	"github.com/onlyLTY/dockerCopilot/internal/svc"
-	"os"
-	"path/filepath"
 )
 
 func BackupList(ctx *svc.ServiceContext) ([]string, error) {
@@ -11,22 +10,12 @@ func BackupList(ctx *svc.ServiceContext) ([]string, error) {
 	if ctx != nil {
 		dir = ctx.Config.BackupDirectory()
 	}
-	return BackupListIn(dir)
+	if ctx != nil && ctx.Backups != nil {
+		return ctx.Backups.List()
+	}
+	return backupService.NewService(nil, dir).List()
 }
 
 func BackupListIn(dir string) ([]string, error) {
-	var backupList []string
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return nil, err
-	}
-	for _, entry := range entries {
-		if !entry.IsDir() && filepath.Ext(entry.Name()) == ".json" {
-			backupList = append(backupList, entry.Name())
-		} else if !entry.IsDir() && filepath.Ext(entry.Name()) == ".yaml" {
-			backupList = append(backupList, entry.Name())
-		}
-	}
-
-	return backupList, nil
+	return backupService.NewService(nil, dir).List()
 }

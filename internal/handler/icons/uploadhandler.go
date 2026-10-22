@@ -16,9 +16,13 @@ import (
 // file content and by MaxBytesReader on the whole request.
 const multipartMemoryLimit = 1 << 20
 
-func UploadHandler(_ *svc.ServiceContext) http.HandlerFunc {
+func UploadHandler(svcCtx *svc.ServiceContext) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		iconService, err := newIconService()
+		iconService := svcCtx.Icons
+		var err error
+		if iconService == nil {
+			iconService, err = newIconService()
+		}
 		if err != nil {
 			logx.Errorf("initialize icon storage: %v", err)
 			writeUploadError(w, http.StatusInternalServerError, "failed to initialize icon storage")

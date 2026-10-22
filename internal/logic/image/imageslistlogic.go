@@ -2,9 +2,9 @@ package image
 
 import (
 	"context"
-	"github.com/onlyLTY/dockerCopilot/internal/utiles"
 	"time"
 
+	imageService "github.com/onlyLTY/dockerCopilot/internal/image"
 	"github.com/onlyLTY/dockerCopilot/internal/svc"
 	"github.com/onlyLTY/dockerCopilot/internal/types"
 
@@ -13,8 +13,8 @@ import (
 
 type ImagesListLogic struct {
 	logx.Logger
-	ctx    context.Context
-	svcCtx *svc.ServiceContext
+	ctx     context.Context
+	service *imageService.Service
 }
 
 type Info struct {
@@ -28,15 +28,22 @@ type Info struct {
 
 func NewImagesListLogic(ctx context.Context, svcCtx *svc.ServiceContext) *ImagesListLogic {
 	return &ImagesListLogic{
-		Logger: logx.WithContext(ctx),
-		ctx:    ctx,
-		svcCtx: svcCtx,
+		Logger:  logx.WithContext(ctx),
+		ctx:     ctx,
+		service: imageServiceFromContext(svcCtx),
 	}
+}
+
+func imageServiceFromContext(ctx *svc.ServiceContext) *imageService.Service {
+	if ctx.Images != nil {
+		return ctx.Images
+	}
+	return imageService.NewService(ctx.DockerClient)
 }
 
 func (l *ImagesListLogic) ImagesList() (resp *types.Resp, err error) {
 	resp = &types.Resp{}
-	list, err := utiles.GetImagesList(l.svcCtx)
+	list, err := l.service.List(l.ctx)
 	if err != nil {
 		resp.Code = 500
 		resp.Msg = err.Error()

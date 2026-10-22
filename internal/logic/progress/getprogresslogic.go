@@ -11,22 +11,21 @@ import (
 
 type GetProgressLogic struct {
 	logx.Logger
-	ctx    context.Context
-	svcCtx *svc.ServiceContext
+	ctx         context.Context
+	getProgress func(string) (svc.TaskProgress, bool)
 }
 
 func NewGetProgressLogic(ctx context.Context, svcCtx *svc.ServiceContext) *GetProgressLogic {
 	return &GetProgressLogic{
-		Logger: logx.WithContext(ctx),
-		ctx:    ctx,
-		svcCtx: svcCtx,
+		Logger:      logx.WithContext(ctx),
+		ctx:         ctx,
+		getProgress: svcCtx.ProgressService().Get,
 	}
 }
 
 func (l *GetProgressLogic) GetProgress(req *types.GetProgressReq) (resp *types.Resp, err error) {
 	resp = &types.Resp{}
-	//progress, exists := l.svcCtx.ProgressStore[req.TaskId]
-	progress, exists := l.svcCtx.GetProgress(req.TaskId)
+	progress, exists := l.getProgress(req.TaskId)
 	if !exists {
 		resp.Code = 400
 		resp.Msg = "taskID 未找到"

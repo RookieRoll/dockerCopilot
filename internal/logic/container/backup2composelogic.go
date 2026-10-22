@@ -2,7 +2,7 @@ package container
 
 import (
 	"context"
-	"github.com/onlyLTY/dockerCopilot/internal/utiles"
+	backupService "github.com/onlyLTY/dockerCopilot/internal/backup"
 
 	"github.com/onlyLTY/dockerCopilot/internal/svc"
 	"github.com/onlyLTY/dockerCopilot/internal/types"
@@ -12,21 +12,21 @@ import (
 
 type Backup2composeLogic struct {
 	logx.Logger
-	ctx    context.Context
-	svcCtx *svc.ServiceContext
+	ctx     context.Context
+	service *backupService.Service
 }
 
 func NewBackup2composeLogic(ctx context.Context, svcCtx *svc.ServiceContext) *Backup2composeLogic {
 	return &Backup2composeLogic{
-		Logger: logx.WithContext(ctx),
-		ctx:    ctx,
-		svcCtx: svcCtx,
+		Logger:  logx.WithContext(ctx),
+		ctx:     ctx,
+		service: backupServiceFromContext(svcCtx),
 	}
 }
 
 func (l *Backup2composeLogic) Backup2compose() (resp *types.Resp, err error) {
 	resp = &types.Resp{}
-	err = utiles.Backup2Compose(l.svcCtx)
+	err = l.service.ExportCompose(l.ctx)
 	if err != nil {
 		return nil, err
 	}

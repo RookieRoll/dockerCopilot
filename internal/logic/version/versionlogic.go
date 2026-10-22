@@ -7,21 +7,23 @@ import (
 
 	"github.com/onlyLTY/dockerCopilot/internal/svc"
 	"github.com/onlyLTY/dockerCopilot/internal/types"
-	"github.com/onlyLTY/dockerCopilot/internal/utiles"
+	"github.com/onlyLTY/dockerCopilot/internal/updater"
 	"github.com/zeromicro/go-zero/core/logx"
 )
 
 type VersionLogic struct {
 	logx.Logger
-	ctx    context.Context
-	svcCtx *svc.ServiceContext
+	ctx          context.Context
+	updateSource config.UpdateConfig
+	legacySource bool
 }
 
 func NewVersionLogic(ctx context.Context, svcCtx *svc.ServiceContext) *VersionLogic {
 	return &VersionLogic{
-		Logger: logx.WithContext(ctx),
-		ctx:    ctx,
-		svcCtx: svcCtx,
+		Logger:       logx.WithContext(ctx),
+		ctx:          ctx,
+		updateSource: svcCtx.Config.UpdateSource(),
+		legacySource: svcCtx.Config.Updates.Repository == "",
 	}
 }
 
@@ -36,11 +38,11 @@ func (l *VersionLogic) Version(req *types.VersionReq) (resp *types.Resp, err err
 		}
 		return resp, nil
 	} else if req.Type == "remote" {
-		updateSource := l.svcCtx.Config.UpdateSource()
-		if l.svcCtx.Config.Updates.Repository == "" {
+		updateSource := l.updateSource
+		if l.legacySource {
 			updateSource = config.LegacyUpdateSource()
 		}
-		remoteVersion, err := utiles.GetRemoteVersionWithConfig(updateSource)
+		remoteVersion, err := updater.GetRemoteVersionWithConfig(updateSource)
 		if err != nil {
 			resp.Code = 50001
 			resp.Msg = "获取版本错误" + err.Error()

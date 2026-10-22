@@ -10,9 +10,13 @@ import (
 	"github.com/zeromicro/go-zero/rest/httpx"
 )
 
-func ObtainHandler(_ *svc.ServiceContext) http.HandlerFunc {
+func ObtainHandler(svcCtx *svc.ServiceContext) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		iconService, err := newIconService()
+		iconService := svcCtx.Icons
+		var err error
+		if iconService == nil {
+			iconService, err = newIconService()
+		}
 		if err != nil {
 			logx.Errorf("Error initializing icon storage: %v", err)
 			httpx.ErrorCtx(r.Context(), w, fmt.Errorf("failed to read config: %w", err))

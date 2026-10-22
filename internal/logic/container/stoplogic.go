@@ -2,8 +2,7 @@ package container
 
 import (
 	"context"
-	"github.com/onlyLTY/dockerCopilot/internal/utiles"
-
+	containerService "github.com/onlyLTY/dockerCopilot/internal/container"
 	"github.com/onlyLTY/dockerCopilot/internal/svc"
 	"github.com/onlyLTY/dockerCopilot/internal/types"
 
@@ -12,21 +11,21 @@ import (
 
 type StopLogic struct {
 	logx.Logger
-	ctx    context.Context
-	svcCtx *svc.ServiceContext
+	ctx     context.Context
+	service *containerService.Service
 }
 
 func NewStopLogic(ctx context.Context, svcCtx *svc.ServiceContext) *StopLogic {
 	return &StopLogic{
-		Logger: logx.WithContext(ctx),
-		ctx:    ctx,
-		svcCtx: svcCtx,
+		Logger:  logx.WithContext(ctx),
+		ctx:     ctx,
+		service: serviceFromContext(svcCtx),
 	}
 }
 
 func (l *StopLogic) Stop(req *types.IdReq) (resp *types.Resp, err error) {
 	resp = &types.Resp{}
-	err = utiles.StopContainer(l.svcCtx, req.Id)
+	err = l.service.Stop(l.ctx, req.Id)
 	if err != nil {
 		resp.Code = 400
 		resp.Msg = err.Error()

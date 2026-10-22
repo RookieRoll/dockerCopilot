@@ -2,20 +2,14 @@ package utiles
 
 import (
 	"context"
-	"github.com/docker/docker/api/types/container"
+	containerService "github.com/onlyLTY/dockerCopilot/internal/container"
 	"github.com/onlyLTY/dockerCopilot/internal/svc"
 )
 
 func RestartContainer(ctx *svc.ServiceContext, id string) error {
-	timeout := 10
-	signal := "SIGINT"
-	stopOptions := container.StopOptions{
-		Signal:  signal,
-		Timeout: &timeout,
+	service := ctx.Containers
+	if service == nil {
+		service = containerService.NewService(ctx.DockerClient)
 	}
-	err := ctx.DockerClient.ContainerRestart(context.Background(), id, stopOptions)
-	if err != nil {
-		return err
-	}
-	return nil
+	return service.Restart(context.Background(), id)
 }

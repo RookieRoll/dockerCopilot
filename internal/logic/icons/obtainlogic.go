@@ -2,8 +2,8 @@ package icons
 
 import (
 	"context"
-
 	"github.com/onlyLTY/dockerCopilot/internal/svc"
+
 	"github.com/onlyLTY/dockerCopilot/internal/types"
 
 	"github.com/zeromicro/go-zero/core/logx"
@@ -11,15 +11,13 @@ import (
 
 type ObtainLogic struct {
 	logx.Logger
-	ctx    context.Context
-	svcCtx *svc.ServiceContext
+	ctx context.Context
 }
 
 func NewObtainLogic(ctx context.Context, svcCtx *svc.ServiceContext) *ObtainLogic {
 	return &ObtainLogic{
 		Logger: logx.WithContext(ctx),
 		ctx:    ctx,
-		svcCtx: svcCtx,
 	}
 }
 

@@ -2,9 +2,10 @@ package version
 
 import (
 	"context"
+	"github.com/onlyLTY/dockerCopilot/internal/config"
 	"github.com/onlyLTY/dockerCopilot/internal/svc"
 	"github.com/onlyLTY/dockerCopilot/internal/types"
-	"github.com/onlyLTY/dockerCopilot/internal/utiles"
+	"github.com/onlyLTY/dockerCopilot/internal/updater"
 	"github.com/zeromicro/go-zero/core/logx"
 	"os"
 	"time"
@@ -12,21 +13,27 @@ import (
 
 type UpdateProgramLogic struct {
 	logx.Logger
-	ctx    context.Context
-	svcCtx *svc.ServiceContext
+	ctx          context.Context
+	updateSource config.UpdateConfig
+	legacySource bool
 }
 
 func NewUpdateProgramLogic(ctx context.Context, svcCtx *svc.ServiceContext) *UpdateProgramLogic {
 	return &UpdateProgramLogic{
-		Logger: logx.WithContext(ctx),
-		ctx:    ctx,
-		svcCtx: svcCtx,
+		Logger:       logx.WithContext(ctx),
+		ctx:          ctx,
+		updateSource: svcCtx.Config.UpdateSource(),
+		legacySource: svcCtx.Config.Updates.Repository == "",
 	}
 }
 
 func (l *UpdateProgramLogic) UpdateProgram() (resp *types.Resp, err error) {
 	resp = &types.Resp{}
-	err = utiles.UpdateProgram(l.svcCtx)
+	source := l.updateSource
+	if l.legacySource {
+		source = config.LegacyUpdateSource()
+	}
+	err = updater.UpdateProgramWithSource(source)
 	if err != nil {
 		resp.Code = 500
 		resp.Msg = err.Error()

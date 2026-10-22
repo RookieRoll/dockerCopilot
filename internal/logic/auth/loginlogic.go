@@ -12,8 +12,9 @@ import (
 
 type LoginLogic struct {
 	logx.Logger
-	ctx    context.Context
-	svcCtx *svc.ServiceContext
+	ctx     context.Context
+	secret  string
+	expires int64
 }
 
 type JwtResponse struct {
@@ -22,23 +23,24 @@ type JwtResponse struct {
 
 func NewLoginLogic(ctx context.Context, svcCtx *svc.ServiceContext) *LoginLogic {
 	return &LoginLogic{
-		Logger: logx.WithContext(ctx),
-		ctx:    ctx,
-		svcCtx: svcCtx,
+		Logger:  logx.WithContext(ctx),
+		ctx:     ctx,
+		secret:  svcCtx.Config.Auth.AccessSecret,
+		expires: svcCtx.Config.Auth.AccessExpire,
 	}
 }
 
 func (l *LoginLogic) Login(req *types.LoginReq) (resp *types.Resp, err error) {
 	resp = &types.Resp{}
-	if l.svcCtx.Config.Auth.AccessSecret != req.SecretKey {
+	if l.secret != req.SecretKey {
 		resp.Code = 401
 		resp.Msg = "无效的secretKey"
 		resp.Data = JwtResponse{Jwt: ""}
 		return resp, errors.New("无效的secretKey")
 	}
-	jwtToken, err := l.getJwtToken(l.svcCtx.Config.Auth.AccessSecret,
+	jwtToken, err := l.getJwtToken(l.secret,
 		time.Now().Unix(),
-		l.svcCtx.Config.Auth.AccessExpire,
+		l.expires,
 	)
 	if err != nil {
 		resp.Code = 500

@@ -2,7 +2,7 @@ package container
 
 import (
 	"context"
-	"github.com/onlyLTY/dockerCopilot/internal/utiles"
+	backupService "github.com/onlyLTY/dockerCopilot/internal/backup"
 
 	"github.com/onlyLTY/dockerCopilot/internal/svc"
 	"github.com/onlyLTY/dockerCopilot/internal/types"
@@ -12,21 +12,21 @@ import (
 
 type ListBackupsLogic struct {
 	logx.Logger
-	ctx    context.Context
-	svcCtx *svc.ServiceContext
+	ctx     context.Context
+	service *backupService.Service
 }
 
 func NewListBackupsLogic(ctx context.Context, svcCtx *svc.ServiceContext) *ListBackupsLogic {
 	return &ListBackupsLogic{
-		Logger: logx.WithContext(ctx),
-		ctx:    ctx,
-		svcCtx: svcCtx,
+		Logger:  logx.WithContext(ctx),
+		ctx:     ctx,
+		service: backupServiceFromContext(svcCtx),
 	}
 }
 
 func (l *ListBackupsLogic) ListBackups() (resp *types.Resp, err error) {
 	resp = &types.Resp{}
-	backupList, err := utiles.BackupList(l.svcCtx)
+	backupList, err := l.service.List()
 	if err != nil {
 		resp.Code = 500
 		resp.Msg = err.Error()

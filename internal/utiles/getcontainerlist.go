@@ -2,7 +2,7 @@ package utiles
 
 import (
 	"context"
-	"github.com/docker/docker/api/types/container"
+	containerService "github.com/onlyLTY/dockerCopilot/internal/container"
 	"github.com/onlyLTY/dockerCopilot/internal/svc"
 	MyType "github.com/onlyLTY/dockerCopilot/internal/types"
 	"github.com/zeromicro/go-zero/core/logx"
@@ -10,28 +10,22 @@ import (
 
 func GetContainerList(ctx *svc.ServiceContext) ([]MyType.Container, error) {
 	// 获取所有容器（包括停止的容器）
-	dockerContainerList, err := ctx.DockerClient.ContainerList(context.Background(), container.ListOptions{
-		All: true, // 设置为true来获取所有容器
-	})
+	service := ctx.Containers
+	if service == nil {
+		service = containerService.NewService(ctx.DockerClient, ctx.HubImageInfo)
+	}
+	dockerContainerList, err := service.List(context.Background())
 	if err != nil {
 		logx.Errorf("get container list error: %v", err)
 		return nil, err
 	}
-	var containerList []MyType.Container
-	for _, dockerContainerInfo := range dockerContainerList {
-		containerInfo := MyType.Container{
-			Container: dockerContainerInfo,
-		}
-		containerList = append(containerList, containerInfo)
-	}
-	return containerList, nil
+	return dockerContainerList, nil
 }
 
 func CheckImageUpdate(ctx *svc.ServiceContext, containerListData []MyType.Container) []MyType.Container {
-	for idx := range containerListData {
-		if result, ok := ctx.HubImageInfo.Get(containerListData[idx].ImageID); ok && result.NeedUpdate {
-			containerListData[idx].Update = true
-		}
+	service := ctx.Containers
+	if service == nil {
+		service = containerService.NewService(ctx.DockerClient, ctx.HubImageInfo)
 	}
-	return containerListData
+	return service.CheckImageUpdates(containerListData)
 }

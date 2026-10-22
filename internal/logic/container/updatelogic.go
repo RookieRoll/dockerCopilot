@@ -3,23 +3,25 @@ package container
 import (
 	"context"
 	"github.com/google/uuid"
+	containerService "github.com/onlyLTY/dockerCopilot/internal/container"
 	"github.com/onlyLTY/dockerCopilot/internal/svc"
 	"github.com/onlyLTY/dockerCopilot/internal/types"
-	"github.com/onlyLTY/dockerCopilot/internal/utiles"
 	"github.com/zeromicro/go-zero/core/logx"
 )
 
 type UpdateLogic struct {
 	logx.Logger
-	ctx    context.Context
-	svcCtx *svc.ServiceContext
+	ctx              context.Context
+	service          *containerService.Service
+	deleteOldDefault bool
 }
 
 func NewUpdateLogic(ctx context.Context, svcCtx *svc.ServiceContext) *UpdateLogic {
 	return &UpdateLogic{
-		Logger: logx.WithContext(ctx),
-		ctx:    ctx,
-		svcCtx: svcCtx,
+		Logger:           logx.WithContext(ctx),
+		ctx:              ctx,
+		service:          serviceFromContext(svcCtx),
+		deleteOldDefault: svcCtx.Config.ResolveDeleteOldContainer(nil),
 	}
 }
 
@@ -34,8 +36,11 @@ func (l *UpdateLogic) Update(req *types.ContainerUpdateReq) (resp *types.Resp, e
 			}
 		}()
 		imageNameAndTag := req.ImageNameAndTag
-		delOldContainer := l.svcCtx.Config.ResolveDeleteOldContainer(req.DelOldContainer)
-		err := utiles.UpdateContainer(l.svcCtx, req.Id, req.ContainerName, imageNameAndTag, delOldContainer, taskID)
+		delOldContainer := l.deleteOldDefault
+		if req.DelOldContainer != nil {
+			delOldContainer = *req.DelOldContainer
+		}
+		err := l.service.Update(context.Background(), req.Id, req.ContainerName, imageNameAndTag, delOldContainer, taskID)
 		if err != nil {
 			l.Errorf("Error in UpdateContainer: %v", err)
 		}

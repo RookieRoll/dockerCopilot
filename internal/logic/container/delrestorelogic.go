@@ -2,42 +2,33 @@ package container
 
 import (
 	"context"
-	"os"
+	backupService "github.com/onlyLTY/dockerCopilot/internal/backup"
 
 	"github.com/onlyLTY/dockerCopilot/internal/svc"
 	"github.com/onlyLTY/dockerCopilot/internal/types"
-	"github.com/onlyLTY/dockerCopilot/internal/utiles"
 
 	"github.com/zeromicro/go-zero/core/logx"
 )
 
 type DelRestoreLogic struct {
 	logx.Logger
-	ctx    context.Context
-	svcCtx *svc.ServiceContext
+	ctx     context.Context
+	service *backupService.Service
 }
 
 func NewDelRestoreLogic(ctx context.Context, svcCtx *svc.ServiceContext) *DelRestoreLogic {
 	return &DelRestoreLogic{
-		Logger: logx.WithContext(ctx),
-		ctx:    ctx,
-		svcCtx: svcCtx,
+		Logger:  logx.WithContext(ctx),
+		ctx:     ctx,
+		service: backupServiceFromContext(svcCtx),
 	}
 }
 
 func (l *DelRestoreLogic) DelRestore(req *types.DelContainerBackupReq) (resp *types.Resp, err error) {
 	resp = &types.Resp{}
-	fullPath, err := utiles.ResolveBackupPathIn(l.svcCtx.Config.BackupDirectory(), req.Filename, ".json", ".yaml")
-	if err != nil {
+	if err := l.service.Delete(req.Filename, ".json", ".yaml"); err != nil {
 		resp.Code = 400
 		resp.Msg = "非法文件名"
-		resp.Data = map[string]interface{}{}
-		return resp, nil
-	}
-	err = os.Remove(fullPath)
-	if err != nil {
-		resp.Code = 400
-		resp.Msg = "删除失败"
 		resp.Data = map[string]interface{}{}
 		return resp, nil
 	}

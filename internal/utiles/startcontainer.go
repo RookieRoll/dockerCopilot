@@ -2,16 +2,14 @@ package utiles
 
 import (
 	"context"
-	"github.com/docker/docker/api/types/container"
+	containerService "github.com/onlyLTY/dockerCopilot/internal/container"
 	"github.com/onlyLTY/dockerCopilot/internal/svc"
 )
 
 func StartContainer(ctx *svc.ServiceContext, id string) error {
-	startOptions := container.StartOptions{}
-	err := ctx.DockerClient.ContainerStart(context.Background(), id, startOptions)
-	if err != nil {
-		return err
+	service := ctx.Containers
+	if service == nil {
+		service = containerService.NewService(ctx.DockerClient)
 	}
-
-	return nil
+	return service.Start(context.Background(), id)
 }

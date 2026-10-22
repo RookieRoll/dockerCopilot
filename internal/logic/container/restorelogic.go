@@ -4,7 +4,7 @@ import (
 	"context"
 	"fmt"
 	"github.com/google/uuid"
-	"github.com/onlyLTY/dockerCopilot/internal/utiles"
+	backupService "github.com/onlyLTY/dockerCopilot/internal/backup"
 	"path/filepath"
 
 	"github.com/onlyLTY/dockerCopilot/internal/svc"
@@ -15,15 +15,15 @@ import (
 
 type RestoreLogic struct {
 	logx.Logger
-	ctx    context.Context
-	svcCtx *svc.ServiceContext
+	ctx     context.Context
+	service *backupService.Service
 }
 
 func NewRestoreLogic(ctx context.Context, svcCtx *svc.ServiceContext) *RestoreLogic {
 	return &RestoreLogic{
-		Logger: logx.WithContext(ctx),
-		ctx:    ctx,
-		svcCtx: svcCtx,
+		Logger:  logx.WithContext(ctx),
+		ctx:     ctx,
+		service: backupServiceFromContext(svcCtx),
 	}
 }
 
@@ -31,7 +31,7 @@ func (l *RestoreLogic) Restore(req *types.ContainerRestoreReq) (resp *types.Resp
 	resp = &types.Resp{}
 	taskID := uuid.New().String()
 	fileName := req.Filename
-	fullPath, pathErr := utiles.ResolveBackupPathIn(l.svcCtx.Config.BackupDirectory(), fileName, ".json")
+	fullPath, pathErr := l.service.Resolve(fileName, ".json")
 	if pathErr != nil {
 		resp.Code = 400
 		resp.Msg = pathErr.Error()
@@ -53,7 +53,7 @@ func (l *RestoreLogic) Restore(req *types.ContainerRestoreReq) (resp *types.Resp
 				l.Errorf("Recovered from panic in restoreContainer: %v", r)
 			}
 		}()
-		err := utiles.RestoreContainer(l.svcCtx, fileName, taskID)
+		err := l.service.Restore(context.Background(), fileName, taskID)
 		if err != nil {
 			l.Errorf("Error in restoreContainer: %v", err)
 		}
