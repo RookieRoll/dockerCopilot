@@ -82,23 +82,68 @@ func (s *Service) reserveSync(ctx context.Context, id, kind string) (string, *op
 	if err != nil {
 		return "", nil, err
 	}
-	canonicalID := inspected.ID
-	if canonicalID == "" {
-		canonicalID = id
-	}
-	target := operation.Target{ID: canonicalID, Name: strings.TrimLeft(strings.TrimSpace(inspected.Name), "/")}
-	reservation, err := s.Operations().ReserveContext(ctx, operation.Request{TaskID: uuid.NewString(), Kind: kind, Target: target})
+	lease, err := s.reserveInspected(ctx, id, kind, inspected)
 	if err != nil {
 		return "", nil, err
 	}
+	return canonicalContainerID(id, inspected), lease, nil
+}
+
+// ReserveContainerMutation inspects and reserves the same canonical container
+// identity before returning. Callers must hold the lease through any operation
+// whose meaning depends on the inspected name or ID, then release it.
+func (s *Service) ReserveContainerMutation(ctx context.Context, id, kind string) (dockertypes.ContainerJSON, *operation.Lease, error) {
+	inspected, err := s.Inspect(ctx, id)
+	if err != nil {
+		return dockertypes.ContainerJSON{}, nil, err
+	}
+	lease, err := s.reserveInspected(ctx, id, kind, inspected)
+	if err != nil {
+		return dockertypes.ContainerJSON{}, nil, err
+	}
+
+	// Refresh after acquiring the ID lease. A rename can finish between the
+	// initial Inspect and reservation, leaving the first name stale even though
+	// the canonical ID is unchanged.
+	current, err := s.Inspect(ctx, canonicalContainerID(id, inspected))
+	if err != nil {
+		lease.Release()
+		return dockertypes.ContainerJSON{}, nil, err
+	}
+	currentID := canonicalContainerID(id, current)
+	if currentID != canonicalContainerID(id, inspected) {
+		lease.Release()
+		return dockertypes.ContainerJSON{}, nil, fmt.Errorf("container identity changed while acquiring %s reservation", kind)
+	}
+	current.Name = strings.TrimPrefix(strings.TrimSpace(current.Name), "/")
+	if err := lease.AddAlias(operation.Target{ID: currentID, Name: current.Name}); err != nil {
+		lease.Release()
+		return dockertypes.ContainerJSON{}, nil, err
+	}
+	return current, lease, nil
+}
+
+func (s *Service) reserveInspected(ctx context.Context, id, kind string, inspected dockertypes.ContainerJSON) (*operation.Lease, error) {
+	target := operation.Target{ID: canonicalContainerID(id, inspected), Name: strings.TrimLeft(strings.TrimSpace(inspected.Name), "/")}
+	reservation, err := s.Operations().ReserveContext(ctx, operation.Request{TaskID: uuid.NewString(), Kind: kind, Target: target})
+	if err != nil {
+		return nil, err
+	}
 	if reservation.Lease == nil {
-		return "", nil, &operation.ConflictError{TaskID: reservation.ExistingTaskID, Kind: kind}
+		return nil, &operation.ConflictError{TaskID: reservation.ExistingTaskID, Kind: kind}
 	}
 	if err := reservation.Lease.Confirm(); err != nil {
 		reservation.Lease.Release()
-		return "", nil, err
+		return nil, err
 	}
-	return canonicalID, reservation.Lease, nil
+	return reservation.Lease, nil
+}
+
+func canonicalContainerID(requestedID string, inspected dockertypes.ContainerJSON) string {
+	if inspected.ID != "" {
+		return inspected.ID
+	}
+	return requestedID
 }
 
 func (s *Service) SetProgressCallbacks(callbacks ProgressCallbacks) { s.progress = callbacks }
