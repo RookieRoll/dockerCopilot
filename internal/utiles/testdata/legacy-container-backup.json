@@ -1,0 +1,21 @@
+[
+  {
+    "Name": "legacy-service",
+    "Config": {
+      "Image": "example/legacy:1.2",
+      "Env": ["MODE=compat"]
+    },
+    "HostConfig": {
+      "NetworkMode": "bridge",
+      "RestartPolicy": {"Name": "unless-stopped"}
+    },
+    "NetworkingConfig": {
+      "EndpointsConfig": {
+        "legacy-net": {
+          "Aliases": ["legacy-service"],
+          "IPAMConfig": {"IPv4Address": "172.20.0.10"}
+        }
+      }
+    }
+  }
+]
