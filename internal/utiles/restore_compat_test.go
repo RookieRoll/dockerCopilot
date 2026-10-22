@@ -39,6 +39,8 @@ func TestRestoreLegacyBackupCreatesContainerWithoutStarting(t *testing.T) {
 	daemon := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1.45/containers/json":
+			fmt.Fprintln(w, "[]")
 		case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/v1.45/images/create"):
 			mark(func() {
 				pullQuery = r.URL.RawQuery

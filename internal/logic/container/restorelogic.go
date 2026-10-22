@@ -2,6 +2,7 @@ package container
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 
@@ -61,8 +62,21 @@ func (l *RestoreLogic) Restore(req *types.ContainerRestoreReq) (resp *types.Resp
 			if err := execution.Progress("restoring", 0, "备份恢复已开始"); err != nil {
 				return err
 			}
-			if err := l.service.Restore(ctx, fileName, execution.TaskID()); err != nil {
-				return err
+			result, restoreErr := l.service.RestoreWithResults(ctx, fileName, execution.TaskID())
+			if len(result.Items) > 0 {
+				if err := execution.Critical("restore-items", func(record *task.Record) {
+					for _, item := range result.Items {
+						record.Items = append(record.Items, task.Item{
+							ID: fmt.Sprintf("%d", item.Index), Name: item.Name,
+							Status: item.Status, Error: item.Error,
+						})
+					}
+				}); err != nil {
+					return errors.Join(restoreErr, fmt.Errorf("persist restore item results: %w", err))
+				}
+			}
+			if restoreErr != nil {
+				return restoreErr
 			}
 			return execution.Progress("completed", 100, "备份恢复完成")
 		},
