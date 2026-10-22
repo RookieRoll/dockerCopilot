@@ -2,6 +2,7 @@ package container
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -10,6 +11,7 @@ import (
 
 	dockerTypes "github.com/docker/docker/api/types"
 	"github.com/docker/go-connections/nat"
+	"github.com/onlyLTY/dockerCopilot/internal/settings"
 	"github.com/onlyLTY/dockerCopilot/internal/types"
 	"github.com/zeromicro/go-zero/core/logx"
 )
@@ -38,6 +40,15 @@ type Info struct {
 type PortSettings interface {
 	Cleanup([]string) (int, map[string][]types.ConfiguredPort, error)
 }
+
+type stablePortSettings interface {
+	PortSettings
+	Generation() uint64
+	CleanupStableWithContainers([]settings.ContainerPortIdentity, []string, uint64) (int, map[string][]types.ConfiguredPort, bool, error)
+	Load() (map[string][]types.ConfiguredPort, error)
+}
+
+var errStalePortSettingsSnapshot = errors.New("port settings snapshot changed during container list")
 
 func DeduplicateAndSortPorts(ports []PortInfo) []PortInfo {
 	unique := make(map[string]PortInfo, len(ports))
@@ -88,19 +99,81 @@ func MapHostNetworkPorts(exposedPorts nat.PortSet) []PortInfo {
 }
 
 func (s *Service) ListDetails(ctx context.Context, portSettings PortSettings) ([]Info, error) {
+	return s.ListDetailsWithProtectedNames(ctx, portSettings, nil)
+}
+
+// ListDetailsWithProtectedNames only removes stale port settings when both
+// the Docker list snapshot and operation coordinator remained stable while it
+// was collected. Protected names come from durable task recovery records.
+func (s *Service) ListDetailsWithProtectedNames(ctx context.Context, portSettings PortSettings, protectedNames []string) ([]Info, error) {
+	return s.ListDetailsWithOperationVersion(ctx, portSettings, protectedNames, s.Operations().CaptureVersion())
+}
+
+// ListDetailsWithOperationVersion accepts a revision captured before the
+// caller reads durable task protections, closing the window between those
+// facts and the Docker list snapshot.
+func (s *Service) ListDetailsWithOperationVersion(ctx context.Context, portSettings PortSettings, protectedNames []string, opVersion uint64) ([]Info, error) {
+	return s.listDetails(ctx, portSettings, protectedNames, opVersion, true)
+}
+
+// ListDetailsWithoutCleanupWithOperationVersion serves a list when durable
+// recovery protections could not be read. Existing mappings are loaded for
+// display, but cleanup is skipped entirely.
+func (s *Service) ListDetailsWithoutCleanupWithOperationVersion(ctx context.Context, portSettings PortSettings, opVersion uint64) ([]Info, error) {
+	return s.listDetails(ctx, portSettings, nil, opVersion, false)
+}
+
+func (s *Service) listDetails(ctx context.Context, portSettings PortSettings, protectedNames []string, opVersion uint64, cleanupAllowed bool) ([]Info, error) {
+	var portGeneration uint64
+	stableSettings, hasStableSettings := portSettings.(stablePortSettings)
+	if hasStableSettings {
+		portGeneration = stableSettings.Generation()
+	}
 	list, err := s.List(ctx)
 	if err != nil {
 		return nil, err
 	}
 	activeNames := make([]string, 0, len(list))
+	activeContainers := make([]settings.ContainerPortIdentity, 0, len(list))
 	for _, item := range list {
 		if len(item.Names) > 0 {
-			activeNames = append(activeNames, strings.TrimPrefix(item.Names[0], "/"))
+			name := strings.TrimPrefix(item.Names[0], "/")
+			activeNames = append(activeNames, name)
+			activeContainers = append(activeContainers, settings.ContainerPortIdentity{ID: item.ID, Name: name})
 		}
 	}
 	configured := map[string][]types.ConfiguredPort{}
 	if portSettings != nil {
-		removed, entries, cleanupErr := portSettings.Cleanup(activeNames)
+		var removed int
+		var entries map[string][]types.ConfiguredPort
+		var cleanupErr error
+		if !cleanupAllowed {
+			loader, ok := portSettings.(interface {
+				Load() (map[string][]types.ConfiguredPort, error)
+			})
+			if ok {
+				entries, cleanupErr = loader.Load()
+			} else {
+				cleanupErr = errors.New("port settings cannot be loaded without cleanup")
+			}
+		} else if hasStableSettings {
+			committed, stableErr := s.Operations().WithStableVersion(opVersion, func() error {
+				var stable bool
+				removed, entries, stable, cleanupErr = stableSettings.CleanupStableWithContainers(activeContainers, protectedNames, portGeneration)
+				if !stable {
+					return errStalePortSettingsSnapshot
+				}
+				return cleanupErr
+			})
+			if stableErr != nil && stableErr != errStalePortSettingsSnapshot {
+				cleanupErr = stableErr
+			}
+			if !committed || stableErr == errStalePortSettingsSnapshot {
+				entries, cleanupErr = stableSettings.Load()
+			}
+		} else {
+			removed, entries, cleanupErr = portSettings.Cleanup(activeNames)
+		}
 		if cleanupErr != nil {
 			logx.Errorf("cleanup configured container ports: %v", cleanupErr)
 		} else {

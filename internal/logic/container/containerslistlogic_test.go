@@ -7,6 +7,7 @@ import (
 
 	dockerTypes "github.com/docker/docker/api/types"
 	"github.com/docker/go-connections/nat"
+	"github.com/onlyLTY/dockerCopilot/internal/task"
 	"github.com/onlyLTY/dockerCopilot/internal/types"
 )
 
@@ -18,7 +19,6 @@ func TestMapContainerPorts(t *testing.T) {
 		{IP: "0.0.0.0", PublicPort: 8080, PrivatePort: 8080, Type: "tcp"},
 		{IP: "::", PublicPort: 8080, PrivatePort: 80, Type: "TCP"},
 	})
-
 	expected := []PortInfo{
 		{HostIP: "", HostPort: 0, ContainerPort: 443, Protocol: "tcp"},
 		{HostIP: "127.0.0.1", HostPort: 5353, ContainerPort: 53, Protocol: "udp"},
@@ -39,7 +39,6 @@ func TestMapHostNetworkPortsUsesDeclaredExposedPorts(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to create exposed port: %v", err)
 	}
-
 	ports := mapHostNetworkPorts(nat.PortSet{webPort: {}, udpPort: {}})
 	expected := []PortInfo{
 		{HostPort: 0, ContainerPort: 5353, Protocol: "udp"},
@@ -68,5 +67,27 @@ func TestInfoPortsUseLowerCamelCaseJSON(t *testing.T) {
 	expected := `{"id":"","status":"","name":"","usingImage":"","createImage":"","createTime":"","runningTime":"","haveUpdate":false,"ports":[{"hostIp":"0.0.0.0","hostPort":8080,"containerPort":80,"protocol":"tcp"}],"configuredPorts":[]}`
 	if string(encoded) != expected {
 		t.Fatalf("unexpected JSON: %s", encoded)
+	}
+}
+
+func TestProtectedPortNamesUsesUnresolvedDurableTaskFacts(t *testing.T) {
+	records := []task.Record{
+		{Status: task.StatusRunning, Name: "running", ProtectedNames: []string{"old-running"}},
+		{Status: task.StatusFailed, RequiresAttention: true, Name: "failed-review", BackupContainerName: "backup-review"},
+		{Status: task.StatusSucceeded, Recovery: task.Recovery{Status: "restored"}, Items: []task.Item{{Name: "done"}}},
+		{Status: task.StatusFailed, Items: []task.Item{{Name: "item-review", ProtectedNames: []string{"old-item"}, RequiresAttention: true}}},
+	}
+	got := protectedPortNames(records)
+	seen := make(map[string]bool, len(got))
+	for _, name := range got {
+		seen[name] = true
+	}
+	for _, name := range []string{"running", "old-running", "failed-review", "backup-review", "item-review", "old-item"} {
+		if !seen[name] {
+			t.Errorf("unresolved durable name %q is not protected: %#v", name, got)
+		}
+	}
+	if seen["done"] {
+		t.Fatalf("resolved task name should not stay protected: %#v", got)
 	}
 }

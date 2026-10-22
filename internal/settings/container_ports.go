@@ -24,17 +24,21 @@ const (
 var (
 	timeNow = time.Now
 
-	containerPortOverridesPath = filepath.Join("/data", "config", containerPortOverridesFileName)
-	containerPortOverridesMu   sync.Mutex
+	containerPortOverridesPath       = filepath.Join("/data", "config", containerPortOverridesFileName)
+	containerPortOverridesMu         sync.Mutex
+	containerPortOverridesGeneration = make(map[string]uint64)
 )
 
 // PortOverridesService scopes persisted host-network port settings to the
 // configured file path. The legacy package-level functions remain for callers
 // that have not yet been migrated.
-type PortOverridesService struct{ path string }
+type PortOverridesService struct {
+	path      string
+	writeFile func(string, containerPortOverridesFile) error
+}
 
 func NewPortOverridesService(path string) *PortOverridesService {
-	return &PortOverridesService{path: path}
+	return &PortOverridesService{path: path, writeFile: writeContainerPortOverridesFileLocked}
 }
 func (s *PortOverridesService) Load() (map[string][]types.ConfiguredPort, error) {
 	return LoadContainerPortOverridesAt(s.path)
@@ -48,13 +52,47 @@ func (s *PortOverridesService) Remove(name string) error {
 func (s *PortOverridesService) Cleanup(names []string) (int, map[string][]types.ConfiguredPort, error) {
 	return CleanupContainerPortOverridesAt(s.path, names)
 }
+func (s *PortOverridesService) CleanupProtected(names, protected []string) (int, map[string][]types.ConfiguredPort, error) {
+	return CleanupContainerPortOverridesAtProtected(s.path, names, protected)
+}
+func (s *PortOverridesService) Generation() uint64 {
+	containerPortOverridesMu.Lock()
+	defer containerPortOverridesMu.Unlock()
+	return containerPortOverridesGeneration[portOverridesPathKey(s.path)]
+}
+func (s *PortOverridesService) CleanupStable(names, protected []string, expected uint64) (int, map[string][]types.ConfiguredPort, bool, error) {
+	return CleanupContainerPortOverridesAtStable(s.path, names, protected, expected)
+}
+func (s *PortOverridesService) CleanupStableWithContainers(containers []ContainerPortIdentity, protected []string, expected uint64) (int, map[string][]types.ConfiguredPort, bool, error) {
+	return CleanupContainerPortOverridesAtStableWithContainers(s.path, containers, protected, expected)
+}
 func (s *PortOverridesService) Migrate(oldName, newName string) error {
 	return MigrateContainerPortOverridesAt(s.path, oldName, newName)
+}
+func (s *PortOverridesService) BeginRename(oldName, newName, containerID string) error {
+	return beginContainerPortRenameAt(s.path, oldName, newName, containerID, s.writeFile)
+}
+func (s *PortOverridesService) CompleteRename(oldName, newName string) error {
+	return completeContainerPortRenameAt(s.path, oldName, newName, s.writeFile)
 }
 
 type containerPortOverridesFile struct {
 	SchemaVersion int                                        `json:"schemaVersion"`
 	Containers    map[string]containerPortOverridesContainer `json:"containers"`
+	RenameIntents map[string]ContainerPortRenameIntent       `json:"renameIntents,omitempty"`
+}
+
+// ContainerPortRenameIntent is a durable marker that protects both names
+// until a later successful Docker list can resolve an interrupted rename.
+type ContainerPortRenameIntent struct {
+	NewName     string `json:"newName"`
+	ContainerID string `json:"containerID,omitempty"`
+	StartedAt   string `json:"startedAt"`
+}
+
+type ContainerPortIdentity struct {
+	ID   string
+	Name string
 }
 
 type containerPortOverridesContainer struct {
@@ -142,7 +180,11 @@ func RemoveContainerPortOverridesAt(path, containerName string) error {
 		return nil
 	}
 	delete(config.Containers, containerName)
-	return writeContainerPortOverridesFileLocked(path, config)
+	if err := writeContainerPortOverridesFileLocked(path, config); err != nil {
+		return err
+	}
+	incrementPortOverridesGenerationLocked(path)
+	return nil
 }
 
 // CleanupContainerPortOverrides removes entries whose container names are not
@@ -153,19 +195,62 @@ func CleanupContainerPortOverrides(activeContainerNames []string) (int, map[stri
 }
 
 func CleanupContainerPortOverridesAt(path string, activeContainerNames []string) (int, map[string][]types.ConfiguredPort, error) {
-	activeNames := make(map[string]struct{}, len(activeContainerNames))
-	for _, name := range activeContainerNames {
-		if normalizedName := normalizeContainerName(name); normalizedName != "" {
-			activeNames[normalizedName] = struct{}{}
-		}
-	}
+	return cleanupContainerPortOverridesAt(path, activeContainerNames, nil)
+}
 
+func CleanupContainerPortOverridesAtProtected(path string, activeContainerNames, protectedNames []string) (int, map[string][]types.ConfiguredPort, error) {
+	return cleanupContainerPortOverridesAt(path, activeContainerNames, protectedNames)
+}
+
+// CleanupContainerPortOverridesAtStable atomically checks the port-file
+// generation and removes only entries absent from both Docker and durable
+// operation protection. A generation mismatch means the caller's list
+// snapshot is stale and must be retried.
+func CleanupContainerPortOverridesAtStable(path string, activeContainerNames, protectedNames []string, expectedGeneration uint64) (int, map[string][]types.ConfiguredPort, bool, error) {
+	return cleanupContainerPortOverridesAtStable(path, activeContainerNames, nil, protectedNames, expectedGeneration)
+}
+
+func CleanupContainerPortOverridesAtStableWithContainers(path string, containers []ContainerPortIdentity, protectedNames []string, expectedGeneration uint64) (int, map[string][]types.ConfiguredPort, bool, error) {
+	activeNames := make([]string, 0, len(containers))
+	for _, container := range containers {
+		activeNames = append(activeNames, container.Name)
+	}
+	return cleanupContainerPortOverridesAtStable(path, activeNames, containers, protectedNames, expectedGeneration)
+}
+
+func cleanupContainerPortOverridesAtStable(path string, activeContainerNames []string, identities []ContainerPortIdentity, protectedNames []string, expectedGeneration uint64) (int, map[string][]types.ConfiguredPort, bool, error) {
 	containerPortOverridesMu.Lock()
 	defer containerPortOverridesMu.Unlock()
+	if containerPortOverridesGeneration[portOverridesPathKey(path)] != expectedGeneration {
+		return 0, nil, false, nil
+	}
+	removed, overrides, err := cleanupContainerPortOverridesLockedWithIdentity(path, activeContainerNames, identities, protectedNames)
+	return removed, overrides, true, err
+}
 
+func cleanupContainerPortOverridesAt(path string, activeContainerNames, protectedNames []string) (int, map[string][]types.ConfiguredPort, error) {
+	containerPortOverridesMu.Lock()
+	defer containerPortOverridesMu.Unlock()
+	return cleanupContainerPortOverridesLockedWithIdentity(path, activeContainerNames, nil, protectedNames)
+}
+
+func cleanupContainerPortOverridesLockedWithIdentity(path string, activeContainerNames []string, identities []ContainerPortIdentity, protectedNames []string) (int, map[string][]types.ConfiguredPort, error) {
 	config, err := readContainerPortOverridesFileLocked(path)
 	if err != nil {
 		return 0, nil, err
+	}
+	activeSet := make(map[string]struct{}, len(activeContainerNames))
+	for _, name := range activeContainerNames {
+		if normalized := normalizeContainerName(name); normalized != "" {
+			activeSet[normalized] = struct{}{}
+		}
+	}
+	intentChanged, pendingNames := reconcilePortRenameIntents(&config, activeSet, identities)
+	activeNames := make(map[string]struct{}, len(activeContainerNames))
+	for _, name := range append(append(append([]string(nil), activeContainerNames...), protectedNames...), pendingNames...) {
+		if normalizedName := normalizeContainerName(name); normalizedName != "" {
+			activeNames[normalizedName] = struct{}{}
+		}
 	}
 	removed := 0
 	for name := range config.Containers {
@@ -175,10 +260,11 @@ func CleanupContainerPortOverridesAt(path string, activeContainerNames []string)
 		delete(config.Containers, name)
 		removed++
 	}
-	if removed > 0 {
+	if removed > 0 || intentChanged {
 		if err := writeContainerPortOverridesFileLocked(path, config); err != nil {
 			return removed, nil, err
 		}
+		incrementPortOverridesGenerationLocked(path)
 	}
 
 	overrides := make(map[string][]types.ConfiguredPort, len(config.Containers))
@@ -226,7 +312,11 @@ func SaveContainerPortOverridesAtTimestamp(path, containerName string, ports []t
 			Ports:     normalized,
 		}
 	}
-	return writeContainerPortOverridesFileLocked(path, config)
+	if err := writeContainerPortOverridesFileLocked(path, config); err != nil {
+		return err
+	}
+	incrementPortOverridesGenerationLocked(path)
+	return nil
 }
 
 func MigrateContainerPortOverrides(oldName, newName string) error {
@@ -254,7 +344,150 @@ func MigrateContainerPortOverridesAt(path, oldName, newName string) error {
 	delete(config.Containers, oldName)
 	entry.UpdatedAt = nowRFC3339()
 	config.Containers[newName] = entry
-	return writeContainerPortOverridesFileLocked(path, config)
+	if err := writeContainerPortOverridesFileLocked(path, config); err != nil {
+		return err
+	}
+	incrementPortOverridesGenerationLocked(path)
+	return nil
+}
+
+// BeginContainerPortRenameAt persists a marker before Docker is renamed. The
+// old mapping remains untouched until CompleteContainerPortRenameAt succeeds.
+func BeginContainerPortRenameAt(path, oldName, newName, containerID string) error {
+	return beginContainerPortRenameAt(path, oldName, newName, containerID, writeContainerPortOverridesFileLocked)
+}
+
+func beginContainerPortRenameAt(path, oldName, newName, containerID string, writeFile func(string, containerPortOverridesFile) error) error {
+	if writeFile == nil {
+		writeFile = writeContainerPortOverridesFileLocked
+	}
+	oldName = normalizeContainerName(oldName)
+	newName = normalizeContainerName(newName)
+	containerID = strings.TrimSpace(containerID)
+	if oldName == "" || newName == "" || containerID == "" {
+		return fmt.Errorf("old name, new name, and canonical container ID are required")
+	}
+	if oldName == newName {
+		return nil
+	}
+	containerPortOverridesMu.Lock()
+	defer containerPortOverridesMu.Unlock()
+	config, err := readContainerPortOverridesFileLocked(path)
+	if err != nil {
+		return err
+	}
+	if config.RenameIntents == nil {
+		config.RenameIntents = make(map[string]ContainerPortRenameIntent)
+	}
+	if current, exists := config.RenameIntents[oldName]; exists {
+		if current.NewName != newName || (current.ContainerID != "" && containerID != "" && current.ContainerID != containerID) {
+			return fmt.Errorf("a different port configuration rename is still pending for %q", oldName)
+		}
+		return nil
+	}
+	config.RenameIntents[oldName] = ContainerPortRenameIntent{NewName: newName, ContainerID: containerID, StartedAt: nowRFC3339()}
+	if err := writeFile(path, config); err != nil {
+		return err
+	}
+	incrementPortOverridesGenerationLocked(path)
+	return nil
+}
+
+// CompleteContainerPortRenameAt migrates the old entry and clears its durable
+// intent in a single atomic file replacement.
+func CompleteContainerPortRenameAt(path, oldName, newName string) error {
+	return completeContainerPortRenameAt(path, oldName, newName, writeContainerPortOverridesFileLocked)
+}
+
+func completeContainerPortRenameAt(path, oldName, newName string, writeFile func(string, containerPortOverridesFile) error) error {
+	if writeFile == nil {
+		writeFile = writeContainerPortOverridesFileLocked
+	}
+	oldName = normalizeContainerName(oldName)
+	newName = normalizeContainerName(newName)
+	if oldName == "" || newName == "" || oldName == newName {
+		return nil
+	}
+	containerPortOverridesMu.Lock()
+	defer containerPortOverridesMu.Unlock()
+	config, err := readContainerPortOverridesFileLocked(path)
+	if err != nil {
+		return err
+	}
+	intent, exists := config.RenameIntents[oldName]
+	if !exists || intent.NewName != newName {
+		return fmt.Errorf("matching port configuration rename intent is missing")
+	}
+	oldEntry, hasOld := config.Containers[oldName]
+	if _, hasNew := config.Containers[newName]; hasOld && hasNew {
+		return fmt.Errorf("port configuration already exists for the new container name")
+	}
+	if hasOld {
+		delete(config.Containers, oldName)
+		oldEntry.UpdatedAt = nowRFC3339()
+		config.Containers[newName] = oldEntry
+	}
+	delete(config.RenameIntents, oldName)
+	if err := writeFile(path, config); err != nil {
+		return err
+	}
+	incrementPortOverridesGenerationLocked(path)
+	return nil
+}
+
+// reconcilePortRenameIntents resolves only facts established by a complete
+// Docker list. Ambiguous presence preserves both names and the intent.
+func reconcilePortRenameIntents(config *containerPortOverridesFile, active map[string]struct{}, identities []ContainerPortIdentity) (bool, []string) {
+	if config.RenameIntents == nil {
+		return false, nil
+	}
+	changed := false
+	nameByID := make(map[string]string, len(identities))
+	for _, identity := range identities {
+		id := strings.ToLower(strings.TrimSpace(identity.ID))
+		name := normalizeContainerName(identity.Name)
+		if id != "" && name != "" {
+			nameByID[id] = name
+		}
+	}
+	protected := make([]string, 0, len(config.RenameIntents)*2)
+	for oldName, intent := range config.RenameIntents {
+		oldName = normalizeContainerName(oldName)
+		newName := normalizeContainerName(intent.NewName)
+		_, oldPresent := active[oldName]
+		_, newPresent := active[newName]
+		currentName := nameByID[strings.ToLower(strings.TrimSpace(intent.ContainerID))]
+		switch {
+		case intent.ContainerID != "" && currentName == newName && newPresent:
+			oldEntry, hasOld := config.Containers[oldName]
+			_, hasNew := config.Containers[newName]
+			if hasOld && hasNew {
+				protected = append(protected, oldName, newName)
+				continue
+			}
+			if hasOld {
+				delete(config.Containers, oldName)
+				oldEntry.UpdatedAt = nowRFC3339()
+				config.Containers[newName] = oldEntry
+			}
+			delete(config.RenameIntents, oldName)
+			changed = true
+		case intent.ContainerID != "" && currentName == oldName && oldPresent:
+			delete(config.RenameIntents, oldName)
+			changed = true
+		default:
+			protected = append(protected, oldName, newName)
+		}
+	}
+	return changed, protected
+}
+
+func portOverridesPathKey(path string) string {
+	return filepath.Clean(path)
+}
+
+func incrementPortOverridesGenerationLocked(path string) {
+	containerPortOverridesGeneration[portOverridesPathKey(path)]++
 }
 
 func normalizeContainerName(name string) string {

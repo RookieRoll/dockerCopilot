@@ -63,9 +63,10 @@ func (*ConflictError) HTTPStatus() int   { return http.StatusConflict }
 func (*ConflictError) ErrorCode() string { return "CONTAINER_OPERATION_CONFLICT" }
 
 type Coordinator struct {
-	mu     sync.Mutex
-	byKey  map[string]*leaseState
-	byTask map[string]*leaseState
+	mu       sync.Mutex
+	byKey    map[string]*leaseState
+	byTask   map[string]*leaseState
+	revision uint64
 }
 
 type leaseState struct {
@@ -156,6 +157,7 @@ func (c *Coordinator) ReserveBatchContext(ctx context.Context, req Request, targ
 			c.byKey[key] = state
 		}
 		c.byTask[req.TaskID] = state
+		c.revision++
 		c.mu.Unlock()
 		return Reservation{Lease: &Lease{coordinator: c, taskID: req.TaskID, state: state}}, nil
 	}
@@ -239,6 +241,7 @@ func (c *Coordinator) ReserveAvailableBatchContext(ctx context.Context, req Requ
 			c.byKey[key] = state
 		}
 		c.byTask[req.TaskID] = state
+		c.revision++
 		c.mu.Unlock()
 		return Reservation{Lease: &Lease{coordinator: c, taskID: req.TaskID, state: state}, Conflicts: conflicts}, nil
 	}
@@ -309,6 +312,7 @@ func (c *Coordinator) ReserveContext(ctx context.Context, req Request) (Reservat
 			c.byKey[key] = state
 		}
 		c.byTask[req.TaskID] = state
+		c.revision++
 		c.mu.Unlock()
 		return Reservation{Lease: &Lease{coordinator: c, taskID: req.TaskID, state: state}}, nil
 	}
@@ -348,6 +352,7 @@ func (l *Lease) Confirm() error {
 	}
 	if !l.state.accepted {
 		l.state.accepted = true
+		c.revision++
 		close(l.state.ready)
 	}
 	return nil
@@ -394,9 +399,16 @@ func (c *Coordinator) addAlias(taskID string, expected *leaseState, target Targe
 			return conflict(current)
 		}
 	}
+	changed := false
 	for _, key := range keys {
+		if _, exists := state.keys[key]; !exists {
+			changed = true
+		}
 		state.keys[key] = struct{}{}
 		c.byKey[key] = state
+	}
+	if changed {
+		c.revision++
 	}
 	return nil
 }
@@ -441,6 +453,7 @@ func (l *Lease) Release() {
 		}
 	}
 	delete(c.byTask, l.taskID)
+	c.revision++
 	if !l.state.accepted {
 		close(l.state.ready)
 	}
