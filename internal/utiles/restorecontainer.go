@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	dockerBackend "github.com/docker/docker/api/types/backend"
 	"github.com/docker/docker/api/types/image"
+	"github.com/onlyLTY/dockerCopilot/internal/config"
 	"github.com/onlyLTY/dockerCopilot/internal/svc"
 	"github.com/zeromicro/go-zero/core/logx"
 	"os"
@@ -23,7 +24,11 @@ func RestoreContainer(ctx *svc.ServiceContext, filename string, taskID string) e
 		IsDone:     false,
 	}
 	oldProgress.Name = "恢复容器"
-	fullPath, err := ResolveBackupPath(filename, ".json")
+	backupDir := config.LegacyBackupDirectory()
+	if ctx != nil {
+		backupDir = ctx.Config.BackupDirectory()
+	}
+	fullPath, err := ResolveBackupPathIn(backupDir, filename, ".json")
 	if err != nil {
 		logx.Errorf("Failed to resolve backup path: %v", err)
 		oldProgress.Message = "非法文件名"

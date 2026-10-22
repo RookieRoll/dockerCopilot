@@ -4,6 +4,7 @@ import (
 	composeType "github.com/compose-spec/compose-go/types"
 	dockerTypes "github.com/docker/docker/api/types"
 	composeNat "github.com/docker/go-connections/nat"
+	"github.com/onlyLTY/dockerCopilot/internal/config"
 	"github.com/zeromicro/go-zero/core/logx"
 	"os"
 	"path/filepath"
@@ -15,6 +16,10 @@ import (
 
 // DockerConfig2ComposeYaml 将docker config转换为docker-compose.yaml
 func DockerConfig2ComposeYaml(containerJSONs []dockerTypes.ContainerJSON) (err error) {
+	return DockerConfig2ComposeYamlInDir(containerJSONs, config.LegacyBackupDirectory())
+}
+
+func DockerConfig2ComposeYamlInDir(containerJSONs []dockerTypes.ContainerJSON, backupDir string) (err error) {
 	var c composeYaml
 	c.Services = make(map[string]composeType.ServiceConfig, len(containerJSONs))
 	for _, containerJSON := range containerJSONs {
@@ -26,10 +31,6 @@ func DockerConfig2ComposeYaml(containerJSONs []dockerTypes.ContainerJSON) (err e
 		c.Services[s.Name] = s
 	}
 	// write to file
-	backupDir := os.Getenv("BACKUP_DIR") // 从环境变量中获取备份目录
-	if backupDir == "" {
-		backupDir = "/data/backups" // 如果环境变量未设置，使用默认值
-	}
 	_, err = os.Stat(backupDir)
 	if os.IsNotExist(err) {
 		err = os.MkdirAll(backupDir, 0755)

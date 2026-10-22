@@ -4,6 +4,7 @@ import (
 	"archive/tar"
 	"compress/gzip"
 	"fmt"
+	"github.com/onlyLTY/dockerCopilot/internal/config"
 	"github.com/onlyLTY/dockerCopilot/internal/svc"
 	"github.com/zeromicro/go-zero/core/logx"
 	"io"
@@ -16,12 +17,12 @@ import (
 )
 
 func UpdateProgram(ctx *svc.ServiceContext) error {
-	githubProxy := os.Getenv("githubProxy")
-	if githubProxy != "" {
-		githubProxy = strings.TrimRight(githubProxy, "/") + "/"
+	updateSource := config.LegacyUpdateSource()
+	if ctx != nil && ctx.Config.Updates.Repository != "" {
+		updateSource = ctx.Config.UpdateSource()
 	}
-	versionURL := githubProxy + "https://raw.githubusercontent.com/RookieRoll/dockerCopilot/latest/version"
-	releaseBaseURL := githubProxy + "https://github.com/RookieRoll/dockerCopilot/releases/download"
+	versionURL := updateSource.VersionURL()
+	releaseBaseURL := updateSource.ReleaseBaseURL()
 	logx.Infof("versionURL: %s", versionURL)
 	client := &http.Client{Timeout: 30 * time.Second}
 	resp, err := client.Get(versionURL)

@@ -9,13 +9,13 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strings"
 
 	"github.com/onlyLTY/dockerCopilot/internal/config"
 	"github.com/onlyLTY/dockerCopilot/internal/handler"
 	"github.com/onlyLTY/dockerCopilot/internal/svc"
 	"github.com/onlyLTY/dockerCopilot/internal/utiles"
 	"github.com/robfig/cron/v3"
-	"github.com/zeromicro/go-zero/core/conf"
 	"github.com/zeromicro/go-zero/core/logx"
 	"github.com/zeromicro/go-zero/rest"
 	"github.com/zeromicro/go-zero/rest/httpx"
@@ -35,20 +35,15 @@ type UnauthorizedResponse struct {
 }
 
 func main() {
-	logDir := "./logs"
-	ErrSetupLog := SetupLog(logDir)
-	if ErrSetupLog != nil {
-		logx.Errorf("failed to setup log: %v", ErrSetupLog)
+	flag.Parse()
+	c, err := config.LoadFile(*configFile, true)
+	if err != nil {
+		log.Printf("无法加载配置文件出错: %v", err)
+		log.Printf("请确认secretKey设置正确，要求非纯数字且大于八位")
 		os.Exit(1)
 	}
-	logx.SetLevel(logx.InfoLevel)
-
-	flag.Parse()
-	var c config.Config
-	err := conf.Load(*configFile, &c, conf.UseEnv())
-	if err != nil {
-		logx.Errorf("无法加载配置文件出错: %v", err)
-		logx.Errorf("请确认secretKey设置正确，要求非纯数字且大于八位")
+	if err := SetupLogWithOptions(c.LogOptions()); err != nil {
+		log.Printf("failed to setup log: %v", err)
 		os.Exit(1)
 	}
 	server := rest.MustNewServer(c.RestConf, rest.WithCors("*"), rest.WithUnauthorizedCallback(
@@ -191,6 +186,11 @@ func ensureLogDirectory(logDir string) error {
 
 // SetupLog 初始化日志设置
 func SetupLog(logDir string) error {
+	return SetupLogWithOptions(config.LogOptions{Directory: logDir, Level: "info", RetentionDays: 7, MaxFileSizeMiB: 20, MaxTotalSizeMiB: 200})
+}
+
+func SetupLogWithOptions(options config.LogOptions) error {
+	logDir := options.Directory
 	// 检查日志目录是否存在
 	if err := ensureLogDirectory(logDir); err != nil {
 		return fmt.Errorf("failed to create log directory: %v", err)
@@ -198,12 +198,20 @@ func SetupLog(logDir string) error {
 
 	logConf := logx.LogConf{
 		Path:     logDir,
-		Level:    "info",
-		KeepDays: 7,
+		Level:    options.Level,
+		KeepDays: options.RetentionDays,
 		Compress: true,
 		Mode:     "file",
 	}
 	logx.MustSetup(logConf)
 	logx.AddWriter(logx.NewWriter(os.Stdout))
+	switch strings.ToLower(options.Level) {
+	case "debug":
+		logx.SetLevel(logx.DebugLevel)
+	case "error", "severe":
+		logx.SetLevel(logx.ErrorLevel)
+	default:
+		logx.SetLevel(logx.InfoLevel)
+	}
 	return nil
 }

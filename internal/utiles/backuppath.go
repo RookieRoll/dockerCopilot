@@ -6,19 +6,21 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+
+	"github.com/onlyLTY/dockerCopilot/internal/config"
 )
 
 var backupFilenamePattern = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
 
 func BackupDir() string {
-	backupDir := os.Getenv("BACKUP_DIR")
-	if backupDir == "" {
-		backupDir = "/data/backups"
-	}
-	return backupDir
+	return config.LegacyBackupDirectory()
 }
 
 func ResolveBackupPath(filename string, allowedExts ...string) (string, error) {
+	return ResolveBackupPathIn(BackupDir(), filename, allowedExts...)
+}
+
+func ResolveBackupPathIn(backupDir, filename string, allowedExts ...string) (string, error) {
 	name := strings.TrimSpace(filename)
 	if name == "" {
 		return "", fmt.Errorf("非法文件名")
@@ -44,7 +46,7 @@ func ResolveBackupPath(filename string, allowedExts ...string) (string, error) {
 		}
 	}
 
-	base := filepath.Clean(BackupDir())
+	base := filepath.Clean(backupDir)
 	fullPath := filepath.Clean(filepath.Join(base, name))
 	basePrefix := base + string(os.PathSeparator)
 	if fullPath != base && !strings.HasPrefix(fullPath, basePrefix) {

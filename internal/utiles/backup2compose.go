@@ -22,7 +22,7 @@ func Backup2Compose(ctx *svc.ServiceContext) (err error) {
 		}
 		containerJSONs = append(containerJSONs, inspectedContainer)
 	}
-	err = backupCompose.DockerConfig2ComposeYaml(containerJSONs)
+	err = backupCompose.DockerConfig2ComposeYamlInDir(containerJSONs, ctx.Config.BackupDirectory())
 	if err != nil {
 		logx.Error("备份失败" + err.Error())
 		return err

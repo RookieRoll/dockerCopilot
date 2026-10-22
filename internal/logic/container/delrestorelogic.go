@@ -27,7 +27,7 @@ func NewDelRestoreLogic(ctx context.Context, svcCtx *svc.ServiceContext) *DelRes
 
 func (l *DelRestoreLogic) DelRestore(req *types.DelContainerBackupReq) (resp *types.Resp, err error) {
 	resp = &types.Resp{}
-	fullPath, err := utiles.ResolveBackupPath(req.Filename, ".json", ".yaml")
+	fullPath, err := utiles.ResolveBackupPathIn(l.svcCtx.Config.BackupDirectory(), req.Filename, ".json", ".yaml")
 	if err != nil {
 		resp.Code = 400
 		resp.Msg = "非法文件名"

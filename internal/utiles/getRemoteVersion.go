@@ -3,7 +3,6 @@ package utiles
 import (
 	"io"
 	"net/http"
-	"os"
 	"strings"
 	"sync"
 	"time"
@@ -13,12 +12,11 @@ import (
 )
 
 func GetRemoteVersion() (remoteVersion string, err error) {
-	githubProxy := os.Getenv("githubProxy")
-	if githubProxy != "" {
-		githubProxy = strings.TrimRight(githubProxy, "/") + "/"
-	}
-	versionURL := githubProxy + "https://raw.githubusercontent.com/RookieRoll/dockerCopilot/latest/version"
-	remoteVersion, err = fetchVersionFromURL(versionURL)
+	return GetRemoteVersionWithConfig(config.LegacyUpdateSource())
+}
+
+func GetRemoteVersionWithConfig(source config.UpdateConfig) (remoteVersion string, err error) {
+	remoteVersion, err = fetchVersionFromURL(source.VersionURL())
 	if err != nil {
 		return "0.0.0", err
 	}

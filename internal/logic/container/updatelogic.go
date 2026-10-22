@@ -7,7 +7,6 @@ import (
 	"github.com/onlyLTY/dockerCopilot/internal/types"
 	"github.com/onlyLTY/dockerCopilot/internal/utiles"
 	"github.com/zeromicro/go-zero/core/logx"
-	"os"
 )
 
 type UpdateLogic struct {
@@ -35,7 +34,7 @@ func (l *UpdateLogic) Update(req *types.ContainerUpdateReq) (resp *types.Resp, e
 			}
 		}()
 		imageNameAndTag := req.ImageNameAndTag
-		delOldContainer := os.Getenv("DelOldContainer") != "false"
+		delOldContainer := l.svcCtx.Config.ResolveDeleteOldContainer(req.DelOldContainer)
 		err := utiles.UpdateContainer(l.svcCtx, req.Id, req.ContainerName, imageNameAndTag, delOldContainer, taskID)
 		if err != nil {
 			l.Errorf("Error in UpdateContainer: %v", err)

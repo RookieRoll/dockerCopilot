@@ -31,7 +31,7 @@ func (l *RestoreLogic) Restore(req *types.ContainerRestoreReq) (resp *types.Resp
 	resp = &types.Resp{}
 	taskID := uuid.New().String()
 	fileName := req.Filename
-	fullPath, pathErr := utiles.ResolveBackupPath(fileName, ".json")
+	fullPath, pathErr := utiles.ResolveBackupPathIn(l.svcCtx.Config.BackupDirectory(), fileName, ".json")
 	if pathErr != nil {
 		resp.Code = 400
 		resp.Msg = pathErr.Error()

@@ -7,3 +7,27 @@ Log:
 Auth:
   AccessSecret: ${secretKey}
   AccessExpire: 7257600
+Tasks:
+  Directory: /data/tasks
+  MaxConcurrent: 2
+  QueueCapacity: 100
+  Timeout: 30m
+  Retention: 168h
+  MaxRecords: 1000
+  HealthcheckWait: 120s
+  RunningObservation: 10s
+  RecoveryTimeout: 2m
+Logging:
+  Directory: /data/logs
+  Level: info
+  RetentionDays: 7
+  MaxFileSizeMiB: 20
+  MaxTotalSizeMiB: 200
+Updates:
+  Repository: RookieRoll/dockerCopilot
+  GitHubProxy: ""
+Backup:
+  Directory: /data/backups
+Docker:
+  DeleteOldContainer: true
+  PortOverridesPath: /data/config/container-port-overrides.json

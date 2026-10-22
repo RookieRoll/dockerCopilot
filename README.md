@@ -40,6 +40,45 @@ services:
     image: 2807645688/dockercopilot:latest
 ```
 
+## 服务配置
+
+服务默认读取 `etc/dockerCopilot.yaml`。集中配置预设任务记录目录为 `/data/tasks`、并发上限为 2、队列容量为 100、更新/恢复期限为 30 分钟、终态记录保留 7 天且最多 1000 条。健康检查等待、持续运行观察和恢复预算分别预设为 120 秒、10 秒和 2 分钟；任务执行器和这些行为由后续任务接入。
+
+日志配置预设写入 `/data/logs`、级别为 `info`、保留 7 天，单文件与目录容量上限分别为 20 MiB 和 200 MiB；轮转和容量清理由后续日志任务接入。备份默认写入 `/data/backups`，端口覆盖配置默认写入 `/data/config/container-port-overrides.json`。在线更新源默认为 `RookieRoll/dockerCopilot`。旧的 `BACKUP_DIR`、`DelOldContainer`、`githubProxy` 和 `CONTAINER_PORT_OVERRIDES_PATH` 环境变量继续生效；对应环境变量优先于 YAML。`DelOldContainer` 接受 `true` 或 `false`，单次更新请求显式提供 `delOldContainer` 时优先使用请求值。
+
+任务、日志和更新配置也可使用 `DOCKERCOPILOT_TASK_*`、`DOCKERCOPILOT_LOG_*`、`DOCKERCOPILOT_UPDATE_REPOSITORY` 与 `DOCKERCOPILOT_GITHUB_PROXY` 覆盖。任务超时、保留期和恢复/健康检查时间使用 Go duration 格式，例如 `30m`、`168h` 和 `120s`。更新仓库使用 `owner/repository` 格式；代理地址必须是没有凭据、查询参数或片段的 HTTP(S) URL。
+
+关键默认值可在 YAML 中显式调整：
+
+```yaml
+Tasks:
+  Directory: /data/tasks
+  MaxConcurrent: 2
+  QueueCapacity: 100
+  Timeout: 30m
+  Retention: 168h
+  MaxRecords: 1000
+  HealthcheckWait: 120s
+  RunningObservation: 10s
+  RecoveryTimeout: 2m
+Logging:
+  Directory: /data/logs
+  Level: info
+  RetentionDays: 7
+  MaxFileSizeMiB: 20
+  MaxTotalSizeMiB: 200
+Updates:
+  Repository: RookieRoll/dockerCopilot
+  GitHubProxy: ""
+Backup:
+  Directory: /data/backups
+Docker:
+  DeleteOldContainer: true
+  PortOverridesPath: /data/config/container-port-overrides.json
+```
+
+本任务集中提供配置加载、默认值和启动校验；任务运行器、日志轮转/容量限制以及健康检查等待会由后续功能接入。
+
 ## 开发环境
 
 go版本：1.23+

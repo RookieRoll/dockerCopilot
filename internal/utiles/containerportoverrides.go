@@ -11,12 +11,12 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/onlyLTY/dockerCopilot/internal/config"
 	"github.com/onlyLTY/dockerCopilot/internal/types"
 )
 
 const (
 	containerPortOverridesFileName = "container-port-overrides.json"
-	containerPortOverridesPathEnv  = "CONTAINER_PORT_OVERRIDES_PATH"
 	maxConfiguredPorts             = 32
 	maxConfiguredPortLabelRunes    = 64
 )
@@ -82,21 +82,26 @@ func NormalizeConfiguredPorts(ports []types.ConfiguredPort) ([]types.ConfiguredP
 }
 
 func configuredPortOverridesFilePath() string {
-	if configuredPath := strings.TrimSpace(os.Getenv(containerPortOverridesPathEnv)); configuredPath != "" {
-		return configuredPath
-	}
-	return containerPortOverridesPath
+	return config.LegacyPortOverridesPath(containerPortOverridesPath)
 }
 
 func LoadContainerPortOverrides() (map[string][]types.ConfiguredPort, error) {
+	return LoadContainerPortOverridesAt(configuredPortOverridesFilePath())
+}
+
+func LoadContainerPortOverridesAt(path string) (map[string][]types.ConfiguredPort, error) {
 	containerPortOverridesMu.Lock()
 	defer containerPortOverridesMu.Unlock()
-	return loadContainerPortOverridesLocked()
+	return loadContainerPortOverridesLocked(path)
 }
 
 // RemoveContainerPortOverrides removes the saved ports for one container.
 // It is safe to call when the container has no saved configuration.
 func RemoveContainerPortOverrides(containerName string) error {
+	return RemoveContainerPortOverridesAt(configuredPortOverridesFilePath(), containerName)
+}
+
+func RemoveContainerPortOverridesAt(path, containerName string) error {
 	containerName = normalizeContainerName(containerName)
 	if containerName == "" {
 		return nil
@@ -105,7 +110,7 @@ func RemoveContainerPortOverrides(containerName string) error {
 	containerPortOverridesMu.Lock()
 	defer containerPortOverridesMu.Unlock()
 
-	config, err := readContainerPortOverridesFileLocked()
+	config, err := readContainerPortOverridesFileLocked(path)
 	if err != nil {
 		return err
 	}
@@ -113,13 +118,17 @@ func RemoveContainerPortOverrides(containerName string) error {
 		return nil
 	}
 	delete(config.Containers, containerName)
-	return writeContainerPortOverridesFileLocked(config)
+	return writeContainerPortOverridesFileLocked(path, config)
 }
 
 // CleanupContainerPortOverrides removes entries whose container names are not
 // present in the latest successful Docker container list and returns the
 // cleaned, normalized overrides from the same single file read.
 func CleanupContainerPortOverrides(activeContainerNames []string) (int, map[string][]types.ConfiguredPort, error) {
+	return CleanupContainerPortOverridesAt(configuredPortOverridesFilePath(), activeContainerNames)
+}
+
+func CleanupContainerPortOverridesAt(path string, activeContainerNames []string) (int, map[string][]types.ConfiguredPort, error) {
 	activeNames := make(map[string]struct{}, len(activeContainerNames))
 	for _, name := range activeContainerNames {
 		if normalizedName := normalizeContainerName(name); normalizedName != "" {
@@ -130,7 +139,7 @@ func CleanupContainerPortOverrides(activeContainerNames []string) (int, map[stri
 	containerPortOverridesMu.Lock()
 	defer containerPortOverridesMu.Unlock()
 
-	config, err := readContainerPortOverridesFileLocked()
+	config, err := readContainerPortOverridesFileLocked(path)
 	if err != nil {
 		return 0, nil, err
 	}
@@ -143,7 +152,7 @@ func CleanupContainerPortOverrides(activeContainerNames []string) (int, map[stri
 		removed++
 	}
 	if removed > 0 {
-		if err := writeContainerPortOverridesFileLocked(config); err != nil {
+		if err := writeContainerPortOverridesFileLocked(path, config); err != nil {
 			return removed, nil, err
 		}
 	}
@@ -160,6 +169,10 @@ func CleanupContainerPortOverrides(activeContainerNames []string) (int, map[stri
 }
 
 func SaveContainerPortOverrides(containerName string, ports []types.ConfiguredPort) error {
+	return SaveContainerPortOverridesAt(configuredPortOverridesFilePath(), containerName, ports)
+}
+
+func SaveContainerPortOverridesAt(path, containerName string, ports []types.ConfiguredPort) error {
 	containerName = normalizeContainerName(containerName)
 	if containerName == "" {
 		return fmt.Errorf("container name is required")
@@ -173,7 +186,7 @@ func SaveContainerPortOverrides(containerName string, ports []types.ConfiguredPo
 	containerPortOverridesMu.Lock()
 	defer containerPortOverridesMu.Unlock()
 
-	config, err := readContainerPortOverridesFileLocked()
+	config, err := readContainerPortOverridesFileLocked(path)
 	if err != nil {
 		return err
 	}
@@ -185,10 +198,14 @@ func SaveContainerPortOverrides(containerName string, ports []types.ConfiguredPo
 			Ports:     normalized,
 		}
 	}
-	return writeContainerPortOverridesFileLocked(config)
+	return writeContainerPortOverridesFileLocked(path, config)
 }
 
 func MigrateContainerPortOverrides(oldName, newName string) error {
+	return MigrateContainerPortOverridesAt(configuredPortOverridesFilePath(), oldName, newName)
+}
+
+func MigrateContainerPortOverridesAt(path, oldName, newName string) error {
 	oldName = normalizeContainerName(oldName)
 	newName = normalizeContainerName(newName)
 	if oldName == "" || newName == "" || oldName == newName {
@@ -198,7 +215,7 @@ func MigrateContainerPortOverrides(oldName, newName string) error {
 	containerPortOverridesMu.Lock()
 	defer containerPortOverridesMu.Unlock()
 
-	config, err := readContainerPortOverridesFileLocked()
+	config, err := readContainerPortOverridesFileLocked(path)
 	if err != nil {
 		return err
 	}
@@ -209,15 +226,15 @@ func MigrateContainerPortOverrides(oldName, newName string) error {
 	delete(config.Containers, oldName)
 	entry.UpdatedAt = nowRFC3339()
 	config.Containers[newName] = entry
-	return writeContainerPortOverridesFileLocked(config)
+	return writeContainerPortOverridesFileLocked(path, config)
 }
 
 func normalizeContainerName(name string) string {
 	return strings.TrimPrefix(strings.TrimSpace(name), "/")
 }
 
-func loadContainerPortOverridesLocked() (map[string][]types.ConfiguredPort, error) {
-	config, err := readContainerPortOverridesFileLocked()
+func loadContainerPortOverridesLocked(path string) (map[string][]types.ConfiguredPort, error) {
+	config, err := readContainerPortOverridesFileLocked(path)
 	if err != nil {
 		return nil, err
 	}
@@ -232,12 +249,12 @@ func loadContainerPortOverridesLocked() (map[string][]types.ConfiguredPort, erro
 	return overrides, nil
 }
 
-func readContainerPortOverridesFileLocked() (containerPortOverridesFile, error) {
+func readContainerPortOverridesFileLocked(path string) (containerPortOverridesFile, error) {
 	config := containerPortOverridesFile{
 		SchemaVersion: 1,
 		Containers:    make(map[string]containerPortOverridesContainer),
 	}
-	content, err := os.ReadFile(configuredPortOverridesFilePath())
+	content, err := os.ReadFile(path)
 	if os.IsNotExist(err) {
 		return config, nil
 	}
@@ -256,8 +273,7 @@ func readContainerPortOverridesFileLocked() (containerPortOverridesFile, error) 
 	return config, nil
 }
 
-func writeContainerPortOverridesFileLocked(config containerPortOverridesFile) error {
-	path := configuredPortOverridesFilePath()
+func writeContainerPortOverridesFileLocked(path string, config containerPortOverridesFile) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}

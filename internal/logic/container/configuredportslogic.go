@@ -43,7 +43,7 @@ func (l *ConfiguredPortsLogic) Save(req *types.ContainerConfiguredPortsReq) (res
 	}
 
 	containerName := strings.TrimPrefix(containerInspect.Name, "/")
-	if err := utiles.SaveContainerPortOverrides(containerName, req.Ports); err != nil {
+	if err := utiles.SaveContainerPortOverridesAt(l.svcCtx.Config.PortOverridesFilePath(), containerName, req.Ports); err != nil {
 		resp.Code = 400
 		resp.Msg = err.Error()
 		resp.Data = map[string]interface{}{}

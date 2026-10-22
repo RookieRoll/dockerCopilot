@@ -131,7 +131,7 @@ func (l *ContainersListLogic) ContainersList() (resp *types.Resp, err error) {
 			activeContainerNames = append(activeContainerNames, strings.TrimPrefix(container.Names[0], "/"))
 		}
 	}
-	removed, configuredPortOverrides, cleanupErr := utiles.CleanupContainerPortOverrides(activeContainerNames)
+	removed, configuredPortOverrides, cleanupErr := utiles.CleanupContainerPortOverridesAt(l.svcCtx.Config.PortOverridesFilePath(), activeContainerNames)
 	if cleanupErr != nil {
 		l.Errorf("cleanup configured container ports: %v", cleanupErr)
 		configuredPortOverrides = map[string][]types.ConfiguredPort{}

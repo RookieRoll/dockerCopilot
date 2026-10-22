@@ -42,7 +42,7 @@ func (l *RenameLogic) Rename(req *types.ContainerRenameReq) (resp *types.Resp, e
 		resp.Data = map[string]interface{}{}
 		return resp, err
 	}
-	if err := utiles.MigrateContainerPortOverrides(oldName, req.NewName); err != nil {
+	if err := utiles.MigrateContainerPortOverridesAt(l.svcCtx.Config.PortOverridesFilePath(), oldName, req.NewName); err != nil {
 		l.Errorf("migrate configured ports after renaming container %q: %v", oldName, err)
 	}
 	resp.Code = 200
