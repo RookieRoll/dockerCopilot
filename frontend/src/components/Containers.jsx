@@ -1330,7 +1330,7 @@ export function Containers() {
           onClose={() => setPortConfigContainer(null)}
           onSaved={() => {
             setPortConfigContainer(null)
-            queryClient.invalidateQueries(['containers'])
+            queryClient.invalidateQueries({ queryKey: ['containers'] })
           }}
         />
       )}
@@ -1454,7 +1454,7 @@ function ConfiguredPortsModal({ container, onClose, onSaved }) {
                 {existingPortCount > 0 ? '\u7f16\u8f91 host \u7f51\u7edc\u7aef\u53e3' : '\u914d\u7f6e host \u7f51\u7edc\u7aef\u53e3'}
               </h3>
               <p className="mt-1 text-xs text-gray-500 dark:text-gray-400">
-                {container.name} \u00b7 {'Docker \u65e0\u6cd5\u81ea\u52a8\u786e\u8ba4\u5b9e\u9645\u76d1\u542c\u7aef\u53e3'}
+                {container.name} · {'Docker \u65e0\u6cd5\u81ea\u52a8\u786e\u8ba4\u5b9e\u9645\u76d1\u542c\u7aef\u53e3'}
               </p>
             </div>
             <button
