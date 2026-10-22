@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/google/uuid"
 	containerService "github.com/onlyLTY/dockerCopilot/internal/container"
@@ -21,15 +22,19 @@ import (
 
 type UpdateLogic struct {
 	logx.Logger
-	ctx              context.Context
-	taskRunner       *task.Runner
-	taskStore        *task.Store
-	service          *containerService.Service
-	mutationGate     *operation.MutationGate
-	deleteOldDefault bool
+	ctx                context.Context
+	taskRunner         *task.Runner
+	taskStore          *task.Store
+	service            *containerService.Service
+	mutationGate       *operation.MutationGate
+	deleteOldDefault   bool
+	healthcheckWait    time.Duration
+	runningObservation time.Duration
+	optionsErr         error
 }
 
 func NewUpdateLogic(ctx context.Context, svcCtx *svc.ServiceContext) *UpdateLogic {
+	options, optionsErr := svcCtx.Config.TaskOptions()
 	return &UpdateLogic{
 		Logger:           logx.WithContext(ctx),
 		ctx:              ctx,
@@ -38,6 +43,7 @@ func NewUpdateLogic(ctx context.Context, svcCtx *svc.ServiceContext) *UpdateLogi
 		service:          serviceFromContext(svcCtx),
 		mutationGate:     svcCtx.MutationGate(),
 		deleteOldDefault: svcCtx.Config.ResolveDeleteOldContainer(nil),
+		healthcheckWait:  options.HealthcheckWait, runningObservation: options.RunningObservation, optionsErr: optionsErr,
 	}
 }
 
@@ -72,6 +78,9 @@ func (e taskSubmitError) ErrorCode() string {
 
 func (l *UpdateLogic) Update(req *types.ContainerUpdateReq) (resp *types.Resp, err error) {
 	resp = &types.Resp{}
+	if l.optionsErr != nil {
+		return nil, taskUnavailableError("task validation options are unavailable")
+	}
 	if l.taskRunner == nil {
 		return nil, taskUnavailableError("task runner is unavailable")
 	}
@@ -101,7 +110,7 @@ func (l *UpdateLogic) Update(req *types.ContainerUpdateReq) (resp *types.Resp, e
 		Record: task.Record{
 			Type: "container-update", Name: req.ContainerName, ImageRef: imageNameAndTag,
 			OldContainerID: req.Id, ContainerIDs: []string{req.Id},
-			TaskID: taskID, Options: task.TaskOptions{Image: imageNameAndTag, DeleteOldContainer: &deleteOption},
+			TaskID: taskID, Options: task.TaskOptions{Image: imageNameAndTag, DeleteOldContainer: &deleteOption, HealthWaitSeconds: durationSeconds(l.healthcheckWait)},
 		},
 		OnAccepted: func() error {
 			gate, acquireErr := l.mutationGate.Acquire(context.Background(), taskID)
@@ -169,6 +178,7 @@ func (l *UpdateLogic) Update(req *types.ContainerUpdateReq) (resp *types.Resp, e
 						record.ProtectedNames = appendTaskIdentity(record.ProtectedNames, req.ContainerName)
 					})
 				},
+				Validation: containerService.UpdateValidationOptions{HealthcheckWait: l.healthcheckWait, RunningObservation: l.runningObservation},
 			})
 			if err != nil {
 				return err
@@ -200,6 +210,17 @@ func (l *UpdateLogic) Update(req *types.ContainerUpdateReq) (resp *types.Resp, e
 	resp.Msg = "success"
 	resp.Data = map[string]string{"taskID": acceptedTaskID}
 	return resp, nil
+}
+
+func durationSeconds(value time.Duration) int {
+	if value <= 0 {
+		return 0
+	}
+	seconds := int(value / time.Second)
+	if seconds == 0 {
+		return 1
+	}
+	return seconds
 }
 
 func (l *UpdateLogic) effectiveDeleteOld(requestValue *bool) bool {

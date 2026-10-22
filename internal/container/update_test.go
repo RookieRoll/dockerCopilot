@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	dockertypes "github.com/docker/docker/api/types"
 	dockerc "github.com/docker/docker/api/types/container"
@@ -17,7 +18,7 @@ import (
 	dockerClient "github.com/docker/docker/client"
 )
 
-const updateInspectJSON = `{"Id":"old-canonical-id","Image":"sha256:old-image","Name":"/web","State":{"Running":true},"Config":{"Image":"web:latest","Hostname":"stable-host","StopSignal":"SIGTERM","StopTimeout":23,"Volumes":{"/data":{}}},"HostConfig":{"Binds":["/host/config:/config:ro"],"RestartPolicy":{"Name":"always"}},"NetworkSettings":{"Networks":{"bridge":{"Aliases":["web-alias"],"IPAddress":"172.17.0.2","NetworkID":"old-network-id","EndpointID":"old-endpoint-id"}}},"Mounts":[{"Type":"volume","Name":"anonymous-volume-id","Source":"/var/lib/docker/volumes/anonymous-volume-id/_data","Destination":"/data","Mode":"rw","RW":true}]}`
+const updateInspectJSON = `{"Id":"old-canonical-id","Image":"sha256:old-image","Name":"/web","RestartCount":0,"State":{"Running":true,"Status":"running","StartedAt":"2026-10-22T00:00:00Z"},"Config":{"Image":"web:latest","Hostname":"stable-host","StopSignal":"SIGTERM","StopTimeout":23,"Volumes":{"/data":{}}},"HostConfig":{"Binds":["/host/config:/config:ro"],"RestartPolicy":{"Name":"always"}},"NetworkSettings":{"Networks":{"bridge":{"Aliases":["web-alias"],"IPAddress":"172.17.0.2","NetworkID":"old-network-id","EndpointID":"old-endpoint-id"}}},"Mounts":[{"Type":"volume","Name":"anonymous-volume-id","Source":"/var/lib/docker/volumes/anonymous-volume-id/_data","Destination":"/data","Mode":"rw","RW":true}]}`
 
 func newUpdateTestService(t *testing.T, handler http.HandlerFunc) *Service {
 	t.Helper()
@@ -313,5 +314,205 @@ func TestUpdateUsesDockerDefaultStopOptionsWhenUnset(t *testing.T) {
 	}
 	if stopSignal != "" || stopTimeout != "" {
 		t.Fatalf("Docker defaults should be used when unset, got signal=%q timeout=%q", stopSignal, stopTimeout)
+	}
+}
+
+func TestUpdateValidatesHealthyOrContinuouslyRunningReplacement(t *testing.T) {
+	tests := []struct {
+		name            string
+		healthcheck     bool
+		healthStatus    string
+		healthAfter     int32
+		omitHealth      bool
+		newHealthcheck  bool
+		running         bool
+		validationWait  time.Duration
+		observationWait time.Duration
+		inspectDelay    time.Duration
+		restartAfter    int32
+		startedAtAfter  int32
+		stopAfter       int32
+		wantErr         bool
+		wantCompleted   string
+	}{
+		{name: "healthy after starting", healthcheck: true, healthStatus: "starting", healthAfter: 2, running: true, wantCompleted: "healthcheck"},
+		{name: "new image introduces healthcheck", healthcheck: true, newHealthcheck: true, healthStatus: "starting", healthAfter: 2, running: true, wantCompleted: "healthcheck"},
+		{name: "configured healthcheck status missing", healthcheck: true, omitHealth: true, running: true, wantErr: true},
+		{name: "continuous running without healthcheck", running: true, wantCompleted: "仅验证容器持续运行"},
+		{name: "healthcheck configured timeout", healthcheck: true, healthStatus: "starting", running: true, validationWait: 8 * time.Millisecond, wantErr: true},
+		{name: "healthy result after health deadline", healthcheck: true, healthStatus: "healthy", running: true, validationWait: 8 * time.Millisecond, inspectDelay: 25 * time.Millisecond, wantErr: true},
+		{name: "unhealthy", healthcheck: true, healthStatus: "unhealthy", running: true, wantErr: true},
+		{name: "immediate exit", running: false, wantErr: true},
+		{name: "inspect delayed past validation deadline", running: true, observationWait: 8 * time.Millisecond, inspectDelay: 1200 * time.Millisecond, wantErr: true},
+		{name: "final inspect catches late exit", running: true, observationWait: 20 * time.Millisecond, stopAfter: 2, wantErr: true},
+		{name: "already restarted before validation", running: true, restartAfter: 1, wantErr: true},
+		{name: "restart count changes during observation", running: true, restartAfter: 2, wantErr: true},
+		{name: "startedAt changes during observation", running: true, startedAtAfter: 2, wantErr: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var validationCalls, removeCalls atomic.Int32
+			service := newUpdateTestService(t, func(w http.ResponseWriter, r *http.Request) {
+				switch {
+				case r.Method == http.MethodGet && r.URL.Path == "/_ping":
+					w.Header().Set("API-Version", "1.45")
+					fmt.Fprint(w, "OK")
+				case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/json") && strings.Contains(r.URL.Path, "/containers/old-canonical-id"):
+					if tc.healthcheck && !tc.newHealthcheck {
+						var original map[string]any
+						if err := json.Unmarshal([]byte(updateInspectJSON), &original); err != nil {
+							t.Fatal(err)
+						}
+						original["Config"].(map[string]any)["Healthcheck"] = map[string]any{"Test": []string{"CMD", "true"}}
+						w.Header().Set("Content-Type", "application/json")
+						_ = json.NewEncoder(w).Encode(original)
+					} else {
+						serveUpdateInspect(w)
+					}
+				case r.Method == http.MethodPost && r.URL.Path == "/v1.45/images/create":
+					fmt.Fprintln(w, `{"status":"pulled"}`)
+				case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/v1.45/images/") && strings.HasSuffix(r.URL.Path, "/json"):
+					fmt.Fprint(w, `{"Id":"sha256:resolved-image-id"}`)
+				case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/stop"), r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/rename"), r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/start"):
+					w.WriteHeader(http.StatusNoContent)
+				case r.Method == http.MethodPost && r.URL.Path == "/v1.45/containers/create":
+					fmt.Fprint(w, `{"Id":"new-container-id","Warnings":[]}`)
+				case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/json") && strings.Contains(r.URL.Path, "/containers/new-container-id"):
+					call := validationCalls.Add(1)
+					if tc.inspectDelay > 0 {
+						time.Sleep(tc.inspectDelay)
+					}
+					state, health := "running", ""
+					if !tc.running {
+						state = "exited"
+					}
+					if tc.stopAfter > 0 && call >= tc.stopAfter {
+						state = "exited"
+					}
+					if tc.healthcheck {
+						health = tc.healthStatus
+						if tc.healthAfter > 0 && call >= tc.healthAfter {
+							health = "healthy"
+						}
+					}
+					w.Header().Set("Content-Type", "application/json")
+					restartCount := int32(0)
+					if tc.restartAfter > 0 && call >= tc.restartAfter {
+						restartCount = 1
+					}
+					startedAt := "2026-10-22T00:00:00Z"
+					if tc.startedAtAfter > 0 && call >= tc.startedAtAfter {
+						startedAt = "2026-10-22T00:00:01Z"
+					}
+					if tc.healthcheck && !tc.omitHealth {
+						running := tc.running && !(tc.stopAfter > 0 && call >= tc.stopAfter)
+						fmt.Fprintf(w, `{"Id":"new-container-id","Name":"/web","RestartCount":%d,"State":{"Running":%t,"Status":%q,"StartedAt":%q,"Health":{"Status":%q}},"Config":{"Image":"sha256:resolved-image-id","Healthcheck":{"Test":["CMD","true"]}},"HostConfig":{},"NetworkSettings":{"Networks":{}}}`, restartCount, running, state, startedAt, health)
+					} else {
+						running := tc.running && !(tc.stopAfter > 0 && call >= tc.stopAfter)
+						fmt.Fprintf(w, `{"Id":"new-container-id","Name":"/web","RestartCount":%d,"State":{"Running":%t,"Status":%q,"StartedAt":%q},"Config":{"Image":"sha256:resolved-image-id"},"HostConfig":{},"NetworkSettings":{"Networks":{}}}`, restartCount, running, state, startedAt)
+					}
+				case r.Method == http.MethodDelete && strings.HasPrefix(r.URL.Path, "/v1.45/containers/"):
+					removeCalls.Add(1)
+					w.WriteHeader(http.StatusNoContent)
+				default:
+					http.NotFound(w, r)
+				}
+			})
+			callbacks := testUpdateCallbacks(func(string) error { return nil })
+			wait := tc.validationWait
+			if wait == 0 {
+				wait = time.Second
+			}
+			observationWait := tc.observationWait
+			if observationWait == 0 {
+				observationWait = time.Second
+			}
+			callbacks.Validation = UpdateValidationOptions{HealthcheckWait: wait, RunningObservation: observationWait, PollInterval: 20 * time.Millisecond}
+			completed := ""
+			validationStarted := time.Time{}
+			callbacks.Progress = func(stage string, _ int, message string) error {
+				if stage == "validating-new" && validationStarted.IsZero() {
+					validationStarted = time.Now()
+				}
+				if stage == "completed" {
+					completed = message
+				}
+				return nil
+			}
+			err := service.UpdateWithOptions(context.Background(), "old-canonical-id", "web", "web:next", true, "task-validation", callbacks)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("UpdateWithOptions error=%v wantErr=%t validationCalls=%d", err, tc.wantErr, validationCalls.Load())
+			}
+			if tc.wantErr {
+				if tc.name == "healthcheck configured timeout" && time.Since(validationStarted) > 500*time.Millisecond {
+					t.Fatalf("configured health timeout was not respected: %s", time.Since(validationStarted))
+				}
+				if removeCalls.Load() != 0 {
+					t.Fatal("old container was removed before replacement validation succeeded")
+				}
+				return
+			}
+			if completed == "" || !strings.Contains(completed, tc.wantCompleted) {
+				t.Fatalf("result did not explain validation scope: %q", completed)
+			}
+			if tc.healthcheck && validationCalls.Load() < 2 {
+				t.Fatalf("healthcheck was not polled, calls=%d", validationCalls.Load())
+			}
+			if !tc.healthcheck && time.Since(validationStarted) < 10*time.Millisecond {
+				t.Fatalf("running validation ended before the configured observation window: %s", time.Since(validationStarted))
+			}
+			if removeCalls.Load() != 1 {
+				t.Fatalf("old container cleanup should happen after validation, calls=%d", removeCalls.Load())
+			}
+		})
+	}
+}
+
+func TestUpdateKeepsOriginallyStoppedReplacementStopped(t *testing.T) {
+	var startCalls atomic.Int32
+	var completed string
+	service := newUpdateTestService(t, func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/_ping":
+			w.Header().Set("API-Version", "1.45")
+			fmt.Fprint(w, "OK")
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/json") && strings.Contains(r.URL.Path, "/containers/old-canonical-id"):
+			var original map[string]any
+			if err := json.Unmarshal([]byte(updateInspectJSON), &original); err != nil {
+				t.Fatal(err)
+			}
+			original["State"] = map[string]any{"Running": false, "Status": "exited"}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(original)
+		case r.Method == http.MethodPost && r.URL.Path == "/v1.45/images/create":
+			fmt.Fprintln(w, `{"status":"pulled"}`)
+		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/v1.45/images/") && strings.HasSuffix(r.URL.Path, "/json"):
+			fmt.Fprint(w, `{"Id":"sha256:resolved-image-id"}`)
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/rename"):
+			w.WriteHeader(http.StatusNoContent)
+		case r.Method == http.MethodPost && r.URL.Path == "/v1.45/containers/create":
+			fmt.Fprint(w, `{"Id":"new-container-id","Warnings":[]}`)
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/start"):
+			startCalls.Add(1)
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			http.NotFound(w, r)
+		}
+	})
+	callbacks := testUpdateCallbacks(func(string) error { return nil })
+	callbacks.Progress = func(stage string, _ int, message string) error {
+		if stage == "completed" {
+			completed = message
+		}
+		return nil
+	}
+	if err := service.UpdateWithOptions(context.Background(), "old-canonical-id", "web", "web:next", false, "task-stopped-original", callbacks); err != nil {
+		t.Fatal(err)
+	}
+	if startCalls.Load() != 0 {
+		t.Fatal("replacement was started although the original container was stopped")
+	}
+	if !strings.Contains(completed, "保持停止") || !strings.Contains(completed, "未执行运行验证") {
+		t.Fatalf("result did not explain stopped-container behavior: %q", completed)
 	}
 }

@@ -31,7 +31,7 @@ func newOperationTestService(t *testing.T, handler http.HandlerFunc) *Service {
 
 func writeInspectedContainer(w http.ResponseWriter) {
 	w.Header().Set("Content-Type", "application/json")
-	fmt.Fprint(w, `{"Id":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","Name":"/web","State":{"Running":true},"Config":{"Image":"old:image"},"HostConfig":{},"NetworkSettings":{"Networks":{}}}`)
+	fmt.Fprint(w, `{"Id":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","Name":"/web","RestartCount":0,"State":{"Running":true,"Status":"running","StartedAt":"2026-10-22T00:00:00Z"},"Config":{"Image":"old:image"},"HostConfig":{},"NetworkSettings":{"Networks":{}}}`)
 }
 
 func testUpdateCallbacks(onCreated func(string) error) UpdateCallbacks {
@@ -44,6 +44,7 @@ func testUpdateCallbacks(onCreated func(string) error) UpdateCallbacks {
 		},
 		Checkpoint: func(UpdateCheckpoint) error { return nil },
 		OnCreated:  onCreated,
+		Validation: UpdateValidationOptions{HealthcheckWait: 20 * time.Millisecond, RunningObservation: 3 * time.Second, PollInterval: 20 * time.Millisecond},
 	}
 }
 

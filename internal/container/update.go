@@ -39,6 +39,13 @@ type UpdateCallbacks struct {
 	SaveSnapshot func([]byte) error
 	Checkpoint   func(UpdateCheckpoint) error
 	OnCreated    func(string) error
+	Validation   UpdateValidationOptions
+}
+
+type UpdateValidationOptions struct {
+	HealthcheckWait    time.Duration
+	RunningObservation time.Duration
+	PollInterval       time.Duration
 }
 
 // UpdateWithOptions performs update preparation and replacement with a frozen
@@ -193,6 +200,7 @@ func (s *Service) UpdateWithOptions(ctx context.Context, id, name, imageRef stri
 	}
 
 	wasRunning := before.State != nil && before.State.Running
+	validationResult := "原容器已停止，新容器保持停止；未执行运行验证"
 	if wasRunning {
 		if err := publish("stopping-old", 35, "正在按原停止配置停止旧容器"); err != nil {
 			return fail("stopping-old", "更新准备失败", err)
@@ -227,11 +235,11 @@ func (s *Service) UpdateWithOptions(ctx context.Context, id, name, imageRef stri
 	if err := checkpoint(UpdateCheckpoint{Stage: "creating-new", SnapshotRef: snapshotRef, OldContainerID: canonicalID, ResolvedImageID: resolved.ID, BackupName: backupName}); err != nil {
 		return fail("creating-new", "持久化新容器创建检查点失败，未创建新容器", err)
 	}
-	config := before.Config
-	config.Image = resolved.ID
+	createConfig := *before.Config
+	createConfig.Image = resolved.ID
 	hostConfig := preserveObservedVolumes(before.HostConfig, before.Mounts)
 	networks := copyCreateNetworks(before.NetworkSettings)
-	created, err := s.docker.ContainerCreate(ctx, config, hostConfig, networks, nil, name)
+	created, err := s.docker.ContainerCreate(ctx, &createConfig, hostConfig, networks, nil, name)
 	if err != nil {
 		return fail("creating-new", "创建新容器失败", err)
 	}
@@ -254,6 +262,13 @@ func (s *Service) UpdateWithOptions(ctx context.Context, id, name, imageRef stri
 		if err := checkpoint(UpdateCheckpoint{Stage: "new-started", SnapshotRef: snapshotRef, OldContainerID: canonicalID, ResolvedImageID: resolved.ID, BackupName: backupName}); err != nil {
 			return fail("new-started", "新容器已启动但保存阶段检查点失败", err)
 		}
+		if err := publish("validating-new", 90, "正在验证新容器健康或持续运行状态"); err != nil {
+			return fail("validating-new", "保存容器验证阶段失败", err)
+		}
+		validationResult, err = s.validateStartedContainer(ctx, created.ID, callbacks.Validation, hasConfiguredHealthcheck(&createConfig), publish)
+		if err != nil {
+			return fail("validating-new", "新容器未通过运行验证", err)
+		}
 	}
 	if deleteOld {
 		if err := checkpoint(UpdateCheckpoint{Stage: "removing-old", SnapshotRef: snapshotRef, OldContainerID: canonicalID, PreviousImageID: before.Image, ResolvedImageID: resolved.ID, BackupName: backupName}); err != nil {
@@ -266,7 +281,7 @@ func (s *Service) UpdateWithOptions(ctx context.Context, id, name, imageRef stri
 			return fail("old-removed", "旧容器已删除但清理检查点未能保存", err)
 		}
 	}
-	if err := publish("completed", 100, "容器更新完成"); err != nil {
+	if err := publish("completed", 100, validationResult); err != nil {
 		return fail("replacement-prepared", "更新阶段保存失败", err)
 	}
 	return nil
@@ -320,6 +335,157 @@ func preserveObservedVolumes(host *container.HostConfig, mounts []container.Moun
 		})
 	}
 	return result
+}
+
+func (s *Service) validateStartedContainer(ctx context.Context, id string, options UpdateValidationOptions, expectedHealthcheck bool, publish func(string, int, string) error) (string, error) {
+	healthWait := options.HealthcheckWait
+	if healthWait <= 0 {
+		healthWait = 120 * time.Second
+	}
+	observation := options.RunningObservation
+	if observation <= 0 {
+		observation = 10 * time.Second
+	}
+	interval := options.PollInterval
+	if interval <= 0 {
+		interval = time.Second
+	}
+	started := time.Now()
+	healthDeadline := started.Add(healthWait)
+	observationDeadline := started.Add(observation)
+	// The last read must happen after the observation window. Give that read
+	// its own bounded budget, independent of the polling frequency.
+	inspectGrace := time.Second
+	validationDeadline := observationDeadline.Add(inspectGrace)
+	if expectedHealthcheck {
+		validationDeadline = healthDeadline
+	}
+	var initialRestartCount int
+	var initialStartedAt string
+	firstInspect := true
+	for {
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
+		now := time.Now()
+		if expectedHealthcheck && !now.Before(healthDeadline) {
+			return "", fmt.Errorf("replacement container healthcheck did not become healthy within %s", healthWait)
+		}
+		if !expectedHealthcheck && !now.Before(validationDeadline) {
+			return "", fmt.Errorf("replacement container did not remain running for %s; final inspect exceeded its bounded grace", observation)
+		}
+		inspectStartedAt := time.Now()
+		inspectCtx, cancelInspect := context.WithDeadline(ctx, validationDeadline)
+		inspected, err := s.docker.ContainerInspect(inspectCtx, id)
+		cancelInspect()
+		if err != nil {
+			if ctx.Err() == nil && !time.Now().Before(validationDeadline) {
+				return "", fmt.Errorf("replacement validation deadline elapsed while inspecting: %w", err)
+			}
+			return "", fmt.Errorf("inspect replacement during validation: %w", err)
+		}
+		observedAt := time.Now()
+		// A new image may introduce a healthcheck that the old image lacked.
+		if hasConfiguredHealthcheck(inspected.Config) || (inspected.State != nil && inspected.State.Health != nil) {
+			expectedHealthcheck = true
+			validationDeadline = healthDeadline
+		}
+		if expectedHealthcheck && !observedAt.Before(healthDeadline) {
+			return "", fmt.Errorf("replacement container healthcheck did not become healthy within %s", healthWait)
+		}
+		if !expectedHealthcheck && !observedAt.Before(validationDeadline) {
+			return "", fmt.Errorf("replacement container did not remain running for %s; final inspect exceeded its bounded grace", observation)
+		}
+		if inspected.State == nil || !inspected.State.Running {
+			state := "unknown"
+			if inspected.State != nil && inspected.State.Status != "" {
+				state = inspected.State.Status
+			}
+			return "", fmt.Errorf("replacement container is not running (state=%s)", state)
+		}
+		if inspected.State.Paused || inspected.State.Dead || inspected.State.Restarting ||
+			(inspected.State.Status != "" && inspected.State.Status != "running") {
+			return "", fmt.Errorf("replacement container is not stably running (state=%s, paused=%t, restarting=%t, dead=%t)", inspected.State.Status, inspected.State.Paused, inspected.State.Restarting, inspected.State.Dead)
+		}
+		if firstInspect {
+			initialRestartCount = inspected.RestartCount
+			initialStartedAt = inspected.State.StartedAt
+			firstInspect = false
+			if !expectedHealthcheck && initialRestartCount > 0 {
+				return "", errors.New("replacement container restarted before sustained-running validation began")
+			}
+			if !expectedHealthcheck && initialStartedAt == "" {
+				return "", errors.New("replacement container inspect omitted StartedAt; sustained-running state cannot be verified")
+			}
+		} else if !expectedHealthcheck && (inspected.RestartCount != initialRestartCount || inspected.State.StartedAt != initialStartedAt) {
+			return "", errors.New("replacement container restarted during the sustained-running validation window")
+		}
+		hasHealthcheck := hasConfiguredHealthcheck(inspected.Config)
+		if expectedHealthcheck && (inspected.Config == nil || !hasHealthcheck || inspected.State.Health == nil) {
+			return "", errors.New("replacement container inspect omitted configured healthcheck status")
+		}
+		if health := inspected.State.Health; health != nil {
+			switch health.Status {
+			case "healthy":
+				if !time.Now().Before(healthDeadline) {
+					return "", fmt.Errorf("replacement container healthcheck became healthy after deadline %s", healthWait)
+				}
+				return "新容器 healthcheck 已通过", nil
+			case "unhealthy":
+				return "", errors.New("replacement container healthcheck is unhealthy")
+			case "starting":
+				hasHealthcheck = true
+			case "":
+				return "", errors.New("replacement container returned an empty healthcheck status")
+			default:
+				return "", fmt.Errorf("replacement container returned unknown healthcheck status %q", health.Status)
+			}
+		}
+		now = time.Now()
+		if !hasHealthcheck {
+			if !now.Before(observationDeadline) && !inspectStartedAt.Before(observationDeadline) {
+				return "新容器已持续运行验证窗口；仅验证容器持续运行，不代表应用功能正常", nil
+			}
+		} else if !now.Before(healthDeadline) {
+			return "", fmt.Errorf("replacement container healthcheck did not become healthy within %s", healthWait)
+		}
+		remaining := observationDeadline.Sub(now)
+		if hasHealthcheck {
+			remaining = healthDeadline.Sub(now)
+		}
+		wait := interval
+		if remaining < wait {
+			wait = remaining
+		}
+		if wait <= 0 {
+			continue
+		}
+		timer := time.NewTimer(wait)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			return "", ctx.Err()
+		case <-timer.C:
+			if err := ctx.Err(); err != nil {
+				return "", err
+			}
+		}
+		if err := publish("validating-new", 92, "新容器仍在运行，继续等待验证结果"); err != nil {
+			return "", err
+		}
+	}
+}
+
+func hasConfiguredHealthcheck(config *container.Config) bool {
+	if config == nil || config.Healthcheck == nil || len(config.Healthcheck.Test) == 0 {
+		return false
+	}
+	return !strings.EqualFold(config.Healthcheck.Test[0], "NONE")
 }
 
 func copyCreateNetworks(settings *container.NetworkSettings) *network.NetworkingConfig {

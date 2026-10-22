@@ -14,6 +14,7 @@ import (
 	"time"
 
 	dockerClient "github.com/docker/docker/client"
+	"github.com/onlyLTY/dockerCopilot/internal/config"
 	"github.com/onlyLTY/dockerCopilot/internal/svc"
 	"github.com/onlyLTY/dockerCopilot/internal/task"
 	"github.com/onlyLTY/dockerCopilot/internal/types"
@@ -175,6 +176,9 @@ func TestUpdateLogicPersistsCreatedContainerCheckpoint(t *testing.T) {
 			if record.BackupContainerName == "" {
 				t.Fatalf("planned and completed backup name was not persisted: %+v", record)
 			}
+			if record.Options.HealthWaitSeconds != 1 {
+				t.Fatalf("configured healthcheck wait was not recorded: %+v", record.Options)
+			}
 			if !containsTaskID(record.ImageIDs, "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa") {
 				t.Fatalf("resolved image ID was not persisted: %+v", record.ImageIDs)
 			}
@@ -269,6 +273,7 @@ func newUpdateAdapterContext(t *testing.T, dockerURL string, workers, queue int)
 		t.Fatal(err)
 	}
 	return &svc.ServiceContext{
+		Config:       config.Config{Tasks: config.TaskConfig{HealthcheckWait: "1s", RunningObservation: "200ms"}},
 		DockerClient: docker,
 		Containers:   serviceFromContext(&svc.ServiceContext{DockerClient: docker}),
 		TaskStore:    store, TaskRunner: runner,
@@ -286,7 +291,8 @@ func writeUpdateInspect(w http.ResponseWriter, id string) {
 	}
 	_ = json.NewEncoder(w).Encode(map[string]any{
 		"Id": id, "Image": "sha256:old-image", "Name": "/" + name,
-		"State":           map[string]any{"Running": true},
+		"RestartCount":    0,
+		"State":           map[string]any{"Running": true, "Status": "running", "StartedAt": "2026-10-22T00:00:00Z"},
 		"Config":          map[string]any{"Image": "old:image", "Hostname": "host"},
 		"HostConfig":      map[string]any{},
 		"NetworkSettings": map[string]any{"Networks": map[string]any{}},
