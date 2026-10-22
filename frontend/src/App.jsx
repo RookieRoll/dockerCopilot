@@ -10,7 +10,6 @@ import { ThemeProvider } from './hooks/useTheme.jsx'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { cn } from './utils/cn.js'
 
-import { containerAPI, imageAPI } from './api/client.js'
 
 // 创建一个全局的QueryClient实例
 const queryClient = new QueryClient({
@@ -50,21 +49,6 @@ function AppContent() {
     if (token) {
       setIsAuthenticated(true)
     }
-
-    // 同步图标配置
-    const syncIcons = async () => {
-      try {
-        const response = await imageAPI.getIcons()
-        if (response.data.code === 200 || response.data.code === 0) {
-          const icons = response.data.data
-          // 简单的全量更新，以后如果支持前端删除，可能需要合并逻辑
-          localStorage.setItem('docker_copilot_image_logos', JSON.stringify(icons))
-        }
-      } catch (error) {
-        console.error('Failed to sync icons:', error)
-      }
-    }
-    syncIcons()
 
     // 监听storage事件，当其他标签页修改localStorage时更新认证状态
     const handleStorageChange = (e) => {

@@ -4,7 +4,7 @@ import axios from 'axios'
 // 优先级：环境变量 > window.__API_BASE_URL > localStorage > 当前主机 > 默认值
 function getAPIBaseURL() {
   // 1. 最高优先级：环境变量（构建时注入）
-  if (import.meta.env.VITE_API_BASE_URL) {
+  if (import.meta.env?.VITE_API_BASE_URL) {
     console.log('Using build-time API URL:', import.meta.env.VITE_API_BASE_URL)
     return import.meta.env.VITE_API_BASE_URL
   }
@@ -16,7 +16,7 @@ function getAPIBaseURL() {
   }
 
   // 3. 检查 localStorage（用户保存的地址）
-  const savedURL = localStorage.getItem('api_base_url')
+  const savedURL = typeof localStorage !== 'undefined' ? localStorage.getItem('api_base_url') : null
   if (savedURL) {
     console.log('Using localStorage API URL:', savedURL)
     return savedURL
@@ -130,7 +130,7 @@ export const containerAPI = {
 // 镜像相关API
 export const imageAPI = {
   getImages: () => apiClient.get('/api/images'),
-  getIcons: () => apiClient.get('/api/icons'),
+  getIcons: (config) => apiClient.get('/api/icons', config),
   deleteImage: (id, force = false) => apiClient.delete(`/api/image/${id}?force=${force}`),
   uploadIcon: (file, imageName, containerName) => {
     const formData = new FormData()

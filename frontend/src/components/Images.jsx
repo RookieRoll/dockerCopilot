@@ -1,9 +1,9 @@
 import React, { useState, useEffect } from 'react'
-import { useQuery } from '@tanstack/react-query'
 import { HardDrive, Trash2, RefreshCw, Link, BrushCleaning, X, AlertCircle, CheckCircle } from 'lucide-react'
 import { imageAPI } from '../api/client.js'
 import { cn } from '../utils/cn.js'
 import { getImageLogo } from '../config/imageLogos.js'
+import { useImageIcons } from '../hooks/useImageIcons.js'
 
 // 安全的图片组件
 function SafeImage({ src, alt, className, fallback }) {
@@ -34,35 +34,7 @@ export function Images() {
   const [successModal, setSuccessModal] = useState({ isOpen: false, message: '' })
 
   // 获取自定义图标配置
-  const { data: customIcons = {} } = useQuery({
-    queryKey: ['customIcons'],
-    queryFn: async () => {
-      try {
-        const response = await imageAPI.getIcons()
-        if (response.data.code === 200 || response.data.code === 0) {
-          const icons = response.data.data || {}
-          // update localStorage
-          localStorage.setItem('docker_copilot_image_logos', JSON.stringify(icons))
-          return icons
-        }
-      } catch (err) {
-        console.error('获取图标失败:', err)
-      }
-      return {}
-    },
-    // 初始数据尝试从localStorage获取
-    initialData: () => {
-      const saved = localStorage.getItem('docker_copilot_image_logos')
-      if (saved) {
-        try {
-          return JSON.parse(saved)
-        } catch (e) {
-          console.error('解析本地图标配置失败:', e)
-        }
-      }
-      return undefined
-    }
-  })
+  const { data: customIcons = {}, isError: customIconsError, error: customIconsQueryError } = useImageIcons()
 
   const fetchImages = async () => {
     try {
@@ -231,6 +203,12 @@ export function Images() {
           >
             <X className="h-4 w-4" />
           </button>
+        </div>
+      )}
+
+      {customIconsError && (
+        <div role="alert" className="mx-4 sm:mx-6 mt-4 rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-800 dark:border-red-900 dark:bg-red-900/20 dark:text-red-200">
+          图标映射加载失败：{customIconsQueryError?.message || '请检查服务后重试'}
         </div>
       )}
 
@@ -410,7 +388,7 @@ export function Images() {
                   <div className="flex items-start gap-3 mb-4">
                     <div className="h-10 w-10 bg-gray-100 dark:bg-gray-700 rounded-lg flex items-center justify-center flex-shrink-0 overflow-hidden">
                       <SafeImage
-                        src={getImageLogo(image.name, customIcons)}
+                        src={getImageLogo(`${image.name}:${image.tag}`, customIcons)}
                         alt={image.name}
                         className="h-10 w-10 object-cover"
                         fallback={<HardDrive className="h-5 w-5 text-gray-500 dark:text-gray-400" />}
@@ -519,7 +497,7 @@ export function Images() {
                   <div key={img.id} className="flex items-center gap-3 p-3 bg-white dark:bg-gray-700 rounded-xl hover:shadow-md transition-all duration-200">
                     <div className="h-8 w-8 bg-gray-200 dark:bg-gray-600 rounded-lg flex items-center justify-center flex-shrink-0 overflow-hidden">
                       <SafeImage
-                        src={getImageLogo(img.name, customIcons)}
+                        src={getImageLogo(`${img.name}:${img.tag}`, customIcons)}
                         alt={img.name}
                         className="h-8 w-8 object-cover"
                         fallback={<HardDrive className="h-4 w-4 text-gray-500 dark:text-gray-400" />}

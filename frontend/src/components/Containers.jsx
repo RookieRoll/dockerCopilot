@@ -18,9 +18,10 @@ import {
   Trash2,
   Save
 } from 'lucide-react'
-import { containerAPI, progressAPI, imageAPI } from '../api/client.js'
+import { containerAPI, progressAPI } from '../api/client.js'
 import { cn } from '../utils/cn.js'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
+import { IMAGE_ICON_MAX_BYTES, IMAGE_ICON_SUPPORTED_FORMATS, useImageIcons, uploadImageIcon } from '../hooks/useImageIcons.js'
 import { getImageLogo } from '../config/imageLogos.js'
 import icons8Img from '../assets/icons8.png'
 import { formatContainerPort, getConfiguredPortUrl, getContainerPortTitle, getContainerPortUrl, isHostNetworkMode, normalizeConfiguredPorts, normalizeContainerPorts, stopContainerPortEvent } from '../utils/containerPorts.js'
@@ -287,44 +288,7 @@ export function Containers() {
   })
 
   // 获取自定义图标配置
-  const { data: customIcons = {} } = useQuery({
-    queryKey: ['customIcons'],
-    queryFn: async () => {
-      console.log('[Debug] 开始从服务器获取图标配置...')
-      try {
-        const response = await imageAPI.getIcons()
-        console.log('[Debug] 图标API响应:', response.data)
-        if (response.data.code === 200 || response.data.code === 0) {
-          const icons = response.data.data || {}
-          console.log('[Debug] 获取到的图标数据:', icons)
-          // update localStorage
-          localStorage.setItem('docker_copilot_image_logos', JSON.stringify(icons))
-          return icons
-        }
-      } catch (err) {
-        console.error('[Debug] 获取图标失败:', err)
-      }
-      return {}
-    },
-    // 初始数据尝试从localStorage获取，避免闪烁
-    initialData: () => {
-      const saved = localStorage.getItem('docker_copilot_image_logos')
-      if (saved) {
-        try {
-          const parsed = JSON.parse(saved)
-          // 只有当有实际数据时才作为初始数据
-          if (Object.keys(parsed).length > 0) {
-            return parsed
-          }
-        } catch (e) {
-          console.error('解析本地图标配置失败:', e)
-        }
-      }
-      return undefined
-    },
-    // 即使有初始数据，也立即在后台刷新
-    refetchOnMount: true,
-  })
+  const { data: customIcons = {}, isError: customIconsError, error: customIconsQueryError } = useImageIcons()
 
   const handleContainerAction = async (containerId, action) => {
     try {
@@ -843,6 +807,13 @@ export function Containers() {
         }
       `}</style>
 
+      {customIconsError && (
+        <div role="alert" className="mb-4 rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-800 dark:border-red-900 dark:bg-red-900/20 dark:text-red-200">
+          图标映射加载失败：{customIconsQueryError?.message || '请检查服务后重试'}
+          <button className="ml-3 underline" onClick={() => queryClient.invalidateQueries({ queryKey: ['customIcons'] })}>重试</button>
+        </div>
+      )}
+
       {/* 自定义确认弹窗 */}
       {confirmModal.isOpen && (
         <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4">
@@ -1194,26 +1165,7 @@ export function Containers() {
                         {/* 图标 */}
                         <div className="flex-shrink-0">
                           {(() => {
-                            let iconUrl = container.iconUrl;
-                            if (!iconUrl && container.usingImage) {
-                              const builtInLogo = getImageLogo(container.usingImage);
-                              if (builtInLogo) {
-                                iconUrl = builtInLogo;
-                              } else {
-                                // 如果没有内置logo，则尝试从用户自定义中查找
-                                // const imageLogos = JSON.parse(localStorage.getItem('docker_copilot_image_logos') || '{}');
-                                // 使用 React Query 获取的数据
-                                const imageLogos = customIcons;
-
-                                for (const [imageName, logoUrl] of Object.entries(imageLogos)) {
-                                  if (container.usingImage.startsWith(imageName) ||
-                                    container.usingImage.includes(`${imageName}:`)) {
-                                    iconUrl = logoUrl;
-                                    break;
-                                  }
-                                }
-                              }
-                            }
+                            const iconUrl = container.iconUrl || getImageLogo(container.usingImage, customIcons);
 
                             if (iconUrl) {
                               return (
@@ -1621,17 +1573,7 @@ function ContainerDetailModal({ container, onClose, onRename, onUpdate, onAction
   const [isUploadingIcon, setIsUploadingIcon] = useState(false)
 
   // 获取自定义图标配置
-  const { data: customIcons = {} } = useQuery({
-    queryKey: ['customIcons'],
-    queryFn: async () => {
-      const response = await imageAPI.getIcons()
-      if (response.data.code === 200 || response.data.code === 0) {
-        return response.data.data || {}
-      }
-      return {}
-    },
-    initialData: () => JSON.parse(localStorage.getItem('docker_copilot_image_logos') || '{}'),
-  })
+  const { data: customIcons = {} } = useImageIcons()
 
   // 当容器切换时，更新表单字段的值
   React.useEffect(() => {
@@ -1648,7 +1590,7 @@ function ContainerDetailModal({ container, onClose, onRename, onUpdate, onAction
         const updatedContainer = containers.find(c => c.id === container.id);
         if (updatedContainer) {
           // 检查是否有镜像图标
-          const imageLogos = JSON.parse(localStorage.getItem('docker_copilot_image_logos') || '{}');
+          const imageLogos = customIcons;
 
           // 如果容器没有自定义图标，则查找镜像图标
           if (!updatedContainer.iconUrl) {
@@ -1682,23 +1624,35 @@ function ContainerDetailModal({ container, onClose, onRename, onUpdate, onAction
     }, 3000); // 每3秒获取一次最新状态
 
     return () => clearInterval(interval);
-  }, [container.id, queryClient]);
+  }, [container.id, queryClient, customIcons]);
 
   const handleIconUpload = async (event) => {
     const file = event.target.files[0]
     if (!file) return
 
-    // 限制文件大小 (例如 2MB)
-    if (file.size > 2 * 1024 * 1024) {
+    const extension = file.name.split('.').pop()?.toLowerCase()
+    if (file.size > IMAGE_ICON_MAX_BYTES) {
       setConfirmModal({
         isOpen: true,
         title: '上传失败',
-        message: '图标文件大小不能超过 2MB',
+        message: '图标文件大小不能超过 10 MiB',
         onConfirm: () => setConfirmModal({ isOpen: false }),
         onCancel: null,
         type: 'danger'
       })
       event.target.value = '' // 重置 input
+      return
+    }
+    if (!IMAGE_ICON_SUPPORTED_FORMATS.includes(extension)) {
+      setConfirmModal({
+        isOpen: true,
+        title: '上传失败',
+        message: '仅支持 PNG、JPG、JPEG、WEBP 和 GIF 格式',
+        onConfirm: () => setConfirmModal({ isOpen: false }),
+        onCancel: null,
+        type: 'danger'
+      })
+      event.target.value = ''
       return
     }
 
@@ -1708,37 +1662,15 @@ function ContainerDetailModal({ container, onClose, onRename, onUpdate, onAction
       // 如果有自定义镜像名配置(容器更新时可能改变)，优先使用新的
       const targetImageName = imageNameAndTag || currentContainer.usingImage
 
-      const response = await imageAPI.uploadIcon(file, targetImageName, currentContainer.name)
-
-      if (response.data.code === 200 || response.data.code === 0) {
-        // 上传成功，更新 localStorage
-        const filename = response.data.data // 后端返回的文件名
-        if (filename) {
-          const newPath = `/src/config/image/${filename}`
-          const imageLogos = JSON.parse(localStorage.getItem('docker_copilot_image_logos') || '{}')
-
-          // 更新映射: 镜像名 -> 新路径
-          imageLogos[targetImageName] = newPath
-          localStorage.setItem('docker_copilot_image_logos', JSON.stringify(imageLogos))
-
-          // 强制更新当前容器视图
-          setCurrentContainer(prev => ({
-            ...prev,
-            iconUrl: newPath
-          }))
-
-          // 触发全局事件以便其他组件（如列表）更新
-          window.dispatchEvent(new Event('storage'))
-
-          // 无效化查询以刷新列表和图标
-          await queryClient.invalidateQueries(['containers'])
-          await queryClient.invalidateQueries(['customIcons'])
-
-          console.log('✅ 图标上传成功并已应用')
-        }
-      } else {
-        throw new Error(response.data.msg || '上传失败')
-      }
+      const { url: newPath } = await uploadImageIcon({
+        file,
+        imageName: targetImageName,
+        containerName: currentContainer.name,
+        queryClient,
+      })
+      setCurrentContainer(prev => ({ ...prev, iconUrl: newPath }))
+      await queryClient.invalidateQueries({ queryKey: ['containers'] })
+      console.log('✅ 图标上传成功并已应用')
     } catch (error) {
       console.error('图标上传失败:', error)
       setConfirmModal({
@@ -1887,29 +1819,7 @@ function ContainerDetailModal({ container, onClose, onRename, onUpdate, onAction
 
     // 如果容器没有自定义图标，则查找镜像图标
     if (!iconUrl && currentContainer.usingImage) {
-      // 优先使用内置logo配置（不依赖localStorage）
-      const builtInLogo = getImageLogo(currentContainer.usingImage);
-      if (builtInLogo) {
-        iconUrl = builtInLogo;
-      } else {
-        // 如果没有内置logo，则尝试从用户自定义中查找
-        // const imageLogos = JSON.parse(localStorage.getItem('docker_copilot_image_logos') || '{}');
-        const imageLogos = customIcons;
-        const imageFullName = currentContainer.usingImage;
-
-        if (imageLogos[imageFullName]) {
-          iconUrl = imageLogos[imageFullName];
-        } else {
-          // 降级匹配逻辑
-          const imageName = imageFullName.split(':')[0];
-          for (const [imageId, logoUrl] of Object.entries(imageLogos)) {
-            if (imageId === imageName || imageFullName.startsWith(imageId)) {
-              iconUrl = logoUrl;
-              break;
-            }
-          }
-        }
-      }
+      iconUrl = getImageLogo(currentContainer.usingImage, customIcons)
     }
 
     const IconContent = () => {
@@ -1939,14 +1849,14 @@ function ContainerDetailModal({ container, onClose, onRename, onUpdate, onAction
       <div
         className="relative group cursor-pointer"
         onClick={() => !isUploadingIcon && fileInputRef.current?.click()}
-        title="点击上传自定义图标"
+        title="点击上传自定义图标（PNG/JPG/JPEG/WEBP/GIF，最大 10 MiB）"
       >
         <input
           type="file"
           ref={fileInputRef}
           onChange={handleIconUpload}
           className="hidden"
-          accept="image/png,image/jpeg,image/webp,image/svg+xml"
+          accept=".png,.jpg,.jpeg,.webp,.gif,image/png,image/jpeg,image/webp,image/gif"
         />
 
         <IconContent />
