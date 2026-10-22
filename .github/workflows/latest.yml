@@ -72,11 +72,15 @@ jobs:
 
       - name: Build for ${{ matrix.arch }}
         run: |
+          mkdir -p dist/linux/${{ matrix.arch }}
           CGO_ENABLED=0 GOOS=linux GOARCH=${{ matrix.arch }} go build -a --trimpath -ldflags="-w -s -X 'github.com/onlyLTY/dockerCopilot/internal/config.Version=${{ env.version }}' -X 'github.com/onlyLTY/dockerCopilot/internal/config.BuildDate=$(date)'" -o dist/linux/${{ matrix.arch }}/dockerCopilot-new .
 
-      - name: Compress binary
+      - name: Package root-level upgrade binary and checksum
         run: |
-          tar -czvf dockerCopilot-${{ matrix.arch }}.tar.gz dist/linux/${{ matrix.arch }}/dockerCopilot-new
+          tar -czf dockerCopilot-${{ matrix.arch }}.tar.gz -C dist/linux/${{ matrix.arch }} dockerCopilot-new
+          sha256sum dockerCopilot-${{ matrix.arch }}.tar.gz > dockerCopilot-${{ matrix.arch }}.tar.gz.sha256
+          tar -tzf dockerCopilot-${{ matrix.arch }}.tar.gz | grep -Fx dockerCopilot-new
+          sha256sum -c dockerCopilot-${{ matrix.arch }}.tar.gz.sha256
 
       - name: List current directory
         run: ls -la
@@ -107,6 +111,9 @@ jobs:
 
       - name: Upload Asset for ${{ matrix.arch }}
         run: |
-          gh release upload ${{ env.version }} dockerCopilot-${{ matrix.arch }}.tar.gz --clobber
+          gh release upload ${{ env.version }} \
+            dockerCopilot-${{ matrix.arch }}.tar.gz \
+            dockerCopilot-${{ matrix.arch }}.tar.gz.sha256 \
+            --clobber
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

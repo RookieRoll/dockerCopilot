@@ -36,15 +36,17 @@
 
 ### Linux 发布资产验收记录
 
-每次发布后在 Linux CI 对两个资产分别执行校验；发布流程产出并保留命令输出作为审核记录。当前仓库开发环境为 Windows，未在此处声称已完成 Linux 构建或资产验收。
+每次发布后在 Linux CI 对两个资产分别执行校验；发布流程产出并保留命令输出作为审核记录。2026-10-22 在 Windows 开发环境以 CGO_ENABLED=0 交叉构建并打包 Linux amd64/arm64，核对 SHA256、唯一包内路径及 ELF machine 字段；未执行两种架构的真实 Linux 容器启动。
 
 | 架构 | 资产 | 期望包内路径 | 本地验收状态 |
 | --- | --- | --- | --- |
-| amd64 | `dockerCopilot-amd64.tar.gz` + `.sha256` | 仅根目录 `dockerCopilot-new`，Linux ELF amd64 | 需在 Linux CI 验证 |
-| arm64 | `dockerCopilot-arm64.tar.gz` + `.sha256` | 仅根目录 `dockerCopilot-new`，Linux ELF arm64 | 需在 Linux CI 验证 |
+| amd64 | `dockerCopilot-amd64.tar.gz` + `.sha256` | 仅根目录 `dockerCopilot-new`，Linux ELF amd64 | 交叉构建、包布局和 ELF 架构通过；真实 Linux 启动待 CI |
+| arm64 | `dockerCopilot-arm64.tar.gz` + `.sha256` | 仅根目录 `dockerCopilot-new`，Linux ELF arm64 | 交叉构建、包布局和 ELF 架构通过；真实 Linux 启动待 CI |
 
 Linux 验收至少核对 `sha256sum -c dockerCopilot-<arch>.tar.gz.sha256`、`tar -tzf dockerCopilot-<arch>.tar.gz` 的唯一根条目，以及解包后二进制的 ELF 架构；不得在开发机上替换运行中的程序。
 
 ## 验证
 
 `go test ./internal/updater` 使用 `httptest` 验证版本检查与升级准备：状态码、HTML/空/超限/非法版本、代理路径、缓存隔离和期限、超时与取消；以及缺失/错误校验、压缩/展开上限、错误 ELF 架构、越界/链接/额外归档条目、唯一暂存和失败清理。sidecar 测试验证字段白名单、重复/异常字段拒绝、原子替换和权限。`sh scripts/test-start.sh` 验证候选 ready、提前退出回滚、失败结果保留和摘要不匹配拒绝。所有测试使用本地假数据，不下载真实 release，不执行或替换服务二进制。
+
+2026-10-22 本地启动脚本夹具在 Git Bash 通过（MINGW 下跳过 POSIX SIGKILL 子用例）；真实 Linux 信号行为仍由 Linux CI 验证。两个交叉构建资产均只有根条目 dockerCopilot-new，ELF machine 分别为 62（amd64）和 183（arm64）。
