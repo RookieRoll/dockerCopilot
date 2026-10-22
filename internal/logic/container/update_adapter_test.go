@@ -253,6 +253,54 @@ func TestUpdateStartFailureRetainsSnapshotAndObjectFactsForManualReview(t *testi
 	t.Fatalf("failed update did not settle with recovery facts: %+v", record)
 }
 
+func TestUpdateCleanupFailureCompletesWithWarning(t *testing.T) {
+	daemon := newUpdateAdapterDaemon(t, func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/v1.45/containers/") && strings.HasSuffix(r.URL.Path, "/json"):
+			id := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/v1.45/containers/"), "/json")
+			writeUpdateInspect(w, id)
+		case r.Method == http.MethodPost && r.URL.Path == "/v1.45/images/create":
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprintln(w, `{"status":"pulled"}`)
+		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/v1.45/images/") && strings.HasSuffix(r.URL.Path, "/json"):
+			writeUpdateImageInspect(w)
+		case r.Method == http.MethodPost && (strings.HasSuffix(r.URL.Path, "/stop") || strings.HasSuffix(r.URL.Path, "/rename") || strings.HasSuffix(r.URL.Path, "/start")):
+			w.WriteHeader(http.StatusNoContent)
+		case r.Method == http.MethodPost && r.URL.Path == "/v1.45/containers/create":
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprint(w, `{"Id":"new-container-id","Warnings":[]}`)
+		case r.Method == http.MethodDelete && r.URL.Path == "/v1.45/containers/c1":
+			http.Error(w, "daemon refused cleanup", http.StatusInternalServerError)
+		default:
+			http.NotFound(w, r)
+		}
+	})
+	defer daemon.Close()
+	ctx := newUpdateAdapterContext(t, daemon.URL, 1, 1)
+	defer func() { ctx.TaskRuntime.Close(); _ = ctx.DockerClient.Close() }()
+	resp, err := NewUpdateLogic(context.Background(), ctx).Update(updateReq("c1", "one", "nginx:latest", true))
+	if err != nil {
+		t.Fatal(err)
+	}
+	taskID := resp.Data.(map[string]string)["taskID"]
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		record, getErr := ctx.TaskStore.Get(taskID)
+		if getErr == nil && record.Status.Terminal() {
+			if record.Status != task.StatusSucceeded || record.Error != "" || record.RequiresAttention {
+				t.Fatalf("old-container cleanup failure changed replacement outcome: %+v", record)
+			}
+			if len(record.Warnings) != 1 || !strings.Contains(record.Warnings[0], "c1") || !strings.Contains(record.Warnings[0], "daemon refused cleanup") {
+				t.Fatalf("cleanup warning lost old ID or cause: %+v", record.Warnings)
+			}
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	record, _ := ctx.TaskStore.Get(taskID)
+	t.Fatalf("cleanup-failure task did not settle: %+v", record)
+}
+
 func newUpdateAdapterDaemon(t *testing.T, handler http.HandlerFunc) *httptest.Server {
 	t.Helper()
 	server := httptest.NewServer(handler)

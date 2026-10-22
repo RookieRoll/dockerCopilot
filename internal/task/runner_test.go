@@ -991,6 +991,45 @@ func TestRecoveryCheckpointAuthorizationEndsBeforeCallbackSettlement(t *testing.
 	}
 }
 
+func TestWarningDoesNotFailCommittedTaskWhenInitialWarningWriteFails(t *testing.T) {
+	store := newRunnerMemoryStore()
+	store.saveErr = func(_ Record, call int) error {
+		if call == 2 {
+			return errors.New("warning write temporarily failed")
+		}
+		return nil
+	}
+	var output bytes.Buffer
+	runner, err := NewRunner(store, RunnerOptions{MaxConcurrent: 1, QueueCapacity: 1, Output: &output})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(runner.Close)
+	id, err := runner.Submit(TaskSpec{
+		Record: runnerRecord(),
+		Run: func(_ context.Context, execution *Execution) error {
+			execution.Warning("old container cleanup failed")
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := runner.WaitIdle(testContext(t, time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	record, err := store.Get(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.Status != StatusSucceeded || record.Error != "" || len(record.Warnings) != 1 || record.Warnings[0] != "old container cleanup failed" {
+		t.Fatalf("non-fatal warning changed committed task outcome: %#v", record)
+	}
+	if !strings.Contains(output.String(), "warning was not durably saved yet") {
+		t.Fatalf("warning persistence failure was not reported: %q", output.String())
+	}
+}
+
 func TestRunnerImmediateRecoveryDoesNotRaceOwnerCancellation(t *testing.T) {
 	store := newRunnerMemoryStore()
 	runner := newTestRunner(t, store, RunnerOptions{MaxConcurrent: 4, QueueCapacity: 100})
@@ -1399,4 +1438,107 @@ func runBatchCounter(active, maxActive *atomic.Int32, err error) error {
 	time.Sleep(time.Millisecond)
 	active.Add(-1)
 	return err
+}
+
+func TestRunnerDurableCommitSurvivesDeadlineDuringCheckpoint(t *testing.T) {
+	store := newRunnerMemoryStore()
+	store.saveErr = func(record Record, _ int) error {
+		if record.Stage == "replacement-committed" {
+			time.Sleep(45 * time.Millisecond)
+		}
+		return nil
+	}
+	runner := newTestRunner(t, store, RunnerOptions{MaxConcurrent: 1, QueueCapacity: 1, TaskTimeout: 20 * time.Millisecond})
+	var recoveryCalls atomic.Int32
+	id, err := runner.Submit(TaskSpec{Record: runnerRecord(), Run: func(ctx context.Context, execution *Execution) error {
+		return execution.CriticalCommit("replacement-committed", nil)
+	}, Recover: func(context.Context, error) (Recovery, error) {
+		recoveryCalls.Add(1)
+		return Recovery{Status: "restored"}, nil
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := runner.WaitIdle(testContext(t, time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	record, err := store.Get(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.Status != StatusSucceeded || record.Stage != "replacement-committed" || recoveryCalls.Load() != 0 || len(record.Warnings) == 0 {
+		t.Fatalf("deadline rolled back durable commit: record=%#v recovery calls=%d", record, recoveryCalls.Load())
+	}
+}
+
+func TestRunnerCommittedTimeoutIsQueryableButRetainsWorkerUntilRunReturns(t *testing.T) {
+	store := newRunnerMemoryStore()
+	runner := newTestRunner(t, store, RunnerOptions{MaxConcurrent: 1, QueueCapacity: 1, TaskTimeout: 30 * time.Millisecond})
+	blocked := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseRun := func() { releaseOnce.Do(func() { close(release) }) }
+	var settled atomic.Bool
+	t.Cleanup(releaseRun)
+	firstID, err := runner.Submit(TaskSpec{
+		Record: runnerRecord(),
+		Run: func(ctx context.Context, execution *Execution) error {
+			if err := execution.CriticalCommit("replacement-committed", nil); err != nil && !errors.Is(err, context.DeadlineExceeded) {
+				return err
+			}
+			<-ctx.Done()
+			close(blocked)
+			<-release
+			return ctx.Err()
+		},
+		OnSettled: func() { settled.Store(true) },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondStarted := make(chan struct{})
+	secondID, err := runner.Submit(TaskSpec{Record: runnerRecord(), Run: func(context.Context, *Execution) error {
+		close(secondStarted)
+		return nil
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-blocked:
+	case <-time.After(time.Second):
+		t.Fatal("committed callback did not reach its blocked cleanup")
+	}
+	waitFor(t, func() bool {
+		record, getErr := store.Get(firstID)
+		return getErr == nil && record.Status == StatusSucceeded
+	})
+	if settled.Load() {
+		t.Fatal("settlement released the lease before the callback actually returned")
+	}
+	select {
+	case <-secondStarted:
+		t.Fatal("second mutation started while committed callback still held its worker")
+	default:
+	}
+	releaseRun()
+	if err := runner.WaitIdle(testContext(t, time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if !settled.Load() {
+		t.Fatal("settlement callback did not run after the first Run returned")
+	}
+	select {
+	case <-secondStarted:
+	case <-time.After(time.Second):
+		t.Fatal("second task did not start after the first callback returned")
+	}
+	second, err := store.Get(secondID)
+	if err != nil || second.Status != StatusSucceeded {
+		t.Fatalf("second task status=%#v err=%v", second, err)
+	}
+	first, err := store.Get(firstID)
+	if err != nil || first.Status != StatusSucceeded || len(first.Warnings) == 0 {
+		t.Fatalf("first task commit/warning=%#v err=%v", first, err)
+	}
 }

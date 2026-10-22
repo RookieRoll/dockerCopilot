@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -255,12 +256,26 @@ func (r *Runner) execute(q queuedTask) {
 	case out := <-done:
 		if cause := e.failure(); cause != nil {
 			out.err = cause
-		} else if ctx.Err() != nil {
-			out.err = ctx.Err()
+		} else if deadlineErr := taskContextError(ctx); deadlineErr != nil {
+			if e.isCommitted() {
+				e.Warning("主操作已持久提交，但任务期限已到；清理结果尚未确认")
+				out.err = nil
+			} else {
+				out.err = deadlineErr
+			}
 		}
-		r.finishExecution(e, out, q.spec.Recover, ctx.Err() != nil || out.panicked, q.spec.OnHandoff, q.spec.RollbackHandoff)
+		r.finishExecution(e, out, q.spec.Recover, (taskContextError(ctx) != nil && !e.isCommitted()) || out.panicked, q.spec.OnHandoff, q.spec.RollbackHandoff)
 		cancel()
 	case <-ctx.Done():
+		if e.isCommitted() {
+			// The primary result is already durable. Expose that fact promptly;
+			// the worker and its lease remain occupied until Run really returns.
+			e.Warning("主操作已持久提交，但任务期限已到；清理结果尚未确认")
+			r.finish(e, StatusSucceeded, nil, Recovery{Status: "not-needed"}, false)
+			<-done
+			cancel()
+			return
+		}
 		cause := e.failure()
 		if cause == nil {
 			cause = ctx.Err()
@@ -285,6 +300,14 @@ func (r *Runner) execute(q queuedTask) {
 		out := <-done
 		if criticalErr := e.failure(); criticalErr != nil {
 			cause = errors.Join(cause, criticalErr)
+		}
+		if e.isCommitted() && e.failure() == nil && !out.panicked {
+			// The primary mutation was durably committed before the deadline.
+			// Cleanup warnings are retained by the callback; do not roll back a
+			// committed replacement just because its cleanup budget expired.
+			r.finish(e, StatusSucceeded, nil, Recovery{Status: "not-needed"}, false)
+			cancel()
+			return
 		}
 		if out.err != nil {
 			cause = errors.Join(cause, out.err)
@@ -672,6 +695,7 @@ type Execution struct {
 	finalized   bool
 	criticalErr error
 	recoveryCtx context.Context
+	committed   bool
 }
 
 func (e *Execution) TaskID() string { e.mu.Lock(); defer e.mu.Unlock(); return e.record.TaskID }
@@ -700,7 +724,49 @@ func (e *Execution) Progress(stage string, percentage int, message string) error
 	return nil
 }
 
+// Warning records a non-fatal result such as cleanup that failed after the
+// primary operation committed. A warning persistence error does not turn a
+// committed operation into a failed task; the finalizer will retry saving the
+// in-memory warning and report a final durability failure separately.
+func (e *Execution) Warning(message string) {
+	message = strings.TrimSpace(message)
+	if message == "" {
+		return
+	}
+	e.mu.Lock()
+	if e.finalized {
+		report, id := e.report, e.record.TaskID
+		e.mu.Unlock()
+		if report != nil {
+			report("task %s warning arrived after finalization and was not recorded: %s\n", id, message)
+		}
+		return
+	}
+	next := cloneRecord(e.record)
+	next.Warnings = append(next.Warnings, message)
+	next.UpdatedAt = e.now().UTC()
+	e.record = next
+	err := e.store.Save(next)
+	report, id := e.report, next.TaskID
+	e.mu.Unlock()
+	if err != nil && report != nil {
+		report("task %s warning was not durably saved yet: %v\n", id, err)
+	}
+}
+
 func (e *Execution) Critical(stage string, mutate func(*Record)) error {
+	return e.critical(stage, mutate, false)
+}
+
+// CriticalCommit atomically persists a primary-operation commit checkpoint
+// and records the commit under the same execution lock. It is for single-task
+// operations whose later steps are cleanup only; batch items must not mark
+// their parent task committed.
+func (e *Execution) CriticalCommit(stage string, mutate func(*Record)) error {
+	return e.critical(stage, mutate, true)
+}
+
+func (e *Execution) critical(stage string, mutate func(*Record), commit bool) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if e.finalized {
@@ -709,7 +775,8 @@ func (e *Execution) Critical(stage string, mutate func(*Record)) error {
 	if e.criticalErr != nil {
 		return e.criticalErr
 	}
-	if err := e.ctx.Err(); err != nil {
+	if err := taskContextError(e.ctx); err != nil {
+		e.cancel()
 		return err
 	}
 	next := cloneRecord(e.record)
@@ -733,12 +800,22 @@ func (e *Execution) Critical(stage string, mutate func(*Record)) error {
 		return e.criticalErr
 	}
 	e.record = next
+	if commit {
+		e.committed = true
+	}
 	// A deadline may expire while persistence is in progress. Do not let the
 	// callback begin the described operation after its budget has elapsed.
-	if err := e.ctx.Err(); err != nil {
+	if err := taskContextError(e.ctx); err != nil {
+		e.cancel()
 		return err
 	}
 	return nil
+}
+
+func (e *Execution) isCommitted() bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.committed && e.criticalErr == nil
 }
 
 // MarkPendingInstall durably records the verified handoff facts while the
@@ -928,4 +1005,17 @@ func (r *Runner) SubmitBatch(record Record, operations []BatchOperation, recover
 		return errors.Join(failures...)
 	}
 	return r.Submit(TaskSpec{Record: record, Run: run, Recover: recoverFn})
+}
+
+func taskContextError(ctx context.Context) error {
+	if ctx == nil {
+		return context.Canceled
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if deadline, ok := ctx.Deadline(); ok && !time.Now().Before(deadline) {
+		return context.DeadlineExceeded
+	}
+	return nil
 }

@@ -53,6 +53,7 @@ type UpdateRecoveryResult struct {
 // destructive step unless their required facts have been durably recorded.
 type UpdateCallbacks struct {
 	Progress     func(stage string, percentage int, message string) error
+	Warning      func(message string)
 	SaveSnapshot func([]byte) error
 	Checkpoint   func(UpdateCheckpoint) error
 	OnCreated    func(string) error
@@ -69,7 +70,7 @@ const updateTaskLabel = "io.dockercopilot.update-task"
 
 // UpdateWithOptions performs update preparation and replacement with a frozen
 // image ID. deleteOld controls whether the renamed original is removed after
-// the replacement is started.
+// the replacement is committed and, when applicable, passes runtime validation.
 func (s *Service) UpdateWithOptions(ctx context.Context, id, name, imageRef string, deleteOld bool, taskID string, callbacks UpdateCallbacks) error {
 	if s == nil || s.docker == nil {
 		return errors.New("container Docker client is unavailable")
@@ -164,6 +165,9 @@ func (s *Service) UpdateWithOptions(ctx context.Context, id, name, imageRef stri
 			return errors.New("update checkpoint stage is required")
 		}
 		return callbacks.Checkpoint(value)
+	}
+	warn := func(message, oldID string, cause error) {
+		s.updateWarning(callbacks.Warning, message, oldID, cause)
 	}
 
 	if err := publish("preflight", 2, "正在检查容器并保存更新快照"); err != nil {
@@ -294,21 +298,54 @@ func (s *Service) UpdateWithOptions(ctx context.Context, id, name, imageRef stri
 			return fail("validating-new", "新容器未通过运行验证", err)
 		}
 	}
+	if err := checkpoint(UpdateCheckpoint{Stage: "replacement-committed", SnapshotRef: snapshotRef, OldContainerID: canonicalID, NewContainerID: created.ID, PreviousImageID: before.Image, ResolvedImageID: resolved.ID, BackupName: backupName}); err != nil {
+		return fail("replacement-commit", "新容器已验证，但提交检查点保存失败；未清理旧容器", err)
+	}
 	if deleteOld {
-		if err := checkpoint(UpdateCheckpoint{Stage: "removing-old", SnapshotRef: snapshotRef, OldContainerID: canonicalID, PreviousImageID: before.Image, ResolvedImageID: resolved.ID, BackupName: backupName}); err != nil {
-			return fail("removing-old", "持久化旧容器清理检查点失败，旧容器仍保留", err)
+		cleanupStarted := true
+		if err := publish("removing-old", 96, "替换已提交，正在清理旧容器"); err != nil {
+			cleanupStarted = false
+			warn("更新已提交，但旧容器清理阶段未能保存；旧容器已保留", canonicalID, err)
 		}
-		if err := s.docker.ContainerRemove(ctx, canonicalID, container.RemoveOptions{}); err != nil {
-			return fail("cleanup-old", "新容器已启动，但删除旧容器失败", err)
-		}
-		if err := checkpoint(UpdateCheckpoint{Stage: "old-removed", SnapshotRef: snapshotRef, OldContainerID: canonicalID, PreviousImageID: before.Image, ResolvedImageID: resolved.ID, BackupName: backupName}); err != nil {
-			return fail("old-removed", "旧容器已删除但清理检查点未能保存", err)
+		if cleanupStarted {
+			if err := s.docker.ContainerRemove(ctx, canonicalID, container.RemoveOptions{}); err != nil {
+				cleanupState := s.inspectCleanupState(ctx, canonicalID)
+				warn("更新已提交，但旧容器清理结果需核对（"+cleanupState+"）", canonicalID, err)
+			} else if err := publish("old-removed", 99, "新容器已提交，旧容器已清理"); err != nil {
+				warn("旧容器已删除，但清理结果未能写入任务进度", canonicalID, err)
+			}
 		}
 	}
 	if err := publish("completed", 100, validationResult); err != nil {
-		return fail("replacement-prepared", "更新阶段保存失败", err)
+		warn("更新已提交，但最终进度未能写入任务记录", canonicalID, err)
 	}
 	return nil
+}
+
+func (s *Service) inspectCleanupState(ctx context.Context, oldID string) string {
+	inspectCtx := ctx
+	cancel := func() {}
+	if ctx == nil || ctx.Err() != nil {
+		inspectCtx, cancel = context.WithTimeout(context.Background(), 5*time.Second)
+	}
+	defer cancel()
+	_, err := s.docker.ContainerInspect(inspectCtx, oldID)
+	switch {
+	case err == nil:
+		return "旧容器仍存在"
+	case cerrdefs.IsNotFound(err):
+		return "旧容器已不存在"
+	default:
+		return "无法确认旧容器状态"
+	}
+}
+
+func (s *Service) updateWarning(callback func(string), message, oldID string, cause error) {
+	if callback == nil {
+		logx.Errorf("container update cleanup warning oldContainerID=%s: %s: %v", oldID, message, cause)
+		return
+	}
+	callback(fmt.Sprintf("%s（旧容器ID %s）：%v", message, oldID, cause))
 }
 
 // RecoverUpdate uses only the private inspect snapshot and durable identity
@@ -340,9 +377,9 @@ func (s *Service) RecoverUpdate(ctx context.Context, taskID string, snapshotByte
 	switch stage {
 	case "", "preflight", "snapshot", "snapshot-saved", "pulling-image", "resolving-image", "image-resolved":
 		return UpdateRecoveryResult{Status: "not-needed", Detail: "更新尚未进入旧容器修改阶段"}, nil
-	case "old-removed", "cleanup-old":
-		return unknown("旧容器可能已删除；不会通过名称重建或删除容器，请人工核对Docker状态"), nil
-	case "stopping-old", "old-stopped", "renaming-old", "old-renamed", "creating-new", "created-new", "starting-new", "new-started", "validating-new", "removing-old", "recovery-new-discovered", "recovery-removing-new", "recovery-restoring-name", "recovery-starting-old", "recovery-stopping-old":
+	case "replacement-committed", "removing-old", "old-removed", "cleanup-old":
+		return UpdateRecoveryResult{Status: "not-needed", Detail: "新容器替换已提交；清理结果需单独核对，不回滚已提交替换"}, nil
+	case "stopping-old", "old-stopped", "renaming-old", "old-renamed", "creating-new", "created-new", "starting-new", "new-started", "validating-new", "recovery-new-discovered", "recovery-removing-new", "recovery-restoring-name", "recovery-starting-old", "recovery-stopping-old":
 	default:
 		return unknown("更新阶段无法识别；未执行自动恢复"), nil
 	}

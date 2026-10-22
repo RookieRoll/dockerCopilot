@@ -117,6 +117,7 @@ func TestUpdateCriticalSnapshotFailuresPreventDockerMutation(t *testing.T) {
 func TestRecoverUpdateRestoresOnlyVerifiedReplacement(t *testing.T) {
 	for _, tc := range []struct {
 		name               string
+		stage              string
 		recordedNewID      string
 		candidateLabel     string
 		candidateImage     string
@@ -138,6 +139,8 @@ func TestRecoverUpdateRestoresOnlyVerifiedReplacement(t *testing.T) {
 		{name: "image mismatch", candidateLabel: "task-recovery", candidateImage: "sha256:other-image", nameOccupant: "new-id", wantStatus: "unknown"},
 		{name: "task label mismatch", recordedNewID: "new-id", candidateLabel: "other-task", candidateImage: "sha256:resolved-image-id", nameOccupant: "new-id", wantStatus: "unknown"},
 		{name: "multiple candidates", candidateLabel: "task-recovery", candidateImage: "sha256:resolved-image-id", nameOccupant: "new-id", wantStatus: "unknown", multipleCandidates: true},
+		{name: "durable commit is not rolled back", stage: "replacement-committed", candidateLabel: "task-recovery", candidateImage: "sha256:resolved-image-id", nameOccupant: "new-id", wantStatus: "not-needed"},
+		{name: "cleanup stage is not rolled back", stage: "removing-old", candidateLabel: "task-recovery", candidateImage: "sha256:resolved-image-id", nameOccupant: "new-id", wantStatus: "not-needed"},
 		{name: "original was stopped", recordedNewID: "new-id", candidateLabel: "task-recovery", candidateImage: "sha256:resolved-image-id", nameOccupant: "new-id", wantStatus: "restored", wantRemove: true, wantRename: true, snapshotStopped: true},
 		{name: "start response did not restore running state", recordedNewID: "new-id", candidateLabel: "task-recovery", candidateImage: "sha256:resolved-image-id", nameOccupant: "new-id", wantStatus: "unknown", wantRemove: true, wantRename: true, wantStart: true, ignoreStart: true},
 		{name: "recovery checkpoint failure", recordedNewID: "new-id", candidateLabel: "task-recovery", candidateImage: "sha256:resolved-image-id", nameOccupant: "new-id", wantStatus: "unknown", failCheckpoint: true, wantError: true},
@@ -207,12 +210,16 @@ func TestRecoverUpdateRestoresOnlyVerifiedReplacement(t *testing.T) {
 			}
 			defer reserved.Lease.Release()
 			var discoveredID string
+			stage := tc.stage
+			if stage == "" {
+				stage = "created-new"
+			}
 			snapshot := []byte(updateInspectJSON)
 			if tc.snapshotStopped {
 				snapshot = []byte(strings.Replace(string(snapshot), `"Running":true`, `"Running":false`, 1))
 			}
 			result, err := service.RecoverUpdate(context.Background(), "task-recovery", snapshot, UpdateRecoveryState{
-				Stage: "created-new", OldContainerID: "old-canonical-id", NewContainerID: tc.recordedNewID, BackupName: "web-backup-task", ResolvedImageID: "sha256:resolved-image-id",
+				Stage: stage, OldContainerID: "old-canonical-id", NewContainerID: tc.recordedNewID, BackupName: "web-backup-task", ResolvedImageID: "sha256:resolved-image-id",
 			}, func(checkpoint UpdateCheckpoint) error {
 				if checkpoint.Stage == "recovery-new-discovered" {
 					discoveredID = checkpoint.NewContainerID
@@ -449,6 +456,61 @@ func TestUpdateUsesDockerDefaultStopOptionsWhenUnset(t *testing.T) {
 	}
 }
 
+func TestUpdateCleanupFailureAfterCommitIsSuccessfulWithWarning(t *testing.T) {
+	var committed atomic.Bool
+	var cleanupCalls atomic.Int32
+	var cleanupWarning string
+	service := newUpdateTestService(t, func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/_ping":
+			w.Header().Set("API-Version", "1.45")
+			fmt.Fprint(w, "OK")
+		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/v1.45/containers/") && strings.HasSuffix(r.URL.Path, "/json"):
+			id := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/v1.45/containers/"), "/json")
+			if id == "new-id" {
+				fmt.Fprint(w, `{"Id":"new-id","Name":"/web","Image":"sha256:resolved-image-id","State":{"Running":true,"Status":"running","StartedAt":"2026-10-22T00:00:00Z"},"Config":{"Image":"sha256:resolved-image-id"},"HostConfig":{},"NetworkSettings":{"Networks":{}}}`)
+			} else {
+				serveUpdateInspect(w)
+			}
+		case r.Method == http.MethodPost && r.URL.Path == "/v1.45/images/create":
+			fmt.Fprintln(w, `{"status":"pulled"}`)
+		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/v1.45/images/") && strings.HasSuffix(r.URL.Path, "/json"):
+			fmt.Fprint(w, `{"Id":"sha256:resolved-image-id"}`)
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/stop"), r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/rename"), r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/start"):
+			w.WriteHeader(http.StatusNoContent)
+		case r.Method == http.MethodPost && r.URL.Path == "/v1.45/containers/create":
+			fmt.Fprint(w, `{"Id":"new-id","Warnings":[]}`)
+		case r.Method == http.MethodDelete && r.URL.Path == "/v1.45/containers/old-canonical-id":
+			cleanupCalls.Add(1)
+			if !committed.Load() {
+				t.Error("old container cleanup started before replacement commit checkpoint")
+			}
+			http.Error(w, "daemon cleanup refused", http.StatusInternalServerError)
+		default:
+			http.NotFound(w, r)
+		}
+	})
+	callbacks := testUpdateCallbacks(func(string) error { return nil })
+	callbacks.Validation = UpdateValidationOptions{RunningObservation: time.Millisecond, PollInterval: time.Millisecond}
+	callbacks.Checkpoint = func(checkpoint UpdateCheckpoint) error {
+		if checkpoint.Stage == "replacement-committed" {
+			committed.Store(true)
+		}
+		return nil
+	}
+	callbacks.Warning = func(message string) { cleanupWarning = message }
+	err := service.UpdateWithOptions(context.Background(), "old-canonical-id", "web", "web:next", true, "task-cleanup-warning", callbacks)
+	if err != nil {
+		t.Fatalf("cleanup failure changed successful replacement into task error: %v", err)
+	}
+	if !committed.Load() || cleanupCalls.Load() != 1 {
+		t.Fatalf("cleanup ordering/calls: committed=%v cleanupCalls=%d", committed.Load(), cleanupCalls.Load())
+	}
+	if !strings.Contains(cleanupWarning, "old-canonical-id") || !strings.Contains(cleanupWarning, "daemon cleanup refused") {
+		t.Fatalf("cleanup failure warning omitted retained old ID or cause: %q", cleanupWarning)
+	}
+}
+
 func TestUpdateValidatesHealthyOrContinuouslyRunningReplacement(t *testing.T) {
 	tests := []struct {
 		name            string
@@ -646,5 +708,73 @@ func TestUpdateKeepsOriginallyStoppedReplacementStopped(t *testing.T) {
 	}
 	if !strings.Contains(completed, "保持停止") || !strings.Contains(completed, "未执行运行验证") {
 		t.Fatalf("result did not explain stopped-container behavior: %q", completed)
+	}
+}
+
+func TestUpdateCleanupDeadlineDoesNotRollbackCommittedReplacement(t *testing.T) {
+	deleteStarted := make(chan struct{})
+	var oldStartCalls atomic.Int32
+	var cleanupWarning string
+	service := newUpdateTestService(t, func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/_ping":
+			w.Header().Set("API-Version", "1.45")
+			fmt.Fprint(w, "OK")
+		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/v1.45/containers/") && strings.HasSuffix(r.URL.Path, "/json"):
+			id := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/v1.45/containers/"), "/json")
+			if id == "new-id" {
+				fmt.Fprint(w, `{"Id":"new-id","Name":"/web","Image":"sha256:resolved-image-id","State":{"Running":true,"Status":"running","StartedAt":"2026-10-22T00:00:00Z"},"Config":{"Image":"sha256:resolved-image-id"},"HostConfig":{},"NetworkSettings":{"Networks":{}}}`)
+			} else {
+				serveUpdateInspect(w)
+			}
+		case r.Method == http.MethodPost && r.URL.Path == "/v1.45/images/create":
+			fmt.Fprintln(w, `{"status":"pulled"}`)
+		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/v1.45/images/") && strings.HasSuffix(r.URL.Path, "/json"):
+			fmt.Fprint(w, `{"Id":"sha256:resolved-image-id"}`)
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/stop"), r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/rename"):
+			w.WriteHeader(http.StatusNoContent)
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/start"):
+			if strings.Contains(r.URL.Path, "old-canonical-id") {
+				oldStartCalls.Add(1)
+			}
+			w.WriteHeader(http.StatusNoContent)
+		case r.Method == http.MethodPost && r.URL.Path == "/v1.45/containers/create":
+			fmt.Fprint(w, `{"Id":"new-id","Warnings":[]}`)
+		case r.Method == http.MethodDelete && r.URL.Path == "/v1.45/containers/old-canonical-id":
+			close(deleteStarted)
+			<-r.Context().Done()
+		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/v1.45/containers/"):
+			serveUpdateInspect(w)
+		default:
+			http.NotFound(w, r)
+		}
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	callbacks := testUpdateCallbacks(func(string) error { return nil })
+	callbacks.Validation = UpdateValidationOptions{RunningObservation: time.Millisecond, PollInterval: time.Millisecond}
+	callbacks.Warning = func(message string) { cleanupWarning = message }
+	finished := make(chan error, 1)
+	go func() {
+		finished <- service.UpdateWithOptions(ctx, "old-canonical-id", "web", "web:next", true, "task-cleanup-deadline", callbacks)
+	}()
+	select {
+	case <-deleteStarted:
+	case <-time.After(time.Second):
+		t.Fatal("cleanup request did not start")
+	}
+	select {
+	case err := <-finished:
+		if err != nil {
+			t.Fatalf("cleanup deadline changed committed update result: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("update did not finish after cleanup deadline")
+	}
+	if oldStartCalls.Load() != 0 {
+		t.Fatalf("old container was restarted after committed replacement: %d starts", oldStartCalls.Load())
+	}
+	if !strings.Contains(cleanupWarning, "旧容器仍存在") {
+		t.Fatalf("cleanup warning did not report independently inspected old-container state: %q", cleanupWarning)
 	}
 }

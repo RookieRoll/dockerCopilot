@@ -13,6 +13,7 @@ import (
 
 	"github.com/google/uuid"
 	containerService "github.com/onlyLTY/dockerCopilot/internal/container"
+	"github.com/onlyLTY/dockerCopilot/internal/observability"
 	"github.com/onlyLTY/dockerCopilot/internal/operation"
 	"github.com/onlyLTY/dockerCopilot/internal/svc"
 	"github.com/onlyLTY/dockerCopilot/internal/task"
@@ -112,7 +113,8 @@ func (l *UpdateLogic) Update(req *types.ContainerUpdateReq) (resp *types.Resp, e
 		Record: task.Record{
 			Type: "container-update", Name: req.ContainerName, ImageRef: imageNameAndTag,
 			OldContainerID: req.Id, ContainerIDs: []string{req.Id},
-			TaskID: taskID, Options: task.TaskOptions{Image: imageNameAndTag, DeleteOldContainer: &deleteOption, HealthWaitSeconds: durationSeconds(l.healthcheckWait)},
+			TaskID: taskID, RequestID: observability.RequestIDFromContext(l.ctx),
+			Options: task.TaskOptions{Image: imageNameAndTag, DeleteOldContainer: &deleteOption, HealthWaitSeconds: durationSeconds(l.healthcheckWait)},
 		},
 		OnAccepted: func() error {
 			gate, acquireErr := l.mutationGate.Acquire(context.Background(), taskID)
@@ -149,6 +151,7 @@ func (l *UpdateLogic) Update(req *types.ContainerUpdateReq) (resp *types.Resp, e
 			}
 			err := l.service.UpdateWithOptions(ctx, req.Id, req.ContainerName, imageNameAndTag, delOldContainer, execution.TaskID(), containerService.UpdateCallbacks{
 				Progress: execution.Progress,
+				Warning:  execution.Warning,
 				SaveSnapshot: func(snapshot []byte) error {
 					if l.taskStore == nil {
 						return errors.New("private task snapshot store is unavailable")
@@ -156,7 +159,7 @@ func (l *UpdateLogic) Update(req *types.ContainerUpdateReq) (resp *types.Resp, e
 					return l.taskStore.SaveSnapshot(execution.TaskID(), snapshot)
 				},
 				Checkpoint: func(checkpoint containerService.UpdateCheckpoint) error {
-					return execution.Critical(checkpoint.Stage, func(record *task.Record) {
+					mutate := func(record *task.Record) {
 						if checkpoint.SnapshotRef != "" {
 							record.SnapshotRef = checkpoint.SnapshotRef
 						}
@@ -178,7 +181,11 @@ func (l *UpdateLogic) Update(req *types.ContainerUpdateReq) (resp *types.Resp, e
 							record.BackupContainerName = checkpoint.BackupName
 						}
 						record.ProtectedNames = appendTaskIdentity(record.ProtectedNames, req.ContainerName)
-					})
+					}
+					if checkpoint.Stage == "replacement-committed" {
+						return execution.CriticalCommit(checkpoint.Stage, mutate)
+					}
+					return execution.Critical(checkpoint.Stage, mutate)
 				},
 				OnCreated: func(newID string) error {
 					return execution.Critical("created-new-container", func(record *task.Record) {
