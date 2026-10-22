@@ -92,7 +92,7 @@ export function About({ versionState = {} }) {
               如果任务显示失败/中断，或长时间处于“待确认”，先查看任务错误和服务日志，不要重复提交升级。记录任务 ID，停止管理容器，备份当前程序、交接标记/结果文件和旧程序副本；确认旧程序可用后才将 `.dockerCopilot-previous-&lt;handoff_id&gt;` 恢复为 `dockerCopilot` 并重启服务。不要删除任务数据目录或覆盖唯一备份。
             </p>
             <p className="mt-2 text-xs text-amber-900/80 dark:text-amber-200/80">
-              <a className="underline underline-offset-2" href="https://github.com/RookieRoll/dockerCopilot/blob/main/docs/program-update.md#人工恢复" target="_blank" rel="noopener noreferrer">打开完整人工恢复步骤</a>
+              <a className="underline underline-offset-2" href="https://github.com/RookieRoll/dockerCopilot/blob/latest/docs/program-update.md#人工恢复" target="_blank" rel="noopener noreferrer">打开完整人工恢复步骤</a>
             </p>
           </details>
         </section>
