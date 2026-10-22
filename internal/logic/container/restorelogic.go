@@ -3,11 +3,13 @@ package container
 import (
 	"context"
 	"fmt"
-	"github.com/google/uuid"
+	"net/http"
+
 	backupService "github.com/onlyLTY/dockerCopilot/internal/backup"
 	"path/filepath"
 
 	"github.com/onlyLTY/dockerCopilot/internal/svc"
+	"github.com/onlyLTY/dockerCopilot/internal/task"
 	"github.com/onlyLTY/dockerCopilot/internal/types"
 
 	"github.com/zeromicro/go-zero/core/logx"
@@ -15,28 +17,32 @@ import (
 
 type RestoreLogic struct {
 	logx.Logger
-	ctx     context.Context
-	service *backupService.Service
+	ctx        context.Context
+	taskRunner *task.Runner
+	service    *backupService.Service
 }
 
 func NewRestoreLogic(ctx context.Context, svcCtx *svc.ServiceContext) *RestoreLogic {
 	return &RestoreLogic{
-		Logger:  logx.WithContext(ctx),
-		ctx:     ctx,
-		service: backupServiceFromContext(svcCtx),
+		Logger:     logx.WithContext(ctx),
+		ctx:        ctx,
+		taskRunner: svcCtx.TaskRunner,
+		service:    backupServiceFromContext(svcCtx),
 	}
 }
 
 func (l *RestoreLogic) Restore(req *types.ContainerRestoreReq) (resp *types.Resp, err error) {
 	resp = &types.Resp{}
-	taskID := uuid.New().String()
+	if req == nil {
+		return &types.Resp{Code: http.StatusBadRequest, Msg: "filename is required", Data: map[string]any{}}, requestError("filename is required")
+	}
 	fileName := req.Filename
 	fullPath, pathErr := l.service.Resolve(fileName, ".json")
 	if pathErr != nil {
 		resp.Code = 400
 		resp.Msg = pathErr.Error()
 		resp.Data = map[string]interface{}{}
-		return resp, pathErr
+		return resp, requestError(pathErr.Error())
 	}
 	fileName = filepath.Base(fullPath)
 	if filepath.Ext(fileName) != ".json" {
@@ -44,20 +50,26 @@ func (l *RestoreLogic) Restore(req *types.ContainerRestoreReq) (resp *types.Resp
 		resp.Code = 400
 		resp.Msg = err.Error()
 		resp.Data = map[string]interface{}{}
-		return resp, err
+		return resp, requestError(err.Error())
 	}
-	go func() {
-		// Catch any panic and log the error
-		defer func() {
-			if r := recover(); r != nil {
-				l.Errorf("Recovered from panic in restoreContainer: %v", r)
+	if l.taskRunner == nil {
+		return nil, taskUnavailableError("task runner is unavailable")
+	}
+	taskID, submitErr := l.taskRunner.Submit(task.TaskSpec{
+		Record: task.Record{Type: "backup-restore", Name: fileName},
+		Run: func(ctx context.Context, execution *task.Execution) error {
+			if err := execution.Progress("restoring", 0, "备份恢复已开始"); err != nil {
+				return err
 			}
-		}()
-		err := l.service.Restore(context.Background(), fileName, taskID)
-		if err != nil {
-			l.Errorf("Error in restoreContainer: %v", err)
-		}
-	}()
+			if err := l.service.Restore(ctx, fileName, execution.TaskID()); err != nil {
+				return err
+			}
+			return execution.Progress("completed", 100, "备份恢复完成")
+		},
+	})
+	if submitErr != nil {
+		return &types.Resp{Msg: submitErr.Error(), Data: map[string]any{}}, taskSubmitError{cause: submitErr}
+	}
 	resp.Code = 200
 	resp.Msg = "success"
 	resp.Data = map[string]interface{}{

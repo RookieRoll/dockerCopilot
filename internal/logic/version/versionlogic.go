@@ -2,6 +2,7 @@ package version
 
 import (
 	"context"
+	"net/http"
 
 	"github.com/onlyLTY/dockerCopilot/internal/config"
 
@@ -17,6 +18,12 @@ type VersionLogic struct {
 	updateSource config.UpdateConfig
 	legacySource bool
 }
+
+type invalidVersionRequestError string
+
+func (e invalidVersionRequestError) Error() string     { return string(e) }
+func (e invalidVersionRequestError) HTTPStatus() int   { return http.StatusBadRequest }
+func (e invalidVersionRequestError) ErrorCode() string { return "INVALID_VERSION_REQUEST" }
 
 func NewVersionLogic(ctx context.Context, svcCtx *svc.ServiceContext) *VersionLogic {
 	return &VersionLogic{
@@ -70,6 +77,6 @@ func (l *VersionLogic) Version(req *types.VersionReq) (resp *types.Resp, err err
 		resp.Code = 400
 		resp.Msg = "type 参数错误"
 		resp.Data = map[string]string{}
-		return resp, nil
+		return resp, invalidVersionRequestError("type 参数错误")
 	}
 }

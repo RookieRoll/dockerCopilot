@@ -11,6 +11,7 @@ import (
 	icons "github.com/onlyLTY/dockerCopilot/internal/handler/icons"
 	image "github.com/onlyLTY/dockerCopilot/internal/handler/image"
 	progress "github.com/onlyLTY/dockerCopilot/internal/handler/progress"
+	taskHandler "github.com/onlyLTY/dockerCopilot/internal/handler/task"
 	version "github.com/onlyLTY/dockerCopilot/internal/handler/version"
 	"github.com/onlyLTY/dockerCopilot/internal/svc"
 
@@ -72,9 +73,19 @@ func RegisterHandlers(server *rest.Server, serverCtx *svc.ServiceContext) {
 				Handler: container.BackupHandler(serverCtx),
 			},
 			{
+				Method:  http.MethodPost,
+				Path:    "/container/backup",
+				Handler: container.BackupTaskHandler(serverCtx),
+			},
+			{
 				Method:  http.MethodGet,
 				Path:    "/container/backup2compose",
 				Handler: container.Backup2composeHandler(serverCtx),
+			},
+			{
+				Method:  http.MethodPost,
+				Path:    "/container/backup2compose",
+				Handler: container.Backup2composeTaskHandler(serverCtx),
 			},
 			{
 				Method:  http.MethodDelete,
@@ -146,6 +157,11 @@ func RegisterHandlers(server *rest.Server, serverCtx *svc.ServiceContext) {
 				Method:  http.MethodGet,
 				Path:    "/progress/:taskid",
 				Handler: progress.GetProgressHandler(serverCtx),
+			},
+			{
+				Method:  http.MethodGet,
+				Path:    "/tasks",
+				Handler: taskHandler.ListTasksHandler(serverCtx),
 			},
 		},
 		rest.WithJwt(serverCtx.Config.Auth.AccessSecret),

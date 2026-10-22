@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/onlyLTY/dockerCopilot/internal/observability"
 )
 
 const SchemaVersion = 1
@@ -153,24 +154,40 @@ type PublicItem struct {
 func Public(r Record) PublicRecord {
 	out := PublicRecord{
 		TaskID: r.TaskID, Type: r.Type, Status: r.Status, Stage: r.Stage,
-		Percentage: r.Percentage, Message: r.Message, Name: r.Name, DetailMsg: r.DetailMsg,
+		Percentage: r.Percentage, Message: observability.RedactText(r.Message), Name: r.Name, DetailMsg: observability.RedactText(r.DetailMsg),
 		IsDone: r.Status.Terminal(), ImageRef: r.ImageRef, OldContainerID: r.OldContainerID,
 		NewContainerID: r.NewContainerID,
 		CreatedAt:      r.CreatedAt, StartedAt: cloneTime(r.StartedAt), UpdatedAt: r.UpdatedAt,
 		FinishedAt: cloneTime(r.FinishedAt), ContainerIDs: cloneStrings(r.ContainerIDs),
 		ProtectedNames: cloneStrings(r.ProtectedNames), ImageIDs: cloneStrings(r.ImageIDs),
 		Options: cloneOptions(r.Options), RequestID: r.RequestID, RequiresAttention: r.RequiresAttention,
-		Recovery: r.Recovery, Error: r.Error, Warnings: cloneStrings(r.Warnings),
+		Recovery: publicRecovery(r.Recovery), Error: observability.RedactText(r.Error), Warnings: publicDiagnostics(r.Warnings),
 		SuccessCount: r.SuccessCount, FailedCount: r.FailedCount, SkippedCount: r.SkippedCount,
 		ContainerChecks: append([]ContainerCheck(nil), r.ContainerChecks...),
 	}
 	if len(r.Items) != 0 {
 		out.Items = make([]PublicItem, 0, len(r.Items))
 		for _, item := range r.Items {
-			out.Items = append(out.Items, PublicItem{ID: item.ID, Name: item.Name, Status: item.Status, Stage: item.Stage, Error: item.Error})
+			out.Items = append(out.Items, PublicItem{ID: item.ID, Name: item.Name, Status: item.Status, Stage: item.Stage, Error: observability.RedactText(item.Error)})
 		}
 	}
 	return out
+}
+
+func publicRecovery(recovery Recovery) Recovery {
+	recovery.Detail = observability.RedactText(recovery.Detail)
+	return recovery
+}
+
+func publicDiagnostics(values []string) []string {
+	if values == nil {
+		return nil
+	}
+	result := make([]string, len(values))
+	for index, value := range values {
+		result[index] = observability.RedactText(value)
+	}
+	return result
 }
 
 func cloneRecord(r Record) Record {

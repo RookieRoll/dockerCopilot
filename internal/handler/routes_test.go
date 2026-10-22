@@ -39,6 +39,30 @@ func TestProgressRouteRequiresJWT(t *testing.T) {
 	}
 }
 
+func TestTaskListRouteRequiresJWT(t *testing.T) {
+	port := getFreePort(t)
+	cfg := config.Config{}
+	cfg.Host = "127.0.0.1"
+	cfg.Port = port
+	cfg.Auth.AccessSecret = "test-secret"
+
+	server := rest.MustNewServer(cfg.RestConf)
+	RegisterHandlers(server, &svc.ServiceContext{Config: cfg})
+	defer server.Stop()
+
+	go server.Start()
+	waitForServer(t, port)
+
+	resp, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d/api/tasks", port))
+	if err != nil {
+		t.Fatalf("failed to call task list route: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("expected 401 without JWT, got %d", resp.StatusCode)
+	}
+}
+
 func TestConfiguredPortsRouteRequiresJWT(t *testing.T) {
 	port := getFreePort(t)
 	cfg := config.Config{}

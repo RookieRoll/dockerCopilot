@@ -47,3 +47,43 @@ func TestLiteralContextSharesOneLegacyProgressStore(t *testing.T) {
 		t.Fatal("progress updated through one adapter was not visible through the context")
 	}
 }
+
+func TestLiteralContextSharesLazilyConstructedServices(t *testing.T) {
+	ctx := &svc.ServiceContext{}
+	var wg sync.WaitGroup
+	containers := make(chan *containerService.Service, 16)
+	backups := make(chan *backupService.Service, 16)
+	for range 16 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			containers <- serviceFromContext(ctx)
+			backups <- backupServiceFromContext(ctx)
+		}()
+	}
+	wg.Wait()
+	close(containers)
+	close(backups)
+	var oneContainer *containerService.Service
+	for service := range containers {
+		if service == nil {
+			t.Fatal("container service was not constructed")
+		}
+		if oneContainer == nil {
+			oneContainer = service
+		} else if service != oneContainer {
+			t.Fatal("literal context constructed multiple container services")
+		}
+	}
+	var oneBackup *backupService.Service
+	for service := range backups {
+		if service == nil {
+			t.Fatal("backup service was not constructed")
+		}
+		if oneBackup == nil {
+			oneBackup = service
+		} else if service != oneBackup {
+			t.Fatal("literal context constructed multiple backup services")
+		}
+	}
+}

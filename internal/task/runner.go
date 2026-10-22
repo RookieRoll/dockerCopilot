@@ -36,9 +36,11 @@ type TaskFunc func(context.Context, *Execution) error
 type RecoveryFunc func(context.Context, error) (Recovery, error)
 
 type TaskSpec struct {
-	Record  Record
-	Run     TaskFunc
-	Recover RecoveryFunc
+	Record     Record
+	Run        TaskFunc
+	Recover    RecoveryFunc
+	OnAccepted func() error
+	OnSettled  func()
 }
 
 type RunnerOptions struct {
@@ -177,6 +179,15 @@ func (r *Runner) Submit(spec TaskSpec) (string, error) {
 		r.markIdleLocked()
 		return "", fmt.Errorf("persist initial queued task: %w", err)
 	}
+	if spec.OnAccepted != nil {
+		if err := invokeAccepted(spec.OnAccepted); err != nil {
+			r.queued--
+			cause := fmt.Errorf("task acceptance callback: %w", err)
+			r.finalizeWithoutExecution(rec, cause)
+			r.markIdleLocked()
+			return "", cause
+		}
+	}
 	spec.Record = cloneRecord(rec)
 	select {
 	case r.queue <- queuedTask{spec: spec, accepted: rec}:
@@ -205,6 +216,16 @@ func (r *Runner) worker() {
 }
 
 func (r *Runner) execute(q queuedTask) {
+	if q.spec.OnSettled != nil {
+		defer func() {
+			defer func() {
+				if value := recover(); value != nil {
+					r.writeOutput("task %s settlement callback panicked: %v\n", q.accepted.TaskID, value)
+				}
+			}()
+			q.spec.OnSettled()
+		}()
+	}
 	rec := cloneRecord(q.accepted)
 	started := r.now().UTC()
 	rec.Status = StatusRunning
@@ -476,6 +497,15 @@ func invokeTask(fn TaskFunc, ctx context.Context, e *Execution) (out taskOutcome
 	}()
 	out.err = fn(ctx, e)
 	return
+}
+
+func invokeAccepted(fn func() error) (err error) {
+	defer func() {
+		if value := recover(); value != nil {
+			err = fmt.Errorf("acceptance callback panic: %v", value)
+		}
+	}()
+	return fn()
 }
 
 type taskOutcome struct {

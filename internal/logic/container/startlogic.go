@@ -16,13 +16,10 @@ type StartLogic struct {
 }
 
 func serviceFromContext(svcCtx *svc.ServiceContext) *containerService.Service {
-	if svcCtx.Containers != nil {
-		return svcCtx.Containers
+	if svcCtx == nil {
+		return nil
 	}
-	service := containerService.NewService(svcCtx.DockerClient, svcCtx.HubImageInfo)
-	progress := svcCtx.ProgressService()
-	service.SetProgressCallbacks(containerService.ProgressCallbacks{Update: progress.Update, Get: progress.Get})
-	return service
+	return svcCtx.ContainerService()
 }
 
 func NewStartLogic(ctx context.Context, svcCtx *svc.ServiceContext) *StartLogic {

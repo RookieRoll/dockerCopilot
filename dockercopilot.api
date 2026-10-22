@@ -16,6 +16,15 @@ type GetProgressReq {
 	TaskId string `path:"taskid"`
 }
 
+type TaskListReq {
+	Status        string `form:"status,optional"`
+	Type          string `form:"type,optional"`
+	ContainerID   string `form:"containerID,optional"`
+	ContainerName string `form:"containerName,optional"`
+	Page          int    `form:"page,default=1"`
+	Limit         int    `form:"limit,default=50"`
+}
+
 type StartContainerReq {
 	Name string `json:"name"`
 }
@@ -49,9 +58,11 @@ type MsgResp {
 }
 
 type Resp {
-	Code int         `json:"code"`
-	Msg  string      `json:"msg"`
-	Data interface{} `json:"data"`
+	Code      int         `json:"code"`
+	Msg       string      `json:"msg"`
+	Data      interface{} `json:"data"`
+	ErrorCode string      `json:"errorCode,optional"`
+	RequestID string      `json:"requestId,optional"`
 }
 
 type IdReq {
@@ -125,6 +136,9 @@ service dockerCopilot {
 service dockerCopilot {
 	@handler GetProgress
 		get /progress/:taskid (GetProgressReq) returns (Resp)
+
+	@handler ListTasks
+		get /tasks (TaskListReq) returns (Resp)
 }
 
 @server(
@@ -157,8 +171,14 @@ service dockerCopilot {
 	@handler backup
 	get /container/backup returns (Resp)
 
+	@handler backupTask
+	post /container/backup returns (Resp)
+
 	@handler backup2compose
 	get /container/backup2compose returns (Resp)
+
+	@handler backup2composeTask
+	post /container/backup2compose returns (Resp)
 
 	@handler listBackups
 	get /container/listBackups returns (Resp)

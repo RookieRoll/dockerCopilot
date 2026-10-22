@@ -15,6 +15,29 @@ import (
 	"github.com/google/uuid"
 )
 
+func TestPublicRecordRedactsSensitiveDiagnosticsWithoutMutatingFacts(t *testing.T) {
+	secretURL := "https://user:pass@example.test/repo?access_token=secret-value"
+	record := Record{
+		TaskID: "d7dce3a9-c3e9-4c3f-a7d8-486b12c5e63f", Type: "container-update", Status: StatusFailed,
+		Message: "failed at " + secretURL, DetailMsg: "daemon said " + secretURL,
+		Error: "request failed " + secretURL, Recovery: Recovery{Status: "unknown", Detail: "retry with token=secret-value"},
+		Warnings: []string{"auth=secret-value"},
+		Items:    []Item{{ID: "container", Error: "authorization: Bearer abc.def.ghi"}},
+	}
+	public := Public(record)
+	for field, value := range map[string]string{
+		"message": public.Message, "detailMsg": public.DetailMsg, "error": public.Error,
+		"recovery.detail": public.Recovery.Detail, "warning": public.Warnings[0], "item.error": public.Items[0].Error,
+	} {
+		if strings.Contains(value, "secret-value") || strings.Contains(value, "user:pass") || strings.Contains(value, "abc.def.ghi") {
+			t.Errorf("public %s leaked credential text: %q", field, value)
+		}
+	}
+	if record.Error != "request failed "+secretURL || record.Warnings[0] != "auth=secret-value" {
+		t.Fatal("public projection mutated the persisted diagnostic facts")
+	}
+}
+
 type readonlyInspectorFake struct {
 	mu           sync.Mutex
 	observations map[string]ContainerObservation

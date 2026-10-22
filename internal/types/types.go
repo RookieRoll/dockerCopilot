@@ -76,9 +76,11 @@ type RenameContainerReq struct {
 }
 
 type Resp struct {
-	Code int         `json:"code"`
-	Msg  string      `json:"msg"`
-	Data interface{} `json:"data"`
+	Code      int         `json:"code"`
+	Msg       string      `json:"msg"`
+	Data      interface{} `json:"data"`
+	ErrorCode string      `json:"errorCode,omitempty"`
+	RequestID string      `json:"requestId,omitempty"`
 }
 
 type StartContainerReq struct {

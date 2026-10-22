@@ -4,7 +4,6 @@ import (
 	"embed"
 	"flag"
 	"fmt"
-	"go/types"
 	"io/fs"
 	"log"
 	"net/http"
@@ -19,8 +18,6 @@ import (
 	"github.com/zeromicro/go-zero/core/logx"
 	"github.com/zeromicro/go-zero/rest"
 	"github.com/zeromicro/go-zero/rest/httpx"
-	"github.com/zeromicro/x/errors"
-	xhttp "github.com/zeromicro/x/http"
 )
 
 //go:embed front/*
@@ -57,7 +54,21 @@ func main() {
 			httpx.WriteJson(w, http.StatusUnauthorized, response)
 		}))
 	defer server.Stop()
-	ctx := svc.NewServiceContext(c)
+	ctx, err := svc.NewServiceContextChecked(c)
+	if err != nil {
+		log.Printf("无法初始化服务: %s", observability.RedactText(err.Error()))
+		os.Exit(1)
+	}
+	defer func() {
+		if err := ctx.TaskRuntime.Close(); err != nil {
+			logx.Errorf("关闭任务运行时失败: %v", err)
+		}
+		if ctx.DockerClient != nil {
+			if err := ctx.DockerClient.Close(); err != nil {
+				logx.Errorf("关闭Docker客户端失败: %v", err)
+			}
+		}
+	}()
 
 	// Ensure data directory and config exist (Auto-init)
 	dataDir := "/data/config/image"
@@ -100,18 +111,8 @@ export const customImageLogos = {
 	corndanmu.Start()
 	defer corndanmu.Stop()
 	httpx.SetErrorHandler(func(err error) (int, any) {
-		switch e := err.(type) {
-		case *errors.CodeMsg:
-			return http.StatusOK, xhttp.BaseResponse[types.Nil]{
-				Code: e.Code,
-				Msg:  e.Msg,
-			}
-		default:
-			return http.StatusOK, xhttp.BaseResponse[types.Nil]{
-				Code: 50000,
-				Msg:  err.Error(),
-			}
-		}
+		status, response := observability.HTTPError(err, nil)
+		return status, response
 	})
 	handler.RegisterHandlers(server, ctx)
 	RegisterHandlers(server)

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/onlyLTY/dockerCopilot/internal/operation"
 )
 
 type runnerMemoryStore struct {
@@ -102,6 +103,218 @@ func TestRunnerRejectsInitialPersistenceFailureWithoutRunning(t *testing.T) {
 	}
 }
 
+func TestOnSettledWaitsUntilRunAndRecoveryCallbacksReallyReturn(t *testing.T) {
+	store := newRunnerMemoryStore()
+	runner := newTestRunner(t, store, RunnerOptions{MaxConcurrent: 1, QueueCapacity: 1, TaskTimeout: 20 * time.Millisecond, RecoveryTimeout: time.Second})
+	runEntered := make(chan struct{})
+	releaseRun := make(chan struct{})
+	recoveryEntered := make(chan struct{})
+	releaseRecovery := make(chan struct{})
+	settled := make(chan struct{})
+	_, err := runner.Submit(TaskSpec{
+		Record: runnerRecord(),
+		Run: func(context.Context, *Execution) error {
+			close(runEntered)
+			<-releaseRun // deliberately ignores the task deadline
+			return errors.New("late operation failure")
+		},
+		Recover: func(context.Context, error) (Recovery, error) {
+			close(recoveryEntered)
+			<-releaseRecovery
+			return Recovery{Status: "restored"}, nil
+		},
+		OnSettled: func() { close(settled) },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-runEntered
+	select {
+	case <-settled:
+		t.Fatal("settled callback ran while task callback was still executing")
+	case <-time.After(60 * time.Millisecond):
+	}
+	close(releaseRun)
+	<-recoveryEntered
+	select {
+	case <-settled:
+		t.Fatal("settled callback ran while recovery callback was still executing")
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(releaseRecovery)
+	select {
+	case <-settled:
+	case <-time.After(time.Second):
+		t.Fatal("settled callback did not run after recovery returned")
+	}
+	if err := runner.WaitIdle(testContext(t, time.Second)); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestOnSettledDoesNotRunWhenSubmitIsRejected(t *testing.T) {
+	store := newRunnerMemoryStore()
+	store.createErr = errors.New("disk unavailable")
+	runner := newTestRunner(t, store, RunnerOptions{MaxConcurrent: 1, QueueCapacity: 1})
+	var calls atomic.Int32
+	_, err := runner.Submit(TaskSpec{Record: runnerRecord(), Run: func(context.Context, *Execution) error { return nil }, OnSettled: func() { calls.Add(1) }})
+	if err == nil {
+		t.Fatal("expected initial persistence failure")
+	}
+	if calls.Load() != 0 {
+		t.Fatalf("settlement callback called for rejected task: %d", calls.Load())
+	}
+}
+
+func TestOnAcceptedConfirmsDurableAdmissionBeforeWorkerCanRun(t *testing.T) {
+	store := newRunnerMemoryStore()
+	runner := newTestRunner(t, store, RunnerOptions{MaxConcurrent: 1, QueueCapacity: 1})
+	accepted := make(chan struct{})
+	var ran atomic.Bool
+	id, err := runner.Submit(TaskSpec{
+		Record: runnerRecord(),
+		OnAccepted: func() error {
+			close(accepted)
+			return nil
+		},
+		Run: func(context.Context, *Execution) error {
+			select {
+			case <-accepted:
+			default:
+				return errors.New("worker ran before durable admission callback")
+			}
+			ran.Store(true)
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := runner.WaitIdle(testContext(t, time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if !ran.Load() {
+		t.Fatalf("accepted task %s did not run", id)
+	}
+}
+
+func TestOnAcceptedFailureRejectsTaskAndFinalizesDurableRecord(t *testing.T) {
+	store := newRunnerMemoryStore()
+	runner := newTestRunner(t, store, RunnerOptions{MaxConcurrent: 1, QueueCapacity: 1})
+	var ran atomic.Int32
+	_, err := runner.Submit(TaskSpec{
+		Record:     runnerRecord(),
+		OnAccepted: func() error { return errors.New("lease confirmation failed") },
+		Run:        func(context.Context, *Execution) error { ran.Add(1); return nil },
+	})
+	if err == nil || !strings.Contains(err.Error(), "lease confirmation failed") {
+		t.Fatalf("Submit error=%v; want acceptance failure", err)
+	}
+	if ran.Load() != 0 {
+		t.Fatal("task ran after acceptance callback failed")
+	}
+	if err := runner.WaitIdle(testContext(t, time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if len(store.records) != 1 {
+		t.Fatalf("durable queued record was lost after acceptance error: %d records", len(store.records))
+	}
+	for _, record := range store.records {
+		if record.Status != StatusFailed {
+			t.Fatalf("acceptance failure record status=%q, want failed", record.Status)
+		}
+	}
+}
+
+func TestFastSettlementCannotMakePostSubmitConfirmationFail(t *testing.T) {
+	coordinator := operation.NewCoordinator()
+	taskID := uuid.NewString()
+	reservation, err := coordinator.Reserve(operation.Request{
+		TaskID: taskID, Kind: operation.ContainerUpdate,
+		Target: operation.Target{ID: "container-id", Name: "web"}, EquivalenceKey: "fingerprint",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runner := newTestRunner(t, newRunnerMemoryStore(), RunnerOptions{MaxConcurrent: 1, QueueCapacity: 1})
+	record := runnerRecord()
+	record.TaskID = taskID
+	spec := TaskSpec{
+		Record:     record,
+		OnAccepted: func() error { return reservation.Lease.Confirm() },
+		OnSettled:  reservation.Lease.Release,
+		Run:        func(context.Context, *Execution) error { return nil },
+	}
+	_, err = runner.Submit(spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := runner.WaitIdle(testContext(t, time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	// A fast worker has now settled and released before this confirmation.
+	// Confirm must remain idempotent so adapters cannot report a false failure.
+	if err := reservation.Lease.Confirm(); err != nil {
+		t.Fatalf("post-submit confirmation raced settlement: %v", err)
+	}
+	if _, err := coordinator.Reserve(operation.Request{TaskID: "next", Kind: "container-stop", Target: operation.Target{ID: "container-id", Name: "web"}}); err != nil {
+		t.Fatalf("settled task retained container lease: %v", err)
+	}
+}
+
+func TestOnAcceptedPanicRejectsTaskAndDoesNotKillRunner(t *testing.T) {
+	store := newRunnerMemoryStore()
+	runner := newTestRunner(t, store, RunnerOptions{MaxConcurrent: 1, QueueCapacity: 1})
+	var calls atomic.Int32
+	_, err := runner.Submit(TaskSpec{
+		Record:     runnerRecord(),
+		OnAccepted: func() error { panic("confirm hook panic") },
+		Run:        func(context.Context, *Execution) error { calls.Add(1); return nil },
+	})
+	if err == nil || !strings.Contains(err.Error(), "acceptance callback panic") {
+		t.Fatalf("Submit error=%v; want recovered acceptance panic", err)
+	}
+	if calls.Load() != 0 {
+		t.Fatal("task ran after acceptance callback panic")
+	}
+	var ran atomic.Int32
+	if _, err := runner.Submit(TaskSpec{Record: runnerRecord(), Run: func(context.Context, *Execution) error { ran.Add(1); return nil }}); err != nil {
+		t.Fatalf("runner rejected later work after acceptance panic: %v", err)
+	}
+	if err := runner.WaitIdle(testContext(t, time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if ran.Load() != 1 {
+		t.Fatalf("runner worker did not recover after acceptance panic: calls=%d", ran.Load())
+	}
+}
+
+func TestOnSettledPanicDoesNotStopRunnerWorker(t *testing.T) {
+	store := newRunnerMemoryStore()
+	runner := newTestRunner(t, store, RunnerOptions{MaxConcurrent: 1, QueueCapacity: 1})
+	var ran atomic.Int32
+	_, err := runner.Submit(TaskSpec{
+		Record:    runnerRecord(),
+		Run:       func(context.Context, *Execution) error { return nil },
+		OnSettled: func() { panic("settlement hook bug") },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = runner.Submit(TaskSpec{Record: runnerRecord(), Run: func(context.Context, *Execution) error { ran.Add(1); return nil }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := runner.WaitIdle(testContext(t, time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if ran.Load() != 1 {
+		t.Fatalf("worker failed to process later task after hook panic; calls=%d", ran.Load())
+	}
+}
+
 func TestRunnerDoesNotRunWhenRunningCheckpointCannotPersist(t *testing.T) {
 	store := newRunnerMemoryStore()
 	store.saveErr = func(_ Record, call int) error {
@@ -112,7 +325,8 @@ func TestRunnerDoesNotRunWhenRunningCheckpointCannotPersist(t *testing.T) {
 	}
 	runner := newTestRunner(t, store, RunnerOptions{MaxConcurrent: 1, QueueCapacity: 1})
 	var calls atomic.Int32
-	id, err := runner.Submit(TaskSpec{Record: runnerRecord(), Run: func(context.Context, *Execution) error { calls.Add(1); return nil }})
+	var settled atomic.Int32
+	id, err := runner.Submit(TaskSpec{Record: runnerRecord(), Run: func(context.Context, *Execution) error { calls.Add(1); return nil }, OnSettled: func() { settled.Add(1) }})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -123,8 +337,8 @@ func TestRunnerDoesNotRunWhenRunningCheckpointCannotPersist(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if calls.Load() != 0 || got.Status != StatusFailed {
-		t.Fatalf("callback calls=%d record=%#v", calls.Load(), got)
+	if calls.Load() != 0 || got.Status != StatusFailed || settled.Load() != 1 {
+		t.Fatalf("callback calls=%d settled=%d record=%#v", calls.Load(), settled.Load(), got)
 	}
 }
 

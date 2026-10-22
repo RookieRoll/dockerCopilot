@@ -6,11 +6,8 @@ import (
 )
 
 func backupServiceFromContext(ctx *svc.ServiceContext) *backupService.Service {
-	if ctx.Backups != nil {
-		return ctx.Backups
+	if ctx == nil {
+		return nil
 	}
-	service := backupService.NewService(ctx.DockerClient, ctx.Config.BackupDirectory())
-	progress := ctx.ProgressService()
-	service.SetProgressCallbacks(backupService.ProgressCallbacks{Update: progress.Update, Get: progress.Get})
-	return service
+	return ctx.BackupService()
 }
