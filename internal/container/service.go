@@ -212,15 +212,53 @@ func (s *Service) OperateOwned(ctx context.Context, taskID string, expected oper
 }
 
 func (s *Service) Rename(ctx context.Context, id, name string) error {
+	return s.RenameWithCallback(ctx, id, name, nil)
+}
+
+// RenameWithCallback keeps the container's mutation lease through the local
+// metadata migration callback so list cleanup cannot observe a half-migrated
+// name mapping between Docker rename and settings persistence.
+func (s *Service) RenameWithCallback(ctx context.Context, id, name string, afterRename func(oldName string) error) error {
+	return s.RenameWithLifecycle(ctx, id, name, nil, func(oldName, _ string) error {
+		if afterRename != nil {
+			return afterRename(oldName)
+		}
+		return nil
+	})
+}
+
+// RenameWithLifecycle keeps the operation lease through durable preparation,
+// Docker rename, and local metadata migration.
+func (s *Service) RenameWithLifecycle(ctx context.Context, id, name string, beforeRename, afterRename func(oldName, containerID string) error) error {
 	canonicalID, lease, err := s.reserveSync(ctx, id, "container-rename")
 	if err != nil {
 		return err
 	}
 	defer lease.Release()
+	inspected, err := s.Inspect(ctx, canonicalID)
+	if err != nil {
+		return err
+	}
+	oldName := strings.TrimLeft(strings.TrimSpace(inspected.Name), "/")
+	containerID := inspected.ID
+	if containerID == "" {
+		containerID = canonicalID
+	}
 	if err := lease.AddAlias(operation.Target{Name: name}); err != nil {
 		return err
 	}
-	return s.docker.ContainerRename(ctx, canonicalID, name)
+	if beforeRename != nil {
+		if err := beforeRename(oldName, containerID); err != nil {
+			return err
+		}
+	}
+	if err := s.docker.ContainerRename(ctx, canonicalID, name); err != nil {
+		return err
+	}
+	if afterRename != nil {
+		return afterRename(oldName, containerID)
+	}
+	return nil
 }
 
 // FingerprintUpdate builds the deterministic equivalence key used when
