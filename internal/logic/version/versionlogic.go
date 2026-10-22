@@ -42,14 +42,14 @@ func (l *VersionLogic) Version(req *types.VersionReq) (resp *types.Resp, err err
 		if l.legacySource {
 			updateSource = config.LegacyUpdateSource()
 		}
-		remoteVersion, err := updater.GetRemoteVersionWithConfig(updateSource)
+		remoteVersion, err := updater.CheckRemoteVersion(l.ctx, updateSource)
 		if err != nil {
 			resp.Code = 50001
 			resp.Msg = "获取版本错误" + err.Error()
 			resp.Data = map[string]string{
 				"remoteVersion": config.Version,
 			}
-			return resp, nil
+			return resp, err
 		} else if remoteVersion != config.Version {
 			resp.Code = 200
 			resp.Msg = "程序有更新"
