@@ -343,7 +343,7 @@ func (r *Runner) finishExecution(e *Execution, out taskOutcome, recoverFn Recove
 		return
 	}
 	if (needsRecovery || cause != nil) && recoverFn != nil {
-		call := r.startRecovery(recoverFn, cause)
+		call := r.startRecovery(recoverFn, cause, e)
 		select {
 		case result := <-call.done:
 			call.cancel()
@@ -415,7 +415,7 @@ func (r *Runner) runRecoveryAndReconcile(e *Execution, recoverFn RecoveryFunc, c
 		}
 		return
 	}
-	call := r.startRecoveryWithContext(recoveryCtx, recoverFn, cause)
+	call := r.startRecoveryWithContext(recoveryCtx, recoverFn, cause, e)
 	select {
 	case result := <-call.done:
 		call.cancel()
@@ -467,29 +467,37 @@ type recoveryCall struct {
 	cancel context.CancelFunc
 }
 
-func (r *Runner) startRecovery(fn RecoveryFunc, cause error) recoveryCall {
+func (r *Runner) startRecovery(fn RecoveryFunc, cause error, execution *Execution) recoveryCall {
 	ctx, cancel := context.WithTimeout(context.Background(), r.recoveryTimeout)
-	call := r.startRecoveryWithContext(ctx, fn, cause)
+	call := r.startRecoveryWithContext(ctx, fn, cause, execution)
 	childCancel := call.cancel
 	call.cancel = func() { childCancel(); cancel() }
 	return call
 }
 
-func (r *Runner) startRecoveryWithContext(parent context.Context, fn RecoveryFunc, cause error) recoveryCall {
+func (r *Runner) startRecoveryWithContext(parent context.Context, fn RecoveryFunc, cause error, execution *Execution) recoveryCall {
 	ctx, cancel := context.WithCancel(parent)
 	done := make(chan recoveryResult, 1)
 	go func() {
+		if execution != nil {
+			execution.authorizeRecovery(ctx)
+		}
 		result := recoveryResult{}
-		defer func() {
-			if value := recover(); value != nil {
-				result.err = fmt.Errorf("recovery panic: %v", value)
-			}
-			done <- result
+		func() {
+			defer func() {
+				if value := recover(); value != nil {
+					result.err = fmt.Errorf("recovery panic: %v", value)
+				}
+			}()
+			result.recovery, result.err = fn(ctx, cause)
 		}()
-		result.recovery, result.err = fn(ctx, cause)
 		if result.err == nil && ctx.Err() != nil {
 			result.err = ctx.Err()
 		}
+		if execution != nil {
+			execution.revokeRecovery(ctx)
+		}
+		done <- result
 	}()
 	return recoveryCall{ctx: ctx, done: done, cancel: cancel}
 }
@@ -663,6 +671,7 @@ type Execution struct {
 	report      func(string, ...any)
 	finalized   bool
 	criticalErr error
+	recoveryCtx context.Context
 }
 
 func (e *Execution) TaskID() string { e.mu.Lock(); defer e.mu.Unlock(); return e.record.TaskID }

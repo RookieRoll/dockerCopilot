@@ -105,6 +105,8 @@ func (l *UpdateLogic) Update(req *types.ContainerUpdateReq) (resp *types.Resp, e
 	}
 	var gateMu sync.Mutex
 	var gateLease *operation.MutationLease
+	var executionMu sync.Mutex
+	var executionRef *task.Execution
 	var settled sync.Once
 	acceptedTaskID, err := l.taskRunner.Submit(task.TaskSpec{
 		Record: task.Record{
@@ -139,6 +141,9 @@ func (l *UpdateLogic) Update(req *types.ContainerUpdateReq) (resp *types.Resp, e
 			})
 		},
 		Run: func(ctx context.Context, execution *task.Execution) error {
+			executionMu.Lock()
+			executionRef = execution
+			executionMu.Unlock()
 			if err := execution.Progress("updating", 0, "容器更新已开始"); err != nil {
 				return err
 			}
@@ -161,6 +166,10 @@ func (l *UpdateLogic) Update(req *types.ContainerUpdateReq) (resp *types.Resp, e
 						}
 						if checkpoint.ResolvedImageID != "" {
 							record.ImageIDs = appendTaskIdentity(record.ImageIDs, checkpoint.ResolvedImageID)
+						}
+						if checkpoint.NewContainerID != "" {
+							record.NewContainerID = checkpoint.NewContainerID
+							record.ContainerIDs = appendTaskIdentity(record.ContainerIDs, checkpoint.NewContainerID)
 						}
 						if checkpoint.PreviousImageID != "" {
 							record.ImageIDs = appendTaskIdentity(record.ImageIDs, checkpoint.PreviousImageID)
@@ -185,7 +194,7 @@ func (l *UpdateLogic) Update(req *types.ContainerUpdateReq) (resp *types.Resp, e
 			}
 			return execution.Progress("completed", 100, "容器更新完成")
 		},
-		Recover: func(_ context.Context, cause error) (task.Recovery, error) {
+		Recover: func(recoveryCtx context.Context, cause error) (task.Recovery, error) {
 			if l.taskStore == nil {
 				return task.Recovery{Status: "unknown", Detail: "更新任务存储不可用；无法核对持久化阶段"}, errors.New("task store unavailable during update recovery")
 			}
@@ -194,11 +203,45 @@ func (l *UpdateLogic) Update(req *types.ContainerUpdateReq) (resp *types.Resp, e
 				return task.Recovery{Status: "unknown", Detail: "更新停止后的Docker状态未知；请检查任务快照、旧容器和新容器"}, getErr
 			}
 			switch current.Stage {
-			case "preflight", "snapshot", "snapshot-saved", "pulling-image", "resolving-image", "image-resolved":
-				return task.Recovery{Status: "not-needed"}, nil
-			default:
-				return task.Recovery{Status: "unknown", Detail: "更新可能已停止、改名或创建容器；本阶段未执行自动恢复，请核对私有快照及旧/新容器后人工处理"}, nil
+			case "", "preflight", "snapshot", "snapshot-saved", "pulling-image", "resolving-image", "image-resolved":
+				return task.Recovery{Status: "not-needed", Detail: "更新尚未进入旧容器修改阶段"}, nil
 			}
+			if current.SnapshotRef == "" {
+				return task.Recovery{Status: "unknown", Detail: "更新快照引用缺失；未执行自动恢复"}, nil
+			}
+			snapshot, snapshotErr := l.taskStore.ReadSnapshot(taskID)
+			if snapshotErr != nil {
+				return task.Recovery{Status: "unknown", Detail: "无法读取私有更新快照；未执行自动恢复"}, snapshotErr
+			}
+			executionMu.Lock()
+			recoveryExecution := executionRef
+			executionMu.Unlock()
+			if recoveryExecution == nil {
+				return task.Recovery{Status: "unknown", Detail: "更新执行上下文不可用；未执行自动恢复"}, errors.New("task execution unavailable during update recovery")
+			}
+			var resolvedImageID string
+			if len(current.ImageIDs) > 0 {
+				resolvedImageID = current.ImageIDs[len(current.ImageIDs)-1]
+			}
+			result, recoverErr := l.service.RecoverUpdate(recoveryCtx, taskID, snapshot, containerService.UpdateRecoveryState{
+				Stage: current.Stage, OldContainerID: current.OldContainerID, NewContainerID: current.NewContainerID,
+				BackupName: current.BackupContainerName, ResolvedImageID: resolvedImageID,
+			}, func(checkpoint containerService.UpdateCheckpoint) error {
+				return recoveryExecution.RecoveryCheckpoint(recoveryCtx, checkpoint.Stage, func(record *task.Record) {
+					if checkpoint.OldContainerID != "" {
+						record.OldContainerID = checkpoint.OldContainerID
+						record.ContainerIDs = appendTaskIdentity(record.ContainerIDs, checkpoint.OldContainerID)
+					}
+					if checkpoint.NewContainerID != "" {
+						record.NewContainerID = checkpoint.NewContainerID
+						record.ContainerIDs = appendTaskIdentity(record.ContainerIDs, checkpoint.NewContainerID)
+					}
+					if checkpoint.BackupName != "" {
+						record.BackupContainerName = checkpoint.BackupName
+					}
+				})
+			})
+			return task.Recovery{Status: result.Status, Detail: result.Detail}, recoverErr
 		},
 	})
 	if err != nil {

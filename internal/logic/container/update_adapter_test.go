@@ -197,6 +197,9 @@ func TestUpdateStartFailureRetainsSnapshotAndObjectFactsForManualReview(t *testi
 	var removes atomic.Int32
 	daemon := newUpdateAdapterDaemon(t, func(w http.ResponseWriter, r *http.Request) {
 		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1.45/containers/json":
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprint(w, `[]`)
 		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/v1.45/containers/") && strings.HasSuffix(r.URL.Path, "/json"):
 			writeUpdateInspect(w, "c1")
 		case r.Method == http.MethodPost && r.URL.Path == "/v1.45/images/create":

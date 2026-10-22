@@ -16,9 +16,10 @@ import (
 	dockerc "github.com/docker/docker/api/types/container"
 	dockermount "github.com/docker/docker/api/types/mount"
 	dockerClient "github.com/docker/docker/client"
+	"github.com/onlyLTY/dockerCopilot/internal/operation"
 )
 
-const updateInspectJSON = `{"Id":"old-canonical-id","Image":"sha256:old-image","Name":"/web","RestartCount":0,"State":{"Running":true,"Status":"running","StartedAt":"2026-10-22T00:00:00Z"},"Config":{"Image":"web:latest","Hostname":"stable-host","StopSignal":"SIGTERM","StopTimeout":23,"Volumes":{"/data":{}}},"HostConfig":{"Binds":["/host/config:/config:ro"],"RestartPolicy":{"Name":"always"}},"NetworkSettings":{"Networks":{"bridge":{"Aliases":["web-alias"],"IPAddress":"172.17.0.2","NetworkID":"old-network-id","EndpointID":"old-endpoint-id"}}},"Mounts":[{"Type":"volume","Name":"anonymous-volume-id","Source":"/var/lib/docker/volumes/anonymous-volume-id/_data","Destination":"/data","Mode":"rw","RW":true}]}`
+const updateInspectJSON = `{"Id":"old-canonical-id","Image":"sha256:old-image","Name":"/web","RestartCount":0,"State":{"Running":true,"Status":"running","StartedAt":"2026-10-22T00:00:00Z"},"Config":{"Image":"web:latest","Hostname":"stable-host","Labels":{"custom":"keep","io.dockercopilot.update-task":"previous"},"StopSignal":"SIGTERM","StopTimeout":23,"Volumes":{"/data":{}}},"HostConfig":{"Binds":["/host/config:/config:ro"],"RestartPolicy":{"Name":"always"}},"NetworkSettings":{"Networks":{"bridge":{"Aliases":["web-alias"],"IPAddress":"172.17.0.2","NetworkID":"old-network-id","EndpointID":"old-endpoint-id"}}},"Mounts":[{"Type":"volume","Name":"anonymous-volume-id","Source":"/var/lib/docker/volumes/anonymous-volume-id/_data","Destination":"/data","Mode":"rw","RW":true}]}`
 
 func newUpdateTestService(t *testing.T, handler http.HandlerFunc) *Service {
 	t.Helper()
@@ -113,13 +114,138 @@ func TestUpdateCriticalSnapshotFailuresPreventDockerMutation(t *testing.T) {
 	}
 }
 
+func TestRecoverUpdateRestoresOnlyVerifiedReplacement(t *testing.T) {
+	for _, tc := range []struct {
+		name               string
+		recordedNewID      string
+		candidateLabel     string
+		candidateImage     string
+		nameOccupant       string
+		wantStatus         string
+		wantRemove         bool
+		wantRename         bool
+		wantStart          bool
+		wantCheckpoint     bool
+		snapshotStopped    bool
+		failCheckpoint     bool
+		wantError          bool
+		multipleCandidates bool
+		ignoreStart        bool
+	}{
+		{name: "owned replacement", recordedNewID: "new-id", candidateLabel: "task-recovery", candidateImage: "sha256:resolved-image-id", nameOccupant: "new-id", wantStatus: "restored", wantRemove: true, wantRename: true, wantStart: true},
+		{name: "create response lost", candidateLabel: "task-recovery", candidateImage: "sha256:resolved-image-id", nameOccupant: "new-id", wantStatus: "restored", wantRemove: true, wantRename: true, wantStart: true, wantCheckpoint: true},
+		{name: "external target occupant", candidateLabel: "task-recovery", candidateImage: "sha256:resolved-image-id", nameOccupant: "external-id", wantStatus: "unknown", wantCheckpoint: true},
+		{name: "image mismatch", candidateLabel: "task-recovery", candidateImage: "sha256:other-image", nameOccupant: "new-id", wantStatus: "unknown"},
+		{name: "task label mismatch", recordedNewID: "new-id", candidateLabel: "other-task", candidateImage: "sha256:resolved-image-id", nameOccupant: "new-id", wantStatus: "unknown"},
+		{name: "multiple candidates", candidateLabel: "task-recovery", candidateImage: "sha256:resolved-image-id", nameOccupant: "new-id", wantStatus: "unknown", multipleCandidates: true},
+		{name: "original was stopped", recordedNewID: "new-id", candidateLabel: "task-recovery", candidateImage: "sha256:resolved-image-id", nameOccupant: "new-id", wantStatus: "restored", wantRemove: true, wantRename: true, snapshotStopped: true},
+		{name: "start response did not restore running state", recordedNewID: "new-id", candidateLabel: "task-recovery", candidateImage: "sha256:resolved-image-id", nameOccupant: "new-id", wantStatus: "unknown", wantRemove: true, wantRename: true, wantStart: true, ignoreStart: true},
+		{name: "recovery checkpoint failure", recordedNewID: "new-id", candidateLabel: "task-recovery", candidateImage: "sha256:resolved-image-id", nameOccupant: "new-id", wantStatus: "unknown", failCheckpoint: true, wantError: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			oldName := "/web-backup-task"
+			oldRunning := false
+			candidateExists := true
+			var removes, renames, starts int
+			service := newUpdateTestService(t, func(w http.ResponseWriter, r *http.Request) {
+				switch {
+				case r.Method == http.MethodGet && r.URL.Path == "/_ping":
+					w.Header().Set("API-Version", "1.45")
+					fmt.Fprint(w, "OK")
+				case r.Method == http.MethodGet && r.URL.Path == "/v1.45/containers/json":
+					w.Header().Set("Content-Type", "application/json")
+					items := make([]map[string]any, 0, 2)
+					if candidateExists {
+						items = append(items, map[string]any{"Id": "new-id", "Names": []string{"/web"}, "Image": "web:next", "ImageID": "sha256:resolved-image-id", "Labels": map[string]string{updateTaskLabel: "task-recovery"}, "State": "running", "Status": "Up"})
+						if tc.multipleCandidates {
+							items = append(items, map[string]any{"Id": "second-id", "Names": []string{"/web"}, "Image": "web:next", "ImageID": "sha256:resolved-image-id", "Labels": map[string]string{updateTaskLabel: "task-recovery"}, "State": "running", "Status": "Up"})
+						}
+					}
+					_ = json.NewEncoder(w).Encode(items)
+				case r.Method == http.MethodGet && r.URL.Path == "/v1.45/containers/old-canonical-id/json":
+					fmt.Fprintf(w, `{"Id":"old-canonical-id","Name":%q,"Image":"sha256:old-image","Config":{"Image":"web:latest","StopSignal":"SIGTERM","StopTimeout":23},"HostConfig":{},"State":{"Running":%t}}`, oldName, oldRunning)
+				case r.Method == http.MethodGet && r.URL.Path == "/v1.45/containers/new-id/json":
+					if !candidateExists {
+						http.Error(w, "no such container", http.StatusNotFound)
+						return
+					}
+					fmt.Fprintf(w, `{"Id":"new-id","Name":"/web","Image":%q,"Config":{"Labels":{"%s":%q}},"HostConfig":{},"State":{"Running":true}}`, tc.candidateImage, updateTaskLabel, tc.candidateLabel)
+				case r.Method == http.MethodGet && r.URL.Path == "/v1.45/containers/second-id/json":
+					fmt.Fprintf(w, `{"Id":"second-id","Name":"/web","Image":%q,"Config":{"Labels":{"%s":"task-recovery"}},"HostConfig":{},"State":{"Running":true}}`, tc.candidateImage, updateTaskLabel)
+				case r.Method == http.MethodGet && r.URL.Path == "/v1.45/containers/web/json":
+					if tc.nameOccupant == "new-id" && candidateExists {
+						fmt.Fprintf(w, `{"Id":"new-id","Name":"/web","Image":%q,"Config":{"Labels":{"%s":%q}},"HostConfig":{},"State":{"Running":true}}`, tc.candidateImage, updateTaskLabel, tc.candidateLabel)
+					} else if tc.nameOccupant == "external-id" {
+						fmt.Fprintf(w, `{"Id":"external-id","Name":"/web","Image":"sha256:other-image","Config":{"Labels":{"%s":"external"}},"HostConfig":{},"State":{"Running":true}}`, updateTaskLabel)
+					} else {
+						http.Error(w, "no such container", http.StatusNotFound)
+					}
+				case r.Method == http.MethodDelete && r.URL.Path == "/v1.45/containers/new-id":
+					removes++
+					candidateExists = false
+					w.WriteHeader(http.StatusNoContent)
+				case r.Method == http.MethodPost && r.URL.Path == "/v1.45/containers/old-canonical-id/rename":
+					renames++
+					oldName = "/" + r.URL.Query().Get("name")
+					w.WriteHeader(http.StatusNoContent)
+				case r.Method == http.MethodPost && r.URL.Path == "/v1.45/containers/old-canonical-id/start":
+					starts++
+					if !tc.ignoreStart {
+						oldRunning = true
+					}
+					w.WriteHeader(http.StatusNoContent)
+				default:
+					http.NotFound(w, r)
+				}
+			})
+			reserved, err := service.Operations().Reserve(operation.Request{TaskID: "task-recovery", Kind: operation.ContainerUpdate, Target: operation.Target{ID: "old-canonical-id", Name: "web"}})
+			if err != nil || reserved.Lease == nil {
+				t.Fatalf("reserve lease: %+v, %v", reserved, err)
+			}
+			if err := reserved.Lease.Confirm(); err != nil {
+				t.Fatal(err)
+			}
+			defer reserved.Lease.Release()
+			var discoveredID string
+			snapshot := []byte(updateInspectJSON)
+			if tc.snapshotStopped {
+				snapshot = []byte(strings.Replace(string(snapshot), `"Running":true`, `"Running":false`, 1))
+			}
+			result, err := service.RecoverUpdate(context.Background(), "task-recovery", snapshot, UpdateRecoveryState{
+				Stage: "created-new", OldContainerID: "old-canonical-id", NewContainerID: tc.recordedNewID, BackupName: "web-backup-task", ResolvedImageID: "sha256:resolved-image-id",
+			}, func(checkpoint UpdateCheckpoint) error {
+				if checkpoint.Stage == "recovery-new-discovered" {
+					discoveredID = checkpoint.NewContainerID
+				}
+				if tc.failCheckpoint && checkpoint.Stage == "recovery-removing-new" {
+					return errors.New("checkpoint disk full")
+				}
+				return nil
+			})
+			if (err != nil) != tc.wantError {
+				t.Fatalf("recovery error=%v wantError=%t", err, tc.wantError)
+			}
+			if err != nil && !tc.wantError {
+				t.Fatal(err)
+			}
+			if result.Status != tc.wantStatus || (removes > 0) != tc.wantRemove || (renames > 0) != tc.wantRename || (starts > 0) != tc.wantStart {
+				t.Fatalf("result=%+v remove=%d rename=%d start=%d", result, removes, renames, starts)
+			}
+			if (discoveredID == "new-id") != tc.wantCheckpoint {
+				t.Fatalf("discovered ID checkpoint=%q want=%t", discoveredID, tc.wantCheckpoint)
+			}
+		})
+	}
+}
+
 func TestUpdatePinsResolvedImagePreservesConfigurationAndHonorsDeleteOption(t *testing.T) {
 	for _, deleteOld := range []bool{false, true} {
 		t.Run(fmt.Sprintf("delete-old-%t", deleteOld), func(t *testing.T) {
 			var createBody struct {
-				Image      string         `json:"Image"`
-				Hostname   string         `json:"Hostname"`
-				Volumes    map[string]any `json:"Volumes"`
+				Image      string            `json:"Image"`
+				Hostname   string            `json:"Hostname"`
+				Labels     map[string]string `json:"Labels"`
+				Volumes    map[string]any    `json:"Volumes"`
 				HostConfig struct {
 					Binds  []string `json:"Binds"`
 					Mounts []struct {
@@ -214,6 +340,12 @@ func TestUpdatePinsResolvedImagePreservesConfigurationAndHonorsDeleteOption(t *t
 			}
 			if createBody.Image != "sha256:resolved-image-id" {
 				t.Fatalf("create used mutable reference instead of inspected ID: %q", createBody.Image)
+			}
+			if createBody.Labels[updateTaskLabel] != "task-pinned-image" {
+				t.Fatalf("task ownership label missing from replacement create config: %+v", createBody.Labels)
+			}
+			if createBody.Labels["custom"] != "keep" {
+				t.Fatalf("user container labels were not preserved: %+v", createBody.Labels)
 			}
 			if createBody.Hostname != "stable-host" {
 				t.Fatalf("hostname changed: %q", createBody.Hostname)

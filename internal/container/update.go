@@ -9,10 +9,13 @@ import (
 	"strings"
 	"time"
 
+	dockertypes "github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/api/types/image"
 	dockermount "github.com/docker/docker/api/types/mount"
 	"github.com/docker/docker/api/types/network"
+	cerrdefs "github.com/docker/docker/errdefs"
 	dockerMsgType "github.com/docker/docker/pkg/jsonmessage"
 	"github.com/onlyLTY/dockerCopilot/internal/operation"
 	"github.com/onlyLTY/dockerCopilot/internal/types"
@@ -26,9 +29,23 @@ type UpdateCheckpoint struct {
 	Stage           string
 	SnapshotRef     string
 	OldContainerID  string
+	NewContainerID  string
 	PreviousImageID string
 	ResolvedImageID string
 	BackupName      string
+}
+
+type UpdateRecoveryState struct {
+	Stage           string
+	OldContainerID  string
+	NewContainerID  string
+	BackupName      string
+	ResolvedImageID string
+}
+
+type UpdateRecoveryResult struct {
+	Status string
+	Detail string
 }
 
 // UpdateCallbacks are narrow persistence/progress hooks supplied by the task
@@ -47,6 +64,8 @@ type UpdateValidationOptions struct {
 	RunningObservation time.Duration
 	PollInterval       time.Duration
 }
+
+const updateTaskLabel = "io.dockercopilot.update-task"
 
 // UpdateWithOptions performs update preparation and replacement with a frozen
 // image ID. deleteOld controls whether the renamed original is removed after
@@ -237,6 +256,11 @@ func (s *Service) UpdateWithOptions(ctx context.Context, id, name, imageRef stri
 	}
 	createConfig := *before.Config
 	createConfig.Image = resolved.ID
+	createConfig.Labels = cloneDockerLabels(before.Config.Labels)
+	if createConfig.Labels == nil {
+		createConfig.Labels = make(map[string]string)
+	}
+	createConfig.Labels[updateTaskLabel] = taskID
 	hostConfig := preserveObservedVolumes(before.HostConfig, before.Mounts)
 	networks := copyCreateNetworks(before.NetworkSettings)
 	created, err := s.docker.ContainerCreate(ctx, &createConfig, hostConfig, networks, nil, name)
@@ -287,6 +311,186 @@ func (s *Service) UpdateWithOptions(ctx context.Context, id, name, imageRef stri
 	return nil
 }
 
+// RecoverUpdate uses only the private inspect snapshot and durable identity
+// facts. It removes only a uniquely verified replacement created by this task,
+// then restores the original container name and running state when possible.
+// Any ambiguity is reported as unknown without deleting or renaming anything.
+func (s *Service) RecoverUpdate(ctx context.Context, taskID string, snapshotBytes []byte, state UpdateRecoveryState, checkpoint func(UpdateCheckpoint) error) (UpdateRecoveryResult, error) {
+	unknown := func(detail string) UpdateRecoveryResult {
+		return UpdateRecoveryResult{Status: "unknown", Detail: detail}
+	}
+	if s == nil || s.docker == nil || ctx == nil || taskID == "" || len(snapshotBytes) == 0 || checkpoint == nil {
+		return unknown("更新恢复所需的Docker客户端、上下文、任务身份或私有快照不可用"), errors.New("update recovery dependencies are incomplete")
+	}
+	var before dockertypes.ContainerJSON
+	if err := json.Unmarshal(snapshotBytes, &before); err != nil {
+		return unknown("私有容器快照损坏；未执行自动恢复"), fmt.Errorf("decode update snapshot: %w", err)
+	}
+	if before.ContainerJSONBase == nil || before.Config == nil || before.HostConfig == nil || before.ID == "" {
+		return unknown("私有容器快照缺少原容器身份或配置；未执行自动恢复"), errors.New("update snapshot is missing required original container facts")
+	}
+	oldID := state.OldContainerID
+	if oldID == "" {
+		oldID = before.ID
+	}
+	if oldID != before.ID {
+		return unknown("持久化旧容器ID与快照不一致；未执行自动恢复"), errors.New("update recovery old container ID does not match snapshot")
+	}
+	stage := state.Stage
+	switch stage {
+	case "", "preflight", "snapshot", "snapshot-saved", "pulling-image", "resolving-image", "image-resolved":
+		return UpdateRecoveryResult{Status: "not-needed", Detail: "更新尚未进入旧容器修改阶段"}, nil
+	case "old-removed", "cleanup-old":
+		return unknown("旧容器可能已删除；不会通过名称重建或删除容器，请人工核对Docker状态"), nil
+	case "stopping-old", "old-stopped", "renaming-old", "old-renamed", "creating-new", "created-new", "starting-new", "new-started", "validating-new", "removing-old", "recovery-new-discovered", "recovery-removing-new", "recovery-restoring-name", "recovery-starting-old", "recovery-stopping-old":
+	default:
+		return unknown("更新阶段无法识别；未执行自动恢复"), nil
+	}
+	if state.ResolvedImageID == "" {
+		return unknown("恢复所需的固定镜像ID缺失；未执行自动恢复"), nil
+	}
+	if state.BackupName == "" && stage != "stopping-old" && stage != "old-stopped" {
+		return unknown("恢复所需的备份名称缺失；未执行自动恢复"), nil
+	}
+
+	old, err := s.docker.ContainerInspect(ctx, oldID)
+	if err != nil {
+		return unknown("无法按原容器ID核对旧容器；未执行自动恢复"), fmt.Errorf("inspect original container during recovery: %w", err)
+	}
+	if old.ID != oldID {
+		return unknown("Docker返回的旧容器ID与快照不一致；未执行自动恢复"), nil
+	}
+	originalName := strings.TrimLeft(strings.TrimSpace(before.Name), "/")
+	if originalName == "" {
+		return unknown("快照缺少原容器名称；未执行自动恢复"), nil
+	}
+	oldName := strings.TrimLeft(strings.TrimSpace(old.Name), "/")
+	if oldName != originalName && (state.BackupName == "" || oldName != state.BackupName) {
+		return unknown("旧容器名称已被外部修改；未执行自动恢复"), nil
+	}
+
+	newID := state.NewContainerID
+	var candidate *dockertypes.ContainerJSON
+	if newID != "" {
+		inspected, inspectErr := s.docker.ContainerInspect(ctx, newID)
+		if inspectErr == nil {
+			candidate = &inspected
+		} else if !cerrdefs.IsNotFound(inspectErr) {
+			return unknown("无法核对已记录的新容器ID；未执行自动恢复"), fmt.Errorf("inspect recorded replacement during recovery: %w", inspectErr)
+		}
+	}
+	args := filters.NewArgs(filters.Arg("label", updateTaskLabel+"="+taskID))
+	listed, listErr := s.docker.ContainerList(ctx, container.ListOptions{All: true, Filters: args})
+	if listErr != nil {
+		return unknown("无法按任务标签核对可能的新容器；未执行自动恢复"), fmt.Errorf("list task-labeled replacement containers: %w", listErr)
+	}
+	listedCandidate := false
+	for _, item := range listed {
+		inspected, inspectErr := s.docker.ContainerInspect(ctx, item.ID)
+		if inspectErr != nil {
+			return unknown("无法检查任务标签对应的新容器；未执行自动恢复"), fmt.Errorf("inspect task-labeled replacement: %w", inspectErr)
+		}
+		if !matchesUpdateCandidate(inspected, taskID, state.ResolvedImageID, originalName) {
+			return unknown("任务标签对应容器与持久化镜像或名称不匹配；未执行删除"), nil
+		}
+		if candidate != nil && candidate.ID != inspected.ID {
+			return unknown("发现多个任务标签对应的新容器；未执行自动恢复"), nil
+		}
+		candidate = &inspected
+		listedCandidate = true
+	}
+	if candidate != nil && !listedCandidate {
+		return unknown("记录的新容器未出现在唯一任务标签结果中；未执行自动恢复"), nil
+	}
+	if candidate != nil {
+		if !matchesUpdateCandidate(*candidate, taskID, state.ResolvedImageID, originalName) {
+			return unknown("记录的新容器身份与任务标签、固定镜像ID或目标名称不匹配；未执行删除"), nil
+		}
+		if newID == "" {
+			newID = candidate.ID
+			if err := checkpoint(UpdateCheckpoint{Stage: "recovery-new-discovered", OldContainerID: oldID, NewContainerID: newID, ResolvedImageID: state.ResolvedImageID, BackupName: state.BackupName}); err != nil {
+				return unknown("已发现新容器，但持久化身份失败；未执行删除"), fmt.Errorf("persist discovered replacement identity: %w", err)
+			}
+		}
+		if err := s.Operations().AddAlias(taskID, operation.Target{ID: newID}); err != nil {
+			return unknown("已发现新容器，但无法保护其ID；未执行删除"), fmt.Errorf("protect replacement identity: %w", err)
+		}
+	}
+
+	// Never remove by name. A name lookup must be either the original ID, the
+	// verified task-owned replacement, or absent.
+	nameOccupant, nameErr := s.docker.ContainerInspect(ctx, originalName)
+	if nameErr == nil && nameOccupant.ID != oldID && (candidate == nil || nameOccupant.ID != candidate.ID) {
+		return unknown("目标容器名称已被其他容器占用；未执行自动恢复"), nil
+	} else if nameErr != nil && !cerrdefs.IsNotFound(nameErr) {
+		return unknown("无法核对目标容器名称占用情况；未执行自动恢复"), fmt.Errorf("inspect update target name during recovery: %w", nameErr)
+	}
+
+	if candidate != nil {
+		if err := checkpoint(UpdateCheckpoint{Stage: "recovery-removing-new", OldContainerID: oldID, NewContainerID: candidate.ID, ResolvedImageID: state.ResolvedImageID, BackupName: state.BackupName}); err != nil {
+			return unknown("删除新容器前无法保存恢复检查点；未执行删除"), fmt.Errorf("persist recovery removal checkpoint: %w", err)
+		}
+		if err := s.docker.ContainerRemove(ctx, candidate.ID, container.RemoveOptions{Force: true}); err != nil {
+			remaining, inspectErr := s.docker.ContainerInspect(ctx, candidate.ID)
+			if inspectErr == nil || !cerrdefs.IsNotFound(inspectErr) {
+				return unknown("无法确认新容器已删除；旧容器保持原状"), errors.Join(fmt.Errorf("remove verified replacement: %w", err), inspectErr)
+			}
+			_ = remaining
+		}
+	}
+
+	if oldName == state.BackupName {
+		if err := checkpoint(UpdateCheckpoint{Stage: "recovery-restoring-name", OldContainerID: oldID, NewContainerID: newID, ResolvedImageID: state.ResolvedImageID, BackupName: state.BackupName}); err != nil {
+			return unknown("恢复旧容器名称前无法保存检查点"), fmt.Errorf("persist recovery rename checkpoint: %w", err)
+		}
+		if err := s.docker.ContainerRename(ctx, oldID, originalName); err != nil {
+			return unknown("恢复旧容器名称失败；请人工处理"), fmt.Errorf("rename original container back: %w", err)
+		}
+	}
+	old, err = s.docker.ContainerInspect(ctx, oldID)
+	if err != nil {
+		return unknown("恢复名称后无法核对旧容器；请人工处理"), fmt.Errorf("verify restored original container: %w", err)
+	}
+	if strings.TrimLeft(strings.TrimSpace(old.Name), "/") != originalName {
+		return unknown("旧容器名称未恢复；请人工处理"), nil
+	}
+	originallyRunning := before.State != nil && before.State.Running
+	currentlyRunning := old.State != nil && old.State.Running
+	if originallyRunning && !currentlyRunning {
+		if err := checkpoint(UpdateCheckpoint{Stage: "recovery-starting-old", OldContainerID: oldID, NewContainerID: newID, ResolvedImageID: state.ResolvedImageID, BackupName: state.BackupName}); err != nil {
+			return unknown("启动旧容器前无法保存检查点"), fmt.Errorf("persist recovery start checkpoint: %w", err)
+		}
+		if err := s.docker.ContainerStart(ctx, oldID, container.StartOptions{}); err != nil {
+			return unknown("重新启动旧容器失败；请人工处理"), fmt.Errorf("restart original container after rollback: %w", err)
+		}
+	} else if !originallyRunning && currentlyRunning {
+		if err := checkpoint(UpdateCheckpoint{Stage: "recovery-stopping-old", OldContainerID: oldID, NewContainerID: newID, ResolvedImageID: state.ResolvedImageID, BackupName: state.BackupName}); err != nil {
+			return unknown("停止旧容器前无法保存检查点"), fmt.Errorf("persist recovery stop checkpoint: %w", err)
+		}
+		if err := s.docker.ContainerStop(ctx, oldID, container.StopOptions{Signal: before.Config.StopSignal, Timeout: before.Config.StopTimeout}); err != nil {
+			return unknown("恢复旧容器的停止状态失败；请人工处理"), fmt.Errorf("stop original container after rollback: %w", err)
+		}
+	}
+	verified, err := s.docker.ContainerInspect(ctx, oldID)
+	if err != nil {
+		return unknown("恢复旧容器状态后无法核对；请人工处理"), fmt.Errorf("verify restored original container state: %w", err)
+	}
+	if verified.ID != oldID || strings.TrimLeft(strings.TrimSpace(verified.Name), "/") != originalName || verified.State == nil || verified.State.Running != originallyRunning {
+		return unknown("Docker操作返回后，旧容器身份、名称或运行状态与快照不一致；请人工处理"), nil
+	}
+	return UpdateRecoveryResult{Status: "restored", Detail: "已移除经任务身份核验的新容器，并恢复旧容器名称与原运行状态"}, nil
+}
+
+func matchesUpdateCandidate(candidate dockertypes.ContainerJSON, taskID, imageID, name string) bool {
+	if candidate.ContainerJSONBase == nil || candidate.Config == nil || candidate.ID == "" || candidate.Image != imageID {
+		return false
+	}
+	if candidate.Config.Labels[updateTaskLabel] != taskID || strings.TrimLeft(strings.TrimSpace(candidate.Name), "/") != name {
+		return false
+	}
+	return true
+}
+
 func preserveObservedVolumes(host *container.HostConfig, mounts []container.MountPoint) *container.HostConfig {
 	result := new(container.HostConfig)
 	if host != nil {
@@ -335,6 +539,17 @@ func preserveObservedVolumes(host *container.HostConfig, mounts []container.Moun
 		})
 	}
 	return result
+}
+
+func cloneDockerLabels(labels map[string]string) map[string]string {
+	if labels == nil {
+		return nil
+	}
+	cloned := make(map[string]string, len(labels))
+	for key, value := range labels {
+		cloned[key] = value
+	}
+	return cloned
 }
 
 func (s *Service) validateStartedContainer(ctx context.Context, id string, options UpdateValidationOptions, expectedHealthcheck bool, publish func(string, int, string) error) (string, error) {

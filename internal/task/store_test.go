@@ -64,6 +64,62 @@ func TestStoreCRUDPermissionsAndPublicProjection(t *testing.T) {
 	}
 }
 
+func TestStoreRecoveryCheckpointPreservesTerminalOutcome(t *testing.T) {
+	s, err := Open(Options{Dir: filepath.Join(t.TempDir(), "tasks")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	r := sampleRecord()
+	if err := s.Create(r); err != nil {
+		t.Fatal(err)
+	}
+	r, err = s.Get(r.TaskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := time.Now().UTC()
+	r.Status, r.StartedAt = StatusRunning, &started
+	if err := s.Save(r); err != nil {
+		t.Fatal(err)
+	}
+	finished := started.Add(time.Second)
+	r.Status, r.FinishedAt, r.UpdatedAt = StatusFailed, &finished, finished
+	r.Error = "operation failed"
+	r.Recovery = Recovery{Status: "unknown", Detail: "recovery pending"}
+	r.RequiresAttention = true
+	if err := s.Save(r); err != nil {
+		t.Fatal(err)
+	}
+	r, err = s.Get(r.TaskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.Stage = "recovering-old"
+	r.NewContainerID = "new-confirmed"
+	r.ContainerIDs = append(r.ContainerIDs, "new-confirmed")
+	if err := s.saveRecoveryCheckpoint(r); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.Get(r.TaskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != StatusFailed || got.Error != "operation failed" || got.FinishedAt == nil || !got.FinishedAt.Equal(finished) || got.Stage != "recovering-old" || got.NewContainerID != "new-confirmed" {
+		t.Fatalf("recovery checkpoint changed or lost task facts: %#v", got)
+	}
+	bad := got
+	bad.Error = "rewritten result"
+	if err := s.saveRecoveryCheckpoint(bad); err == nil {
+		t.Fatal("recovery checkpoint rewrote the terminal error")
+	}
+	bad = got
+	bad.Status = StatusSucceeded
+	if err := s.saveRecoveryCheckpoint(bad); err == nil {
+		t.Fatal("recovery checkpoint reversed terminal status")
+	}
+}
+
 func TestStoreCorruptRecordQuarantinedAndValidRecordsReadable(t *testing.T) {
 	dir := t.TempDir()
 	valid := sampleRecord()

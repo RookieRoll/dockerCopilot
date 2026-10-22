@@ -59,6 +59,21 @@ func (s *runnerMemoryStore) Save(r Record) error {
 	s.records[r.TaskID] = cloneRecord(r)
 	return nil
 }
+func (s *runnerMemoryStore) saveRecoveryCheckpoint(r Record) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	old, ok := s.records[r.TaskID]
+	if !ok || old.Status != r.Status || old.Error != r.Error || !old.CreatedAt.Equal(r.CreatedAt) {
+		return errors.New("invalid recovery checkpoint")
+	}
+	old.Stage = r.Stage
+	old.NewContainerID = r.NewContainerID
+	old.ContainerIDs = cloneStrings(r.ContainerIDs)
+	old.BackupContainerName = r.BackupContainerName
+	old.UpdatedAt = r.UpdatedAt
+	s.records[r.TaskID] = old
+	return nil
+}
 func (s *runnerMemoryStore) Get(id string) (Record, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -815,6 +830,164 @@ func TestRunnerRunsRecoveryForOrdinaryFailure(t *testing.T) {
 	}
 	if !called.Load() || r.Status != StatusFailed || r.Recovery.Status != "not-needed" {
 		t.Fatalf("called=%v record=%#v", called.Load(), r)
+	}
+}
+
+func TestRecoveryCheckpointIsAuthorizedAndPersistsIdentityFacts(t *testing.T) {
+	store := newRunnerMemoryStore()
+	runner := newTestRunner(t, store, RunnerOptions{MaxConcurrent: 1, QueueCapacity: 1})
+	want := errors.New("update failed after new container creation")
+	var execution *Execution
+	id, err := runner.Submit(TaskSpec{
+		Record: runnerRecord(),
+		Run: func(_ context.Context, e *Execution) error {
+			execution = e
+			return want
+		},
+		Recover: func(ctx context.Context, cause error) (Recovery, error) {
+			if !errors.Is(cause, want) {
+				return Recovery{}, errors.New("recovery cause was not preserved")
+			}
+			// The callback cannot get its Execution through the signature, so the
+			// test uses the reference assigned by the Run callback below.
+			if execution == nil {
+				return Recovery{}, errors.New("execution reference unavailable")
+			}
+			err := execution.RecoveryCheckpoint(ctx, "recovering-old", func(record *Record) {
+				record.NewContainerID = "new-confirmed"
+				record.ContainerIDs = append(record.ContainerIDs, "new-confirmed")
+			})
+			if err != nil {
+				return Recovery{}, err
+			}
+			return Recovery{Status: "restored"}, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := runner.WaitIdle(testContext(t, time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	record, err := store.Get(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.Status != StatusFailed || record.Stage != "recovering-old" || record.NewContainerID != "new-confirmed" ||
+		record.Recovery.Status != "restored" || record.Error != want.Error() {
+		t.Fatalf("recovery checkpoint/final result mismatch: %#v", record)
+	}
+}
+
+func TestRecoveryCheckpointCanAddFactsAfterTimeoutWithoutRewritingTerminalResult(t *testing.T) {
+	store := newRunnerMemoryStore()
+	runner := newTestRunner(t, store, RunnerOptions{MaxConcurrent: 1, QueueCapacity: 1, TaskTimeout: 20 * time.Millisecond, RecoveryTimeout: time.Second})
+	var execution *Execution
+	record := runnerRecord()
+	id := record.TaskID
+	_, err := runner.Submit(TaskSpec{
+		Record: record,
+		Run: func(ctx context.Context, e *Execution) error {
+			execution = e
+			<-ctx.Done()
+			return ctx.Err()
+		},
+		Recover: func(ctx context.Context, cause error) (Recovery, error) {
+			before, err := store.Get(id)
+			if err != nil {
+				return Recovery{}, err
+			}
+			if before.Status != StatusFailed || before.FinishedAt == nil || !errors.Is(cause, context.DeadlineExceeded) {
+				return Recovery{}, errors.New("timeout terminal result was not persisted before recovery")
+			}
+			if err := execution.RecoveryCheckpoint(ctx, "recovering-old", func(record *Record) {
+				record.NewContainerID = "new-after-timeout"
+				record.ContainerIDs = append(record.ContainerIDs, "new-after-timeout")
+			}); err != nil {
+				return Recovery{}, err
+			}
+			after, err := store.Get(id)
+			if err != nil {
+				return Recovery{}, err
+			}
+			if after.Status != before.Status || after.Error != before.Error || !after.FinishedAt.Equal(*before.FinishedAt) {
+				return Recovery{}, errors.New("recovery checkpoint rewrote terminal task result")
+			}
+			return Recovery{Status: "restored"}, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := runner.WaitIdle(testContext(t, 2*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	finalRecord, err := store.Get(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if finalRecord.Status != StatusFailed || finalRecord.Stage != "recovering-old" || finalRecord.NewContainerID != "new-after-timeout" || finalRecord.Recovery.Status != "restored" {
+		t.Fatalf("timeout recovery result: %#v", finalRecord)
+	}
+}
+
+func TestRecoveryCheckpointRejectsCallsOutsideAuthorizedCallback(t *testing.T) {
+	store := newRunnerMemoryStore()
+	runner := newTestRunner(t, store, RunnerOptions{MaxConcurrent: 1, QueueCapacity: 1})
+	var execution *Execution
+	id, err := runner.Submit(TaskSpec{Record: runnerRecord(), Run: func(_ context.Context, e *Execution) error {
+		execution = e
+		return nil
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := runner.WaitIdle(testContext(t, time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if err := execution.RecoveryCheckpoint(context.Background(), "unauthorized", nil); err == nil {
+		t.Fatal("recovery checkpoint succeeded outside the active recovery callback")
+	}
+	record, err := store.Get(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.Status != StatusSucceeded || record.Stage == "unauthorized" {
+		t.Fatalf("unauthorized recovery altered task: %#v", record)
+	}
+}
+
+func TestRecoveryCheckpointAuthorizationEndsBeforeCallbackSettlement(t *testing.T) {
+	store := newRunnerMemoryStore()
+	runner := newTestRunner(t, store, RunnerOptions{MaxConcurrent: 1, QueueCapacity: 1})
+	var execution *Execution
+	var recoveryCtx context.Context
+	id, err := runner.Submit(TaskSpec{
+		Record: runnerRecord(),
+		Run: func(_ context.Context, e *Execution) error {
+			execution = e
+			return errors.New("trigger recovery")
+		},
+		Recover: func(ctx context.Context, _ error) (Recovery, error) {
+			recoveryCtx = ctx
+			return Recovery{Status: "not-needed"}, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := runner.WaitIdle(testContext(t, time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if err := execution.RecoveryCheckpoint(recoveryCtx, "late", nil); err == nil {
+		t.Fatal("checkpoint remained authorized after the recovery callback returned")
+	}
+	record, err := store.Get(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.Stage == "late" || record.Recovery.Status != "not-needed" {
+		t.Fatalf("late recovery checkpoint altered final record: %#v", record)
 	}
 }
 
