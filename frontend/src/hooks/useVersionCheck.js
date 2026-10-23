@@ -45,6 +45,17 @@ export function useVersionCheck({ enabled = true } = {}) {
   const [showUpdatePrompt, setShowUpdatePrompt] = useState(false)
   const [isSubmittingUpdate, setIsSubmittingUpdate] = useState(false)
   const [programTaskRequestId, setProgramTaskRequestId] = useState(readPendingAcceptance)
+  const handleProgramTaskTerminal = useCallback((task) => {
+    writePendingAcceptance(false)
+    setProgramTaskRequestId('')
+    if (task?.status === 'succeeded') {
+      // A queued/accepted task is not an installation result. Reload only after
+      // the backend has durably confirmed the handoff and reports success.
+      globalThis.setTimeout?.(() => globalThis.location?.reload(), 3000)
+    } else if (task?.status === 'failed' || task?.status === 'interrupted') {
+      globalThis.alert?.('后端更新失败，请手动重启应用')
+    }
+  }, [])
   const programTask = useTask({
     enabled,
     storageKey: PROGRAM_UPDATE_TASK_STORAGE_KEY,
@@ -52,7 +63,7 @@ export function useVersionCheck({ enabled = true } = {}) {
     discoverTaskType: Boolean(programTaskRequestId),
     taskRequestId: programTaskRequestId,
     invalidateKeys: [['version']],
-    onTerminal: () => writePendingAcceptance(false),
+    onTerminal: handleProgramTaskTerminal,
   })
 
   // 查询后端版本信息
@@ -111,18 +122,18 @@ export function useVersionCheck({ enabled = true } = {}) {
       setShowUpdatePrompt(true)
       return accepted
     } catch (error) {
-      // useTask distinguishes a definite rejection from an unknown POST result
-      // and never repeats the request. Keep that diagnostic visible in the task
-      // panel instead of presenting a success dialog or reloading the page.
+      // A failed POST can have an unknown outcome. Keep tracking its request ID
+      // without replaying it; only a definite rejection gets the old error
+      // prompt. The legacy UI has no task-status panel.
       const normalized = normalizeHttpError(error)
       const definitelyRejected = Number.isFinite(normalized.status) && normalized.status >= 400 && normalized.status < 500 && normalized.status !== 408 && normalized.status !== 429
       if (definitelyRejected) {
         writePendingAcceptance(false)
         setProgramTaskRequestId('')
+        globalThis.alert?.('后端更新失败，请手动重启应用')
       } else {
         setProgramTaskRequestId(attemptRequestId)
       }
-      setShowUpdatePrompt(true)
       return null
     } finally {
       setIsSubmittingUpdate(false)
@@ -134,6 +145,8 @@ export function useVersionCheck({ enabled = true } = {}) {
     await refetch()
   }, [refetch])
 
+  const updateState = programUpdateState({ task: programTask.task, taskId: programTask.taskId, isSubmitting: isSubmittingUpdate, submitError: programTask.submitError, discoveryPending: Boolean(programTaskRequestId) })
+
   return {
     // 状态
     showUpdatePrompt,
@@ -143,10 +156,7 @@ export function useVersionCheck({ enabled = true } = {}) {
     remoteVersion: versionData?.remoteVersion,
     buildDate: versionData?.buildDate,
     hasBackendUpdate: versionData?.hasBackendUpdate,
-    versionCheckError: versionData?.localError || versionData?.remoteError || '',
-    programTask,
-    programUpdateState: programUpdateState({ task: programTask.task, taskId: programTask.taskId, isSubmitting: isSubmittingUpdate, submitError: programTask.submitError, discoveryPending: Boolean(programTaskRequestId) }),
-    isSubmittingUpdate,
+    isUpdating: updateState === 'submitting' || updateState === 'active' || updateState === 'uncertain',
     
     // 方法
     setShowUpdatePrompt,

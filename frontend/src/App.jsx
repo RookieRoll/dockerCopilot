@@ -126,7 +126,7 @@ function AppContent() {
       case '#backups':
         return <Backups />
       case '#about':
-        return <About versionState={versionState} />
+        return <About />
       default:
         return <Containers />
     }

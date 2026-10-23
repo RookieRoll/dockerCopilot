@@ -1,7 +1,6 @@
 import React, { useState } from 'react'
 import { AlertCircle, Download, RefreshCw, X } from 'lucide-react'
 import { cn } from '../utils/cn.js'
-import { TaskStatusPanel } from './tasks/TaskStatusPanel.jsx'
 
 /**
  * 版本更新提示组件
@@ -14,12 +13,7 @@ export function UpdatePrompt({
   remoteVersion,
   hasBackendUpdate,
   onUpdateBackend,
-  isUpdating = false,
-  programTask,
-  programUpdateState = 'idle',
-  isSubmittingUpdate = false,
-  versionCheckError = '',
-  onCheckVersions,
+  isUpdating = false
 }) {
   if (!isVisible) return null
 
@@ -39,7 +33,7 @@ export function UpdatePrompt({
             <div className="flex items-center gap-2">
               <AlertCircle className="h-5 w-5 text-blue-600 dark:text-blue-400" />
               <h2 className="text-lg font-semibold text-gray-900 dark:text-white">
-                {versionCheckError ? '版本检查失败' : '有新版本可用'}
+                有新版本可用
               </h2>
             </div>
             <button
@@ -71,25 +65,9 @@ export function UpdatePrompt({
               <p className="text-sm text-blue-800 dark:text-blue-300">
                 {hasBackendUpdate
                   ? '检测到后端有新版本可用。建议您立即更新以获得最新功能和安全补丁。'
-                  : versionCheckError ? '无法确认当前是否有新版本，请重新检查。' : '您正在使用最新版本，感谢您的支持！'}
+                  : '您正在使用最新版本，感谢您的支持！'}
               </p>
             </div>
-            {versionCheckError && (
-              <div role="alert" className="mb-4 rounded-lg border border-amber-300 bg-amber-50 p-3 text-sm text-amber-900 dark:border-amber-800 dark:bg-amber-950/40 dark:text-amber-200">
-                版本检查失败：{versionCheckError}{' '}
-                <button type="button" onClick={onCheckVersions} className="font-medium underline underline-offset-2">重新检查</button>
-              </div>
-            )}
-            {programTask && (
-              <TaskStatusPanel
-                task={programTask.task}
-                taskId={programTask.taskId}
-                connectionError={programTask.connectionError}
-                unauthorized={programTask.unauthorized}
-                submitError={programTask.submitError}
-                isTracking={programTask.isTracking}
-              />
-            )}
           </div>
 
           {/* 底部 - 操作按钮 */}
@@ -115,7 +93,7 @@ export function UpdatePrompt({
                 {isUpdating ? (
                   <>
                     <RefreshCw className="h-4 w-4 animate-spin" />
-                    {isSubmittingUpdate ? '提交中...' : programUpdateState === 'uncertain' ? '结果待确认' : '等待重启确认'}
+                    更新中...
                   </>
                 ) : (
                   <>

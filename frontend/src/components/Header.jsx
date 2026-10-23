@@ -48,10 +48,7 @@ export function Sidebar({ activeTab, onTabChange, onLogout, isCollapsed = false,
     hasBackendUpdate,
     updateBackend,
     checkForUpdates,
-    programTask,
-    programUpdateState,
-    isSubmittingUpdate,
-    versionCheckError,
+    isUpdating,
   } = versionState
 
   // 智能判断是否可以手动切换侧边栏
@@ -350,12 +347,7 @@ export function Sidebar({ activeTab, onTabChange, onLogout, isCollapsed = false,
         remoteVersion={remoteVersion}
         hasBackendUpdate={hasBackendUpdate}
         onUpdateBackend={updateBackend}
-        isUpdating={programUpdateState === 'submitting' || programUpdateState === 'active' || programUpdateState === 'uncertain'}
-        programTask={programTask}
-        programUpdateState={programUpdateState}
-        isSubmittingUpdate={isSubmittingUpdate}
-        versionCheckError={versionCheckError}
-        onCheckVersions={checkForUpdates}
+        isUpdating={isUpdating}
       />
     </>
   )
