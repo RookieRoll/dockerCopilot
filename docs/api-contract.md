@@ -8,7 +8,7 @@ missing values are replaced with a server-generated UUID.
 
 ## Asynchronous tasks
 
-An accepted task response means the task record was durably created and queued;
+An accepted task response means the operation was registered in process memory and admitted for execution;
 it does not mean the operation completed. Accepted responses include `taskID`;
 the batch, image-cleanup, and program-update endpoints also include
 `status: "queued"`, while backup, restore, and container-update responses
@@ -22,15 +22,15 @@ status and diagnostics rather than treating the query itself as failed.
 `restart`, or `update`) and `containerIDs`. For `update`, the optional
 `deleteOldContainer` boolean overrides the configured default; omission keeps
 that default. The service de-duplicates IDs and accepts at most 100 targets. It
-returns the parent task ID after durable acceptance and records per-target
+returns the parent task ID after in-memory acceptance and records per-target
 success, failure, and skip results. The batch route is JWT protected.
 
 `POST /api/images/cleanup` accepts `{"policy":"dangling"}` or
-`{"policy":"unused"}` and returns a queued task ID. It is JWT protected;
+`{"policy":"unused"}` and returns an accepted task ID. It is JWT protected;
 per-image results are available through the task query endpoints.
 
 `POST /api/container/backup` and `POST /api/container/backup2compose` accept
-export tasks and return after queue acceptance. The legacy `GET` export routes
+export tasks and return after acceptance. The legacy `GET` export routes
 retain their synchronous completion semantics. `POST
 /api/container/backups/restore` returns a task ID; restore validates the whole
 input before Docker changes and reports per-item outcomes through the task.
@@ -52,3 +52,5 @@ completion.
 For an update, each target uses its inspected container name and current image
 configuration. Set `deleteOldContainer` explicitly only when overriding the
 configured cleanup preference.
+
+Ordinary progress is process-local and short-lived. Missing progress returns HTTP 410 with `errorCode: OPERATION_RESULT_EXPIRED`; its operation result is unknown and must be checked against Docker and logs. Clients must not replay the mutation. There is no persistent task queue or startup replay.

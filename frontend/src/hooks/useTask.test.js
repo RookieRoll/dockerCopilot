@@ -133,6 +133,29 @@ test('network failures back off within a bound and then continue polling', async
   assert.equal(clock.timers.size, 0)
 })
 
+test('expired process-local progress reports unknown and stops polling without replay', async () => {
+  const clock = fakeTimers()
+  let calls = 0
+  const terminal = []
+  const controller = createTaskPollingController({
+    getTask: async () => {
+      calls += 1
+      throw new ApiError('进度已失效，操作结果未知', { status: 410, errorCode: 'OPERATION_RESULT_EXPIRED' })
+    },
+    onTerminal: (value) => terminal.push(value),
+    setTimer: clock.setTimer,
+    clearTimer: clock.clearTimer,
+  })
+  controller.start('before-restart')
+  await flush()
+  assert.equal(calls, 1)
+  assert.equal(clock.timers.size, 0)
+  assert.equal(terminal.length, 1)
+  assert.equal(terminal[0].status, 'interrupted')
+  assert.equal(terminal[0].recovery.status, 'unknown')
+  assert.match(terminal[0].error, /结果未知/)
+})
+
 test('401 becomes visible unauthorized state and stops polling', async () => {
   const clock = fakeTimers()
   let unauthorized

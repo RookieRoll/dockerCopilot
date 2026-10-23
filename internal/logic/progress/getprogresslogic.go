@@ -21,30 +21,37 @@ type GetProgressLogic struct {
 }
 
 func NewGetProgressLogic(ctx context.Context, svcCtx *svc.ServiceContext) *GetProgressLogic {
-	return &GetProgressLogic{
-		Logger:      logx.WithContext(ctx),
-		ctx:         ctx,
-		getProgress: svcCtx.ProgressService().Get,
-		taskQuery:   svcCtx.TaskQuery,
+	logic := &GetProgressLogic{
+		Logger:    logx.WithContext(ctx),
+		ctx:       ctx,
+		taskQuery: svcCtx.TaskQuery,
 	}
+	if logic.taskQuery == nil {
+		logic.getProgress = svcCtx.ProgressService().Get
+	}
+	return logic
 }
 
 type taskNotFoundError struct{ cause error }
 
-func (e taskNotFoundError) Error() string     { return "taskID 未找到" }
+func (e taskNotFoundError) Error() string {
+	return "进度已失效，服务可能已重启；操作结果未知，请核对容器状态和日志"
+}
 func (e taskNotFoundError) Unwrap() error     { return e.cause }
-func (e taskNotFoundError) HTTPStatus() int   { return http.StatusNotFound }
-func (e taskNotFoundError) ErrorCode() string { return "TASK_NOT_FOUND" }
+func (e taskNotFoundError) HTTPStatus() int   { return http.StatusGone }
+func (e taskNotFoundError) ErrorCode() string { return "OPERATION_RESULT_EXPIRED" }
 
 func (l *GetProgressLogic) GetProgress(req *types.GetProgressReq) (resp *types.Resp, err error) {
 	resp = &types.Resp{}
 	if l.taskQuery != nil {
 		record, queryErr := l.taskQuery.GetProgress(req.TaskId)
 		if queryErr != nil {
-			resp.Code = http.StatusNotFound
-			resp.Msg = "taskID 未找到"
+			resp.Code = http.StatusGone
+			resp.Msg = taskNotFoundError{}.Error()
 			resp.Data = map[string]interface{}{}
 			if !errors.Is(queryErr, os.ErrNotExist) {
+				resp.Code = 0
+				resp.Msg = queryErr.Error()
 				return resp, queryErr
 			}
 			return resp, taskNotFoundError{cause: queryErr}
@@ -56,8 +63,8 @@ func (l *GetProgressLogic) GetProgress(req *types.GetProgressReq) (resp *types.R
 	}
 	progress, exists := l.getProgress(req.TaskId)
 	if !exists {
-		resp.Code = http.StatusNotFound
-		resp.Msg = "taskID 未找到"
+		resp.Code = http.StatusGone
+		resp.Msg = taskNotFoundError{}.Error()
 		resp.Data = map[string]interface{}{}
 		return resp, taskNotFoundError{}
 	}

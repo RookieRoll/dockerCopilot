@@ -5,7 +5,7 @@
 
 # 介绍
 
-一个面向 Docker Engine 的单主机容器管理工具。服务提供容器生命周期与镜像管理、容器更新、备份恢复、端口映射和图标管理，后台使用持久任务与日志记录操作过程。
+一个面向 Docker Engine 的单主机容器管理工具。服务提供容器生命周期与镜像管理、容器更新、备份恢复、端口映射和图标管理，后台使用有限并发操作、短期内存进度和诊断日志记录操作过程。
 
 已实现的主要功能：
 
@@ -15,7 +15,7 @@
 4. 导出 JSON/Compose 配置备份并恢复容器配置；备份不包含挂载卷数据，恢复不会自动启动容器。
 5. 管理自定义图标，通过后台任务 API 与日志排查操作问题。
 
-架构优化保持原有页面和操作入口；任务持久化、恢复与诊断留在后台，详见[页面兼容边界](docs/ui-compatibility.md)。
+架构优化保持原有页面和操作入口；并发协调、即时恢复与诊断留在后台，详见[页面兼容边界](docs/ui-compatibility.md)。
 
 ## 使用
 
@@ -42,13 +42,13 @@ services:
 
 ## 服务配置
 
-服务默认读取 `etc/dockerCopilot.yaml`。集中配置预设任务记录目录为 `/data/tasks`、并发上限为 2、队列容量为 100、更新/恢复期限为 30 分钟、终态记录保留 7 天且最多 1000 条。健康检查等待、持续运行观察和恢复预算分别预设为 120 秒、10 秒和 2 分钟；任务记录、队列、恢复和排空行为由服务启动时统一组装。
+服务默认读取 `etc/dockerCopilot.yaml`。后台操作默认最多同时执行 2 个，操作期限 30 分钟；没有等待队列或持久任务机制。普通终态进度在当前进程保留 10 分钟，内存记录和快照均有容量限制。健康检查等待、持续运行观察和即时恢复预算分别为 120 秒、10 秒和 2 分钟。服务重启后普通进度失效，结果需结合 Docker 当前状态与日志核对；不会自动重放操作。
 
 日志配置预设写入 `/data/logs`、级别为 `info`、保留 7 天，单文件与目录容量上限分别为 20 MiB 和 200 MiB；日志按日和文件大小轮转，并在写入时清理过期文件及控制总容量。文件日志不可用时保留标准输出并降级告警。备份默认写入 `/data/backups`，端口覆盖配置默认写入 `/data/config/container-port-overrides.json`。在线更新源默认为 `RookieRoll/dockerCopilot`。旧的 `BACKUP_DIR`、`DelOldContainer`、`githubProxy` 和 `CONTAINER_PORT_OVERRIDES_PATH` 环境变量继续生效；对应环境变量优先于 YAML。`DelOldContainer` 接受 `true` 或 `false`，单次更新请求显式提供 `delOldContainer` 时优先使用请求值。
 
 JSON 与 Compose 备份保存容器配置（包括环境变量、挂载定义和网络配置），不复制挂载卷中的文件或应用数据；恢复会按备份配置创建容器，但不会自动启动。备份文件使用限制性权限保存，请按敏感配置数据管理。
 
-任务、日志和更新配置也可使用 `DOCKERCOPILOT_TASK_*`、`DOCKERCOPILOT_LOG_*`、`DOCKERCOPILOT_UPDATE_REPOSITORY` 与 `DOCKERCOPILOT_GITHUB_PROXY` 覆盖。`WORKDIR` 可设置在线程序更新目录；未设置时使用当前可执行文件所在目录。`DOCKERCOPILOT_SELF_CONTAINER` 可显式指定运行服务的容器名或 ID；未设置时仅当容器默认 hostname 是至少 12 位十六进制 ID 时尝试通过 Docker inspect 核验。任务超时、保留期和恢复/健康检查时间使用 Go duration 格式，例如 `30m`、`168h` 和 `120s`。更新仓库使用 `owner/repository` 格式；代理地址必须是没有凭据、查询参数或片段的 HTTP(S) URL。
+任务、日志和更新配置也可使用 `DOCKERCOPILOT_TASK_*`、`DOCKERCOPILOT_LOG_*`、`DOCKERCOPILOT_UPDATE_REPOSITORY` 与 `DOCKERCOPILOT_GITHUB_PROXY` 覆盖。`WORKDIR` 可设置在线程序更新目录；未设置时使用当前可执行文件所在目录。`DOCKERCOPILOT_SELF_CONTAINER` 可显式指定运行服务的容器名或 ID；未设置时仅当容器默认 hostname 是至少 12 位十六进制 ID 时尝试通过 Docker inspect 核验。操作超时和恢复/健康检查时间使用 Go duration 格式，例如 `30m` 和 `120s`。旧任务目录、队列和历史保留配置仅兼容读取，不再生效。更新仓库使用 `owner/repository` 格式；代理地址必须是没有凭据、查询参数或片段的 HTTP(S) URL。
 
 在线程序更新只支持能通过 Docker inspect 确认自身容器的部署，并要求容器重启策略为 `always` 或 `unless-stopped`、root filesystem 可写、安装目录与运行程序目录一致且可写。无法确认这些条件时更新任务会拒绝 handoff；普通容器管理仍可使用。使用自定义 hostname 的部署请显式设置 `DOCKERCOPILOT_SELF_CONTAINER`，例如 compose 中的固定 `container_name`。`WORKDIR` 应与挂载并运行 `start.sh` 的安装目录一致。
 
@@ -56,12 +56,8 @@ JSON 与 Compose 备份保存容器配置（包括环境变量、挂载定义和
 
 ```yaml
 Tasks:
-  Directory: /data/tasks
   MaxConcurrent: 2
-  QueueCapacity: 100
   Timeout: 30m
-  Retention: 168h
-  MaxRecords: 1000
   HealthcheckWait: 120s
   RunningObservation: 10s
   RecoveryTimeout: 2m
@@ -82,6 +78,10 @@ Docker:
 ```
 
 配置加载、默认值和启动校验通过后，服务会组装任务运行器、日志轮转和容器更新健康验证等运行时组件。
+
+## Docker 相关代理
+
+应用访问镜像仓库元数据和更新源时，支持标准 `HTTP_PROXY`、`HTTPS_PROXY`、`NO_PROXY` 环境变量。真实镜像拉取由 Docker Engine 执行，还需在 Docker 宿主机配置 daemon 代理；只给 dockerCopilot 容器设置代理不会改变 daemon 的拉取网络。配置示例见 [代理说明](docs/docker-proxy.md)。
 
 ## 开发环境
 

@@ -89,6 +89,21 @@ export function createTaskPollingController({
     } catch (cause) {
       if (stopped || currentRequest.signal.aborted || !isCurrentScope()) return
       const error = normalizeHttpError(cause)
+      if (taskId && error.status === 410 && error.errorCode === 'OPERATION_RESULT_EXPIRED') {
+        const expired = {
+          taskID: taskId,
+          status: 'interrupted',
+          isDone: true,
+          error: error.message,
+          recovery: { status: 'unknown' },
+        }
+        stopped = true
+        terminalTaskId = taskId
+        onConnectionError(null)
+        onUpdate(expired)
+        onTerminal(expired)
+        return
+      }
       if (error.status === 401) {
         stopped = true
         currentRequest.abort()
