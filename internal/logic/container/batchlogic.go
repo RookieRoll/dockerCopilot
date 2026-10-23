@@ -152,7 +152,13 @@ func (l *BatchLogic) Submit(req *BatchRequest) (string, error) {
 				operations = append(operations, item)
 				continue
 			}
-			item.Item.ImageRef = strings.TrimSpace(inspect.Config.Image)
+			imageRef, refErr := containerService.UpdateImageReference(inspect.Config)
+			if refErr != nil {
+				item.InitialError = refErr.Error()
+				operations = append(operations, item)
+				continue
+			}
+			item.Item.ImageRef = imageRef
 			item.Item.ImageIDs = []string{inspect.Image}
 			item.Item.SnapshotRef = uuid.NewString()
 		}

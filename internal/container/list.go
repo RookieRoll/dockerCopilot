@@ -217,6 +217,9 @@ func (s *Service) listDetails(ctx context.Context, portSettings PortSettings, pr
 		inspected := inspects[i]
 		if inspected.Config != nil {
 			info.CreateImage = inspected.Config.Image
+			if imageRef, refErr := UpdateImageReference(inspected.Config); refErr == nil {
+				info.UsingImage = imageRef
+			}
 		} else {
 			logx.Error("get image name error" + item.ID)
 		}

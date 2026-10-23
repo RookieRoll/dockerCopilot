@@ -82,6 +82,9 @@ func (s *Service) UpdateWithOptions(ctx context.Context, id, name, imageRef stri
 	if id == "" || name == "" || imageRef == "" {
 		return errors.New("container ID, target name, and image reference are required")
 	}
+	if err := ValidateUpdateImageReference(imageRef); err != nil {
+		return err
+	}
 	if taskID == "" {
 		return errors.New("update task ID is required")
 	}
@@ -272,6 +275,7 @@ func (s *Service) UpdateWithOptions(ctx context.Context, id, name, imageRef stri
 		candidateOwnerID = callbacks.CandidateOwnerID
 	}
 	createConfig.Labels[updateTaskLabel] = candidateOwnerID
+	createConfig.Labels[updateImageRefLabel] = imageRef
 	hostConfig := preserveObservedVolumes(before.HostConfig, before.Mounts)
 	networks := copyCreateNetworks(before.NetworkSettings)
 	created, err := s.docker.ContainerCreate(ctx, &createConfig, hostConfig, networks, nil, name)

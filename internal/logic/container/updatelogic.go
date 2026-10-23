@@ -94,7 +94,10 @@ func (l *UpdateLogic) Update(req *types.ContainerUpdateReq) (resp *types.Resp, e
 	}
 	delOldContainer := l.effectiveDeleteOld(req.DelOldContainer)
 	deleteOption := delOldContainer
-	imageNameAndTag := req.ImageNameAndTag
+	imageNameAndTag := strings.TrimSpace(req.ImageNameAndTag)
+	if refErr := containerService.ValidateUpdateImageReference(imageNameAndTag); refErr != nil {
+		return &types.Resp{Code: http.StatusBadRequest, Msg: refErr.Error(), Data: map[string]any{}}, requestError(refErr.Error())
+	}
 	l.imageGate.Lock()
 	defer l.imageGate.Unlock()
 	taskID := uuid.NewString()
