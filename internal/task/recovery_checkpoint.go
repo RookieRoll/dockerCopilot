@@ -7,13 +7,13 @@ import (
 	"time"
 )
 
-// recoveryCheckpointStore persists only a small set of recovery facts without
+// recoveryCheckpointStore stores only a small set of recovery facts without
 // changing task identity, the terminal result, or the original error.
 type recoveryCheckpointStore interface {
 	saveRecoveryCheckpoint(Record) error
 }
 
-// RecoveryCheckpoint persists a recovery stage and newly confirmed container
+// RecoveryCheckpoint stores a recovery stage and newly confirmed container
 // identity facts. It is valid only while this execution's recovery callback is
 // running with the context supplied to that callback.
 func (e *Execution) RecoveryCheckpoint(ctx context.Context, stage string, mutate func(*Record)) error {
@@ -71,7 +71,7 @@ func (e *Execution) RecoveryCheckpoint(ctx context.Context, stage string, mutate
 	}
 	e.record = next
 	if err := ctx.Err(); err != nil {
-		// The facts may already be durable, but an expired recovery context must
+		// The facts may already be stored in memory, but an expired recovery context must
 		// never authorize the next Docker mutation.
 		return err
 	}
@@ -97,56 +97,4 @@ func (e *Execution) revokeRecovery(ctx context.Context) {
 		e.recoveryCtx = nil
 	}
 	e.mu.Unlock()
-}
-
-// saveRecoveryCheckpoint applies the recovery checkpoint allowlist to both
-// active and already-terminal tasks. In particular, it cannot rewrite Error,
-// status, completion time, recovery outcome, or other final task results.
-func (s *Store) saveRecoveryCheckpoint(next Record) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if err := s.ready(); err != nil {
-		return err
-	}
-	if err := next.validate(); err != nil {
-		return err
-	}
-	old, err := s.readRecord(next.TaskID)
-	if err != nil {
-		return err
-	}
-	if old.Status != StatusRunning && !old.Status.Terminal() {
-		return errors.New("recovery checkpoint requires a running or terminal task")
-	}
-	if old.TaskID != next.TaskID || old.Type != next.Type || old.Status != next.Status ||
-		!old.CreatedAt.Equal(next.CreatedAt) || !sameOptionalTime(old.StartedAt, next.StartedAt) ||
-		!sameOptionalTime(old.FinishedAt, next.FinishedAt) || old.RequestID != next.RequestID ||
-		!optionsEqual(old.Options, next.Options) || old.Error != next.Error {
-		return errors.New("recovery checkpoint cannot alter task identity or final result")
-	}
-	expected := cloneRecord(old)
-	expected.Stage = next.Stage
-	expected.NewContainerID = next.NewContainerID
-	expected.ContainerIDs = cloneStrings(next.ContainerIDs)
-	expected.BackupContainerName = next.BackupContainerName
-	if len(expected.Items) != len(next.Items) {
-		return errors.New("recovery checkpoint cannot change batch item identities")
-	}
-	for i := range expected.Items {
-		expected.Items[i].Stage = next.Items[i].Stage
-		expected.Items[i].NewContainerID = next.Items[i].NewContainerID
-		expected.Items[i].BackupContainerName = next.Items[i].BackupContainerName
-		expected.Items[i].ProtectedNames = cloneStrings(next.Items[i].ProtectedNames)
-		expected.Items[i].Recovery = next.Items[i].Recovery
-		expected.Items[i].RequiresAttention = next.Items[i].RequiresAttention
-	}
-	expected.UpdatedAt = next.UpdatedAt
-	if !reflect.DeepEqual(next, expected) {
-		return errors.New("recovery checkpoint contains fields outside the recovery allowlist")
-	}
-	expected.UpdatedAt = s.now().UTC()
-	if err := expected.validate(); err != nil {
-		return err
-	}
-	return s.writeRecord(expected)
 }

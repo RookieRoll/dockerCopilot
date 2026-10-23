@@ -8,7 +8,6 @@ import (
 	"runtime"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/google/uuid"
 	"github.com/onlyLTY/dockerCopilot/internal/config"
@@ -24,6 +23,7 @@ type programTaskState struct {
 	drain       operationDrain
 	lease       operationLease
 	placed      *updater.InstallHandoff
+	metadata    *updater.HandoffMetadata
 	workDir     string
 	stagingRoot string
 	handoff     bool
@@ -55,35 +55,51 @@ func (s *programTaskState) cleanupCandidate() error {
 	return updater.RemovePlacedBinary(updater.HandoffOptions{WorkDir: s.workDir, StagingParent: s.stagingRoot, GOARCH: runtime.GOARCH}, *placed)
 }
 
-func (s *programTaskState) rollback(record task.Record) error {
+func (s *programTaskState) setMetadata(metadata updater.HandoffMetadata) {
+	s.mu.Lock()
+	copy := metadata
+	s.metadata = &copy
+	s.mu.Unlock()
+}
+
+func (s *programTaskState) hasHandedOff() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.handoff
+}
+
+func (s *programTaskState) rollback() error {
 	removeErr := s.cleanupCandidate()
-	if removeErr == nil {
-		return nil
-	}
-	marker := record.PendingInstall
-	if marker == nil {
+	s.mu.Lock()
+	metadata := s.metadata
+	s.mu.Unlock()
+	if metadata == nil {
 		return removeErr
 	}
-	metadata, metadataErr := updater.ReadHandoffMetadata(s.workDir)
-	if metadataErr != nil {
-		return errors.Join(removeErr, fmt.Errorf("read handoff identity before rollback result: %w", metadataErr))
+	current, readErr := updater.ReadHandoffMetadata(s.workDir)
+	if readErr != nil {
+		return errors.Join(removeErr, fmt.Errorf("read handoff identity before rollback result: %w", readErr))
 	}
-	if metadata.TaskID != record.TaskID || metadata.HandoffID != marker.HandoffID || metadata.TargetVersion != marker.TargetVersion || metadata.GOARCH != marker.GOARCH || !strings.EqualFold(metadata.BinarySHA256, marker.ArtifactSHA256) {
+	if !sameProgramHandoff(current, *metadata) {
 		return errors.Join(removeErr, errors.New("handoff metadata belongs to a different task; preserving it without overwrite"))
 	}
 	if existing, resultErr := updater.ReadHandoffResult(s.workDir); resultErr == nil {
-		if existing.TaskID != record.TaskID || existing.HandoffID != marker.HandoffID || existing.TargetVersion != marker.TargetVersion || existing.GOARCH != marker.GOARCH || !strings.EqualFold(existing.BinarySHA256, marker.ArtifactSHA256) {
+		if !sameProgramHandoff(existing.HandoffMetadata, *metadata) {
 			return errors.Join(removeErr, errors.New("handoff result belongs to a different task; preserving it without overwrite"))
 		}
 	} else if !errors.Is(resultErr, os.ErrNotExist) {
 		return errors.Join(removeErr, fmt.Errorf("read handoff result before rollback: %w", resultErr))
 	}
-	// Retain a matching failed result if candidate removal cannot be proven.
-	// start.sh then refuses to retry this candidate on a later container start.
-	resultErr := updater.WriteHandoffResult(s.workDir, updater.HandoffResult{
-		HandoffMetadata: metadata, Result: "failed-start", ErrorCode: "rollback_failed",
-	})
+	code := "handoff_aborted"
+	if removeErr != nil {
+		code = "rollback_failed"
+	}
+	resultErr := updater.WriteHandoffResult(s.workDir, updater.HandoffResult{HandoffMetadata: *metadata, Result: "failed-start", ErrorCode: code})
 	return errors.Join(removeErr, resultErr)
+}
+
+func sameProgramHandoff(a, b updater.HandoffMetadata) bool {
+	return a.TaskID == b.TaskID && a.HandoffID == b.HandoffID && a.TargetVersion == b.TargetVersion && a.GOARCH == b.GOARCH && strings.EqualFold(a.BinarySHA256, b.BinarySHA256)
 }
 
 func (s *programTaskState) resume() {
@@ -132,11 +148,14 @@ func (l *UpdateProgramLogic) submitProgramUpdate() (*types.Resp, error) {
 	if err != nil {
 		return nil, err
 	}
-	taskID := uuid.NewString()
 	requestID := l.requestID
-	if uuid.Validate(requestID) != nil {
+	parsedRequestID, parseRequestErr := uuid.Parse(requestID)
+	if parseRequestErr != nil {
 		requestID = uuid.NewString()
+	} else {
+		requestID = parsedRequestID.String()
 	}
+	taskID := requestID
 	state := &programTaskState{workDir: options.WorkDir, stagingRoot: options.StagingParent}
 	source := l.updateSource
 	preparedIdentity := updater.PrepareIdentity{TaskID: taskID, RequestID: requestID}
@@ -186,36 +205,20 @@ func (l *UpdateProgramLogic) submitProgramUpdate() (*types.Resp, error) {
 				drain.Resume()
 				return fmt.Errorf("wait for active mutations: %w", err)
 			}
-			handoffID := uuid.NewString()
-			marker := task.PendingInstallHandoff{
-				HandoffID: handoffID, TargetVersion: targetVersion, GOARCH: runtime.GOARCH,
-				ArtifactSHA256: prepared.BinarySHA256, PreparedAt: time.Now().UTC(),
-			}
-			if err := execution.MarkPendingInstall(marker); err != nil {
-				drain.Resume()
-				return err
-			}
 			placed, err := updater.PlacePreparedBinary(ctx, updater.HandoffOptions{WorkDir: options.WorkDir, StagingParent: options.StagingParent, GOARCH: runtime.GOARCH}, prepared)
 			if err != nil {
 				return err
 			}
 			state.setPlaced(placed)
-			if err := updater.WriteHandoffMetadata(options.WorkDir, updater.HandoffMetadata{
-				TaskID: taskID, HandoffID: handoffID, TargetVersion: targetVersion,
+			metadata := updater.HandoffMetadata{
+				TaskID: taskID, HandoffID: uuid.NewString(), TargetVersion: targetVersion,
 				GOARCH: runtime.GOARCH, BinarySHA256: prepared.BinarySHA256,
-			}); err != nil {
+			}
+			if err := updater.WriteHandoffMetadata(options.WorkDir, metadata); err != nil {
 				return err
 			}
-			return nil
-		},
-		Recover: func(_ context.Context, cause error) (task.Recovery, error) {
-			state.resume()
-			if cause != nil {
-				return task.Recovery{Status: "restored", Detail: "程序交接未完成，已恢复接收变更"}, nil
-			}
-			return task.Recovery{Status: "restored"}, nil
-		},
-		OnHandoff: func(_ task.Record) error {
+			state.setMetadata(metadata)
+			svcCtx.TaskRuntime.MarkProgramHandoff(metadata)
 			state.mu.Lock()
 			state.handoff = true
 			state.mu.Unlock()
@@ -223,12 +226,28 @@ func (l *UpdateProgramLogic) submitProgramUpdate() (*types.Resp, error) {
 				state.mu.Lock()
 				state.handoff = false
 				state.mu.Unlock()
-				return err
+				svcCtx.TaskRuntime.ClearProgramHandoff(taskID)
+				return fmt.Errorf("request program restart for handoff: %w", err)
 			}
-			return nil
+			// The task remains running while the old HTTP process drains. Close
+			// cancels the execution after the listener stops; Recover recognizes
+			// the handoff and must not remove the candidate or reopen mutations.
+			<-ctx.Done()
+			return ctx.Err()
 		},
-		RollbackHandoff: func(_ context.Context, record task.Record) error {
-			return state.rollback(record)
+		Recover: func(ctx context.Context, cause error) (task.Recovery, error) {
+			if state.hasHandedOff() {
+				return task.Recovery{Status: "not-needed", Detail: "new process will verify program readiness"}, nil
+			}
+			rollbackErr := state.rollback()
+			state.resume()
+			if rollbackErr != nil {
+				return task.Recovery{Status: "unknown", Detail: "program handoff rollback requires manual review"}, rollbackErr
+			}
+			if cause != nil {
+				return task.Recovery{Status: "restored", Detail: "程序交接未完成，已恢复接收变更"}, nil
+			}
+			return task.Recovery{Status: "not-needed"}, nil
 		},
 		OnSettled: func() { state.settled(svcCtx) },
 	})

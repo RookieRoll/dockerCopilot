@@ -34,7 +34,7 @@ func TestLoadLegacyConfigAndApplyDefaults(t *testing.T) {
 	}
 }
 
-func TestLoadRepositoryConfigAndRejectExplicitZero(t *testing.T) {
+func TestLoadRepositoryConfigAndIgnoreRetiredQueueSetting(t *testing.T) {
 	var cfg Config
 	loaded, err := LoadFile(filepath.Join("..", "..", "etc", "dockerCopilot.yaml"), false)
 	if err != nil {
@@ -50,8 +50,8 @@ func TestLoadRepositoryConfigAndRejectExplicitZero(t *testing.T) {
 	if err := os.WriteFile(filename, content, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := LoadFile(filename, false); err == nil {
-		t.Fatal("expected explicit zero queue capacity to fail during config load")
+	if _, err := LoadFile(filename, false); err != nil {
+		t.Fatalf("retired queue setting must not prevent startup: %v", err)
 	}
 }
 
@@ -120,6 +120,33 @@ func TestExplicitEmptyCanonicalProxyClearsLegacyProxy(t *testing.T) {
 	}
 }
 
+func TestRetiredPersistentTaskOptionsDoNotAffectRuntime(t *testing.T) {
+	cfg := Config{}
+	cfg.ApplyDefaults()
+	cfg.Tasks.Directory = filepath.Join(t.TempDir(), "must-not-create")
+	cfg.Tasks.Retention = "no-longer-used"
+	cfg.Tasks.QueueCapacity = intPointer(-100)
+	cfg.Tasks.MaxRecords = intPointer(-1)
+	t.Setenv("DOCKERCOPILOT_TASK_QUEUE_CAPACITY", "ignored")
+	t.Setenv("DOCKERCOPILOT_TASK_MAX_RECORDS", "ignored")
+	if err := cfg.ApplyEnvironment(); err != nil {
+		t.Fatal(err)
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("retired persistence settings blocked startup: %v", err)
+	}
+	options, err := cfg.TaskOptions()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if options.Directory != "" || options.QueueCapacity != 0 || options.Retention != 10*time.Minute || options.MaxRecords != 1000 {
+		t.Fatalf("persistent configuration leaked into runtime: %+v", options)
+	}
+	if _, err := os.Stat(cfg.Tasks.Directory); !os.IsNotExist(err) {
+		t.Fatalf("retired task directory was accessed or created: %v", err)
+	}
+}
+
 func TestProgramWorkDirAndSelfContainerEnvironmentAreCentralized(t *testing.T) {
 	filename := filepath.Join(t.TempDir(), "config.yaml")
 	content := []byte("Name: dockerCopilot\nHost: 0.0.0.0\nPort: 12712\nTimeout: 100000000000000\nLog:\n  Encoding: plain\nAuth:\n  AccessSecret: test-secret\n  AccessExpire: 7257600\nUpdates:\n  WorkDir: /yaml/install\nDocker:\n  SelfContainer: named-container\n")
@@ -168,8 +195,8 @@ func TestValidateRejectsInvalidExplicitOverrides(t *testing.T) {
 	cfg.ApplyDefaults()
 	zero := 0
 	cfg.Tasks.QueueCapacity = &zero
-	if err := cfg.Validate(); err == nil {
-		t.Fatal("expected explicit zero queue capacity to fail validation")
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("retired queue capacity should be ignored: %v", err)
 	}
 	cfg = Config{}
 	cfg.ApplyDefaults()
@@ -186,8 +213,8 @@ func TestValidateRejectsInvalidExplicitOverrides(t *testing.T) {
 	}
 	cfg.Updates.GitHubProxy = ""
 	cfg.Tasks.Directory = "   "
-	if err := cfg.Validate(); err == nil {
-		t.Fatal("expected blank task directory to fail validation")
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("retired task directory should be ignored: %v", err)
 	}
 	cfg.Tasks.Directory = defaultTaskDir
 	tooLarge := int64(^uint64(0) >> 1)

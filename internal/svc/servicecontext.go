@@ -17,36 +17,29 @@ import (
 	"github.com/onlyLTY/dockerCopilot/internal/task"
 	"github.com/onlyLTY/dockerCopilot/internal/types"
 	"github.com/zeromicro/go-zero/core/logx"
-	"github.com/zeromicro/go-zero/rest"
 )
 
 type ServiceContext struct {
-	Config                     config.Config
-	CookieCheckMiddleware      rest.Middleware
-	Jwtuuid                    string
-	BearerTokenCheckMiddleware rest.Middleware
-	JwtSecret                  string
-	PortainerJwt               string
-	HubImageInfo               *module.ImageUpdateData
-	IndexCheckMiddleware       rest.Middleware
-	ProgressStore              ProgressStoreType
-	LegacyProgress             *legacyprogress.Store
-	DockerClient               *client.Client
-	Containers                 *containerService.Service
-	Images                     *imageService.Service
-	Backups                    *backupService.Service
-	Ports                      *settings.PortOverridesService
-	Icons                      *settings.IconService
-	TaskRuntime                *TaskRuntime
-	TaskStore                  *task.Store
-	TaskRunner                 *task.Runner
-	TaskQuery                  *task.QueryService
-	Mutations                  *operation.MutationGate
-	ProgramShutdown            chan struct{}
-	pendingProgramDrain        *operation.MutationDrain
-	mu                         sync.Mutex
-	programUpdateMu            sync.Mutex
-	programUpdateActive        bool
+	Config              config.Config
+	HubImageInfo        *module.ImageUpdateData
+	ProgressStore       ProgressStoreType
+	LegacyProgress      *legacyprogress.Store
+	DockerClient        *client.Client
+	Containers          *containerService.Service
+	Images              *imageService.Service
+	Backups             *backupService.Service
+	Ports               *settings.PortOverridesService
+	Icons               *settings.IconService
+	TaskRuntime         *TaskRuntime
+	TaskStore           *task.Store
+	TaskRunner          *task.Runner
+	TaskQuery           *task.QueryService
+	Mutations           *operation.MutationGate
+	ProgramShutdown     chan struct{}
+	pendingProgramDrain *operation.MutationDrain
+	mu                  sync.Mutex
+	programUpdateMu     sync.Mutex
+	programUpdateActive bool
 }
 
 type TaskProgress = types.TaskProgress
@@ -88,7 +81,7 @@ func NewServiceContextChecked(c config.Config) (*ServiceContext, error) {
 		return nil, fmt.Errorf("resolve program working directory: %w", err)
 	}
 	validator := newProgramInstallValidator(c, cli, workDir)
-	runtime, err := NewTaskRuntimeForConfigWithValidator(context.Background(), c, serviceInspector{service: ctx.Containers}, validator, workDir)
+	runtime, err := NewTaskRuntimeForConfigWithValidator(context.Background(), c, validator, workDir)
 	if err != nil {
 		if cli != nil {
 			_ = cli.Close()
@@ -113,14 +106,10 @@ func newServiceContext(c config.Config, cli *client.Client) (*ServiceContext, er
 	if err != nil {
 		return nil, fmt.Errorf("configure trusted registry certificate for application digest checks: %w", err)
 	}
-	progressStore := make(ProgressStoreType)
-	progress := legacyprogress.NewStore(progressStore)
 	containers := containerService.NewService(cli, updates)
 	ctx := &ServiceContext{
 		Config:          c,
 		HubImageInfo:    updates,
-		ProgressStore:   progressStore,
-		LegacyProgress:  progress,
 		DockerClient:    cli,
 		Mutations:       operation.NewMutationGate(),
 		ProgramShutdown: make(chan struct{}, 1),
@@ -134,8 +123,6 @@ func newServiceContext(c config.Config, cli *client.Client) (*ServiceContext, er
 		return ctx, fmt.Errorf("create icon service: %w", err)
 	}
 	ctx.Icons = icons
-	ctx.Backups.SetProgressCallbacks(backupService.ProgressCallbacks{Update: progress.Update, Get: progress.Get})
-	ctx.Containers.SetProgressCallbacks(containerService.ProgressCallbacks{Update: progress.Update, Get: progress.Get})
 	return ctx, nil
 }
 

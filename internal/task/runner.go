@@ -16,22 +16,16 @@ import (
 )
 
 var (
-	ErrQueueFull       = errors.New("task queue is full")
+	ErrQueueFull       = errors.New("background operation concurrency limit reached")
 	ErrRunnerClosed    = errors.New("task runner is closed")
 	ErrExecutionClosed = errors.New("task execution is already finalized")
 )
 
-// RecordStore is the runner's narrow persistence dependency. A concrete Store
-// also implements ReconciliationStore so timeout recovery facts can be saved
-// after the failed terminal result has already been persisted.
+// RecordStore is the runner's narrow in-process progress dependency.
 type RecordStore interface {
 	Create(Record) error
 	Save(Record) error
 	Get(string) (Record, error)
-}
-
-type ReconciliationStore interface {
-	Reconcile(string, Reconciliation) error
 }
 
 type TaskFunc func(context.Context, *Execution) error
@@ -43,14 +37,6 @@ type TaskSpec struct {
 	Recover    RecoveryFunc
 	OnAccepted func() error
 	OnSettled  func()
-	// OnHandoff runs only after a complete pending-install marker is durably
-	// saved. A successful callback requests controlled process shutdown; the
-	// task remains running until a new process confirms readiness.
-	OnHandoff func(Record) error
-	// RollbackHandoff removes any candidate file created for this task when a
-	// marker, notification, task, or deadline failure prevents the handoff.
-	// It runs with the independent recovery deadline after Run has returned.
-	RollbackHandoff func(context.Context, Record) error
 }
 
 type RunnerOptions struct {
@@ -65,16 +51,15 @@ type RunnerOptions struct {
 type Runner struct {
 	store           RecordStore
 	maxConcurrent   int
-	queueCapacity   int
 	taskTimeout     time.Duration
 	recoveryTimeout time.Duration
 	now             func() time.Time
 	output          io.Writer
 	outputMu        sync.Mutex
+	ctx             context.Context
+	cancel          context.CancelFunc
 
 	mu      sync.Mutex
-	queue   chan queuedTask
-	queued  int
 	active  int
 	closed  bool
 	idle    bool
@@ -82,7 +67,7 @@ type Runner struct {
 	workers sync.WaitGroup
 }
 
-type queuedTask struct {
+type submittedTask struct {
 	spec     TaskSpec
 	accepted Record
 }
@@ -91,16 +76,13 @@ func NewRunner(store RecordStore, opts RunnerOptions) (*Runner, error) {
 	if store == nil {
 		return nil, errors.New("task record store is required")
 	}
-	if opts.MaxConcurrent < 0 || opts.QueueCapacity < 0 || opts.TaskTimeout < 0 || opts.RecoveryTimeout < 0 {
+	if opts.MaxConcurrent < 0 || opts.TaskTimeout < 0 || opts.RecoveryTimeout < 0 {
 		return nil, errors.New("runner limits and timeouts cannot be negative")
 	}
 	if opts.MaxConcurrent == 0 {
 		opts.MaxConcurrent = 2
 	}
-	if opts.QueueCapacity == 0 {
-		opts.QueueCapacity = 100
-	}
-	if opts.MaxConcurrent > 64 || opts.QueueCapacity > 10000 {
+	if opts.MaxConcurrent > 64 {
 		return nil, errors.New("runner limits exceed supported bounds")
 	}
 	if opts.TaskTimeout == 0 {
@@ -115,27 +97,24 @@ func NewRunner(store RecordStore, opts RunnerOptions) (*Runner, error) {
 	if opts.Output == nil {
 		opts.Output = os.Stdout
 	}
+	runnerCtx, cancel := context.WithCancel(context.Background())
 	// Runner diagnostics may contain upstream errors. Always sanitize at the
 	// final output boundary, including caller-provided writers.
 	opts.Output = observability.NewRedactingTextWriter(opts.Output)
 	r := &Runner{
-		store: store, maxConcurrent: opts.MaxConcurrent, queueCapacity: opts.QueueCapacity,
+		store: store, maxConcurrent: opts.MaxConcurrent,
 		taskTimeout: opts.TaskTimeout, recoveryTimeout: opts.RecoveryTimeout,
 		now: opts.Now, output: opts.Output,
-		queue: make(chan queuedTask, opts.MaxConcurrent+opts.QueueCapacity), idle: true,
+		ctx: runnerCtx, cancel: cancel,
+		idle: true,
 	}
 	r.idleCh = make(chan struct{})
 	close(r.idleCh)
-	for i := 0; i < r.maxConcurrent; i++ {
-		r.workers.Add(1)
-		go r.worker()
-	}
 	return r, nil
 }
 
-// Submit reserves a bounded admission slot and persists queued before making
-// the task visible to workers. The caller's request context is intentionally
-// absent: accepted work is detached from HTTP request lifetime.
+// Submit reserves an execution slot immediately. QueueCapacity is ignored for
+// compatibility; callers receive ErrQueueFull when all slots are occupied.
 func (r *Runner) Submit(spec TaskSpec) (string, error) {
 	if spec.Run == nil {
 		return "", errors.New("task callback is required")
@@ -145,7 +124,7 @@ func (r *Runner) Submit(spec TaskSpec) (string, error) {
 	if r.closed {
 		return "", ErrRunnerClosed
 	}
-	if r.active+r.queued >= r.maxConcurrent+r.queueCapacity {
+	if r.active >= r.maxConcurrent {
 		return "", ErrQueueFull
 	}
 	if r.idle {
@@ -183,15 +162,15 @@ func (r *Runner) Submit(spec TaskSpec) (string, error) {
 		r.markIdleLocked()
 		return "", err
 	}
-	r.queued++ // reserve capacity before potentially slow initial persistence
+	r.active++
 	if err := r.store.Create(rec); err != nil {
-		r.queued--
+		r.active--
 		r.markIdleLocked()
-		return "", fmt.Errorf("persist initial queued task: %w", err)
+		return "", fmt.Errorf("create in-memory task: %w", err)
 	}
 	if spec.OnAccepted != nil {
 		if err := invokeAccepted(spec.OnAccepted); err != nil {
-			r.queued--
+			r.active--
 			cause := fmt.Errorf("task acceptance callback: %w", err)
 			r.finalizeWithoutExecution(rec, cause, false)
 			r.markIdleLocked()
@@ -199,35 +178,21 @@ func (r *Runner) Submit(spec TaskSpec) (string, error) {
 		}
 	}
 	spec.Record = cloneRecord(rec)
-	select {
-	case r.queue <- queuedTask{spec: spec, accepted: rec}:
-		observability.LogTaskEvent(context.Background(), "task.accepted", rec.TaskID, rec.RequestID,
-			taskEventFields(rec, string(StatusQueued), nil, r.now())...)
-		return rec.TaskID, nil
-	default:
-		// Queue capacity is sized to the maximum admitted outstanding work.
-		r.queued--
-		r.markIdleLocked()
-		return "", errors.New("internal task queue capacity invariant violated")
-	}
-}
-
-func (r *Runner) worker() {
-	defer r.workers.Done()
-	for queued := range r.queue {
-		r.mu.Lock()
-		r.queued--
-		r.active++
-		r.mu.Unlock()
-		r.execute(queued)
+	r.workers.Add(1)
+	go func() {
+		defer r.workers.Done()
+		r.execute(submittedTask{spec: spec, accepted: rec})
 		r.mu.Lock()
 		r.active--
 		r.markIdleLocked()
 		r.mu.Unlock()
-	}
+	}()
+	observability.LogTaskEvent(context.Background(), "task.accepted", rec.TaskID, rec.RequestID,
+		taskEventFields(rec, string(StatusQueued), nil, r.now())...)
+	return rec.TaskID, nil
 }
 
-func (r *Runner) execute(q queuedTask) {
+func (r *Runner) execute(q submittedTask) {
 	if q.spec.OnSettled != nil {
 		defer func() {
 			defer func() {
@@ -245,12 +210,12 @@ func (r *Runner) execute(q queuedTask) {
 	rec.UpdatedAt = started
 	rec.Stage = "starting"
 	if err := r.store.Save(rec); err != nil {
-		r.finalizeWithoutExecution(rec, fmt.Errorf("persist running task: %w", err), true)
+		r.finalizeWithoutExecution(rec, fmt.Errorf("update running task: %w", err), true)
 		return
 	}
 	observability.LogTaskEvent(context.Background(), "task.started", rec.TaskID, rec.RequestID,
 		taskEventFields(rec, string(StatusRunning), nil, r.now())...)
-	ctx, cancel := context.WithTimeout(context.Background(), r.taskTimeout)
+	ctx, cancel := context.WithTimeout(r.ctx, r.taskTimeout)
 	e := &Execution{store: r.store, record: rec, ctx: ctx, cancel: cancel, now: r.now, report: r.writeOutput}
 	done := make(chan taskOutcome, 1)
 	go func() {
@@ -262,118 +227,50 @@ func (r *Runner) execute(q queuedTask) {
 		e.markRunReturned()
 		if cause := e.failure(); cause != nil {
 			out.err = cause
+		} else if e.isCommitted() {
+			if out.err != nil || out.panicked {
+				e.Warning("主操作已完成，但后续清理未确认；不回滚已完成结果")
+			}
+			r.finish(e, StatusSucceeded, nil, Recovery{Status: "not-needed"}, false)
+			cancel()
+			return
 		} else if deadlineErr := taskContextError(ctx); deadlineErr != nil {
 			if e.isCommitted() {
-				e.Warning("主操作已持久提交，但任务期限已到；清理结果尚未确认")
+				e.Warning("主操作已完成，但任务期限已到；清理结果尚未确认")
 				out.err = nil
 			} else {
 				out.err = deadlineErr
 			}
 		}
-		r.finishExecution(e, out, q.spec.Recover, (taskContextError(ctx) != nil && !e.isCommitted()) || out.panicked, q.spec.OnHandoff, q.spec.RollbackHandoff)
+		r.finishExecution(e, out, q.spec.Recover, (taskContextError(ctx) != nil && !e.isCommitted()) || out.panicked)
 		cancel()
 	case <-ctx.Done():
-		if e.isCommitted() {
-			// The primary result is already durable. Expose that fact promptly;
-			// the worker and its lease remain occupied until Run really returns.
-			e.Warning("主操作已持久提交，但任务期限已到；清理结果尚未确认")
-			r.finish(e, StatusSucceeded, nil, Recovery{Status: "not-needed"}, false)
-			out := <-done
-			e.markRunReturned()
-			if out.err == nil && !out.panicked {
-				r.releaseSettledNameProtection(e)
-			}
-			cancel()
-			return
-		}
-		cause := e.failure()
-		if cause == nil {
-			cause = ctx.Err()
-		}
-		rec := e.current()
-		// A critical marker write can itself fail while leaving the in-memory
-		// stage at install-handoff. Use a distinct failed stage so the final
-		// result can still be durably stored alongside the cleanup evidence.
-		if rec.PendingInstall != nil {
-			e.mu.Lock()
-			e.record.Stage = "handoff-failed"
-			e.record.Message = "程序交接超时，正在等待任务操作退出后清理"
-			e.mu.Unlock()
-			rec = e.current()
-		}
-		rec.Recovery = Recovery{Status: "unknown", Detail: "task stopped at its deadline or critical persistence failed; recovery is pending"}
-		r.finish(e, StatusFailed, cause, rec.Recovery, true)
-		// Run may ignore its deadline and still be mutating Docker state or
-		// placing the candidate. Do not roll back or clear its facts until it has
-		// really returned. The failed terminal result is durable immediately,
-		// while its pending-install marker preserves the cleanup facts.
+		// Keep the record visibly running until the callback really returns, but
+		// expose why progress stopped. No recovery or lease release races Run.
+		e.markWaitingForRun(ctx.Err())
 		out := <-done
 		e.markRunReturned()
 		if criticalErr := e.failure(); criticalErr != nil {
-			cause = errors.Join(cause, criticalErr)
+			out.err = errors.Join(out.err, criticalErr)
 		}
-		if e.isCommitted() && e.failure() == nil && !out.panicked {
-			// The primary mutation was durably committed before the deadline.
-			// Cleanup warnings are retained by the callback; do not roll back a
-			// committed replacement just because its cleanup budget expired.
+		if e.isCommitted() {
+			if out.err != nil || out.panicked {
+				e.Warning("主操作已完成，但后续清理未确认；不回滚已完成结果")
+			}
 			r.finish(e, StatusSucceeded, nil, Recovery{Status: "not-needed"}, false)
 			cancel()
 			return
 		}
-		if out.err != nil {
-			cause = errors.Join(cause, out.err)
-		}
-		if e.hasUncertainCommit() {
-			cancel()
-			return
-		}
-		out.err = cause
-		r.runRecoveryAndReconcile(e, q.spec.Recover, cause, out, q.spec.RollbackHandoff)
-		r.releaseSettledNameProtection(e)
+		out.err = errors.Join(ctx.Err(), out.err)
+		r.finishExecution(e, out, q.spec.Recover, true)
 		cancel()
 	}
 }
 
-func (r *Runner) finishExecution(e *Execution, out taskOutcome, recoverFn RecoveryFunc, needsRecovery bool, onHandoff func(Record) error, rollbackHandoff func(context.Context, Record) error) {
+func (r *Runner) finishExecution(e *Execution, out taskOutcome, recoverFn RecoveryFunc, needsRecovery bool) {
 	cause := out.err
 	if cause == nil && out.panicked {
 		cause = errors.New("task panicked")
-	}
-	if e.hasPendingInstall() {
-		pendingHandoffFailed := cause != nil || needsRecovery
-		if cause == nil && !needsRecovery {
-			if onHandoff == nil {
-				cause = errors.New("pending program install has no handoff callback")
-				pendingHandoffFailed = true
-			} else if err := invokeHandoff(onHandoff, e.current()); err != nil {
-				cause = fmt.Errorf("notify process handoff: %w", err)
-				pendingHandoffFailed = true
-			} else {
-				e.deferFinalization()
-				rec := e.current()
-				observability.LogTaskEvent(context.Background(), "task.handoff_pending", rec.TaskID, rec.RequestID,
-					logx.Field("taskType", rec.Type), logx.Field("status", string(rec.Status)))
-				return
-			}
-		}
-		if pendingHandoffFailed {
-			// Persist terminal failure promptly while retaining the marker. Cleanup
-			// and gate recovery run afterward under the bounded recovery context.
-			if cause == nil {
-				cause = errors.New("program install handoff did not complete")
-			}
-			e.setPendingInstallFailureStage()
-			r.finish(e, StatusFailed, cause, Recovery{Status: "unknown", Detail: "program handoff cleanup is pending"}, true)
-			r.runRecoveryAndReconcile(e, recoverFn, cause, out, rollbackHandoff)
-			return
-		}
-	}
-	if e.hasUncertainCommit() {
-		if cause == nil {
-			cause = ErrPersistenceOutcomeUncertain
-		}
-		r.finish(e, StatusFailed, cause, Recovery{Status: "unknown", Detail: "commit persistence and rollback outcome are uncertain; automatic compensation was not attempted"}, true)
-		return
 	}
 	status := StatusSucceeded
 	if cause != nil {
@@ -393,33 +290,23 @@ func (r *Runner) finishExecution(e *Execution, out taskOutcome, recoverFn Recove
 	}
 	if (needsRecovery || cause != nil) && recoverFn != nil {
 		call := r.startRecovery(recoverFn, cause, e)
-		select {
-		case result := <-call.done:
-			call.cancel()
-			recovery, recoveryErr := result.recovery, result.err
-			if recoveryErr == nil && recovery.Status == "" {
-				recovery = Recovery{Status: "unknown", Detail: "recovery callback returned no status"}
-			}
-			if recoveryErr != nil {
-				cause = errors.Join(cause, fmt.Errorf("recovery callback failed: %w", recoveryErr))
-				status = StatusFailed
-				recovery = Recovery{Status: "failed", Detail: recoveryErr.Error()}
-			}
-			attention := recoveryErr != nil || recovery.Status == "unknown" || recovery.Status == "failed"
-			r.logRecovery(e, recovery, attention)
-			r.finish(e, status, cause, recovery, attention)
-			return
-		case <-call.ctx.Done():
-			timeoutErr := call.ctx.Err()
-			cause = errors.Join(cause, fmt.Errorf("recovery callback timed out: %w", timeoutErr))
-			r.finish(e, StatusFailed, cause, Recovery{Status: "unknown", Detail: "recovery callback exceeded its deadline; outcome is uncertain"}, true)
-			// Keep this worker occupied until recovery exits; never start another
-			// mutating callback concurrently with an uncooperative recovery.
-			result := <-call.done
-			call.cancel()
-			r.reconcileLateRecovery(e, result, false, cause)
-			return
+		// The recovery context is bounded, but the worker and operation lease are
+		// held until the callback truly returns. Its result is then finalized once.
+		result := <-call.done
+		call.cancel()
+		recovery, recoveryErr := result.recovery, result.err
+		if recoveryErr == nil && recovery.Status == "" {
+			recovery = Recovery{Status: "unknown", Detail: "recovery callback returned no status"}
 		}
+		if recoveryErr != nil {
+			cause = errors.Join(cause, fmt.Errorf("recovery callback failed: %w", recoveryErr))
+			status = StatusFailed
+			recovery = Recovery{Status: "unknown", Detail: recoveryErr.Error()}
+		}
+		attention := recoveryErr != nil || recovery.Status == "unknown" || recovery.Status == "failed"
+		r.logRecovery(e, recovery, attention)
+		r.finish(e, status, cause, recovery, attention)
+		return
 	}
 	if cause != nil {
 		if out.panicked {
@@ -430,84 +317,6 @@ func (r *Runner) finishExecution(e *Execution, out taskOutcome, recoverFn Recove
 		return
 	}
 	r.finish(e, status, nil, Recovery{Status: "not-needed"}, false)
-}
-
-func (r *Runner) runRecoveryAndReconcile(e *Execution, recoverFn RecoveryFunc, cause error, out taskOutcome, rollbackHandoff func(context.Context, Record) error) {
-	recoveryCtx, cancelRecovery := context.WithTimeout(context.Background(), r.recoveryTimeout)
-	defer cancelRecovery()
-	cleanupAttention := false
-	if e.hasPendingInstall() {
-		rollbackDone := r.startHandoffRollback(recoveryCtx, rollbackHandoff, e.current())
-		var rollbackErr error
-		select {
-		case rollbackErr = <-rollbackDone:
-		case <-recoveryCtx.Done():
-			rollbackErr = recoveryCtx.Err()
-			lateErr := <-rollbackDone
-			rollbackErr = errors.Join(rollbackErr, lateErr)
-		}
-		if recoveryCtx.Err() != nil {
-			rollbackErr = errors.Join(rollbackErr, recoveryCtx.Err())
-		}
-		if rollbackErr != nil {
-			cause = errors.Join(cause, fmt.Errorf("rollback pending install after task cancellation: %w", rollbackErr))
-			cleanupAttention = true
-		} else if err := r.reconcilePendingInstallClear(e); err != nil {
-			cause = errors.Join(cause, fmt.Errorf("clear pending install after task cancellation: %w", err))
-			cleanupAttention = true
-		}
-	}
-	if recoverFn == nil {
-		if out.panicked {
-			r.writeOutput("task %s panicked after timeout: %v\n", e.taskID(), out.err)
-		}
-		if cleanupAttention {
-			r.reconcileRecovery(e, Recovery{Status: "unknown", Detail: "pending install cleanup could not be verified"}, true, cause)
-		}
-		return
-	}
-	call := r.startRecoveryWithContext(recoveryCtx, recoverFn, cause, e)
-	select {
-	case result := <-call.done:
-		call.cancel()
-		r.reconcileLateRecovery(e, result, cleanupAttention, cause)
-	case <-call.ctx.Done():
-		// The failed terminal result has already been persisted. Keep the
-		// worker reserved until this callback really exits before reconciling.
-		result := <-call.done
-		call.cancel()
-		r.reconcileLateRecovery(e, result, cleanupAttention, cause)
-	}
-}
-
-func (r *Runner) reconcilePendingInstallClear(e *Execution) error {
-	store, ok := r.store.(ReconciliationStore)
-	if !ok {
-		return errors.New("task record store cannot reconcile pending install marker")
-	}
-	finding := e.reconciliation(Recovery{Status: "unknown", Detail: "program handoff rollback completed; runtime recovery is pending"}, true)
-	finding.ClearPendingInstall = true
-	if err := store.Reconcile(e.taskID(), finding); err != nil {
-		return err
-	}
-	return nil
-}
-
-func (r *Runner) reconcileRecovery(e *Execution, recovery Recovery, attention bool, cause error) {
-	store, ok := r.store.(ReconciliationStore)
-	if !ok {
-		r.writeOutput("task %s record store does not support persisting recovery findings\n", e.taskID())
-		return
-	}
-	finding := e.reconciliation(recovery, attention)
-	if cause != nil {
-		finding.Error = cause.Error()
-	}
-	if err := store.Reconcile(e.taskID(), finding); err != nil {
-		r.writeOutput("task %s recovery finding not durably saved: %v\n", e.taskID(), err)
-		return
-	}
-	r.logRecovery(e, recovery, attention)
 }
 
 func (r *Runner) logRecovery(e *Execution, recovery Recovery, attention bool) {
@@ -576,18 +385,6 @@ func (r *Runner) startRecoveryWithContext(parent context.Context, fn RecoveryFun
 	return recoveryCall{ctx: ctx, done: done, cancel: cancel}
 }
 
-func (r *Runner) reconcileLateRecovery(e *Execution, result recoveryResult, forceAttention bool, cause error) {
-	recovery, recoveryErr := result.recovery, result.err
-	if recoveryErr == nil && recovery.Status == "" {
-		recovery = Recovery{Status: "unknown", Detail: "recovery callback returned no status"}
-	}
-	attention := forceAttention || recoveryErr != nil || recovery.Status == "unknown" || recovery.Status == "failed"
-	if recoveryErr != nil {
-		recovery = Recovery{Status: "failed", Detail: recoveryErr.Error()}
-	}
-	r.reconcileRecovery(e, recovery, attention, cause)
-}
-
 func (r *Runner) finish(e *Execution, status Status, cause error, recovery Recovery, attention bool) {
 	e.mu.Lock()
 	if e.finalized {
@@ -621,7 +418,7 @@ func (r *Runner) finish(e *Execution, status Status, cause error, recovery Recov
 	e.mu.Unlock()
 	e.cancel()
 	if err != nil {
-		r.writeOutput("task %s final result is not durably saved: %v\n", rec.TaskID, err)
+		r.writeOutput("task %s final in-memory result could not be stored: %v\n", rec.TaskID, err)
 	} else {
 		observability.LogTaskEvent(context.Background(), "task.finished", rec.TaskID, rec.RequestID,
 			append(taskEventFields(rec, string(rec.Status), cause, r.now()),
@@ -629,45 +426,6 @@ func (r *Runner) finish(e *Execution, status Status, cause error, recovery Recov
 				logx.Field("requiresAttention", rec.RequiresAttention),
 				logx.Field("warningCount", len(rec.Warnings)))...)
 	}
-}
-
-// releaseSettledNameProtection handles the committed-timeout path, where the
-// successful primary result is persisted before an uncooperative callback
-// returns. Names stay protected until that callback really settles; afterward
-// a terminal reconciliation removes only the temporary name lease. A failed
-// reconciliation leaves the task protected and does not rewrite its result.
-func (r *Runner) releaseSettledNameProtection(e *Execution) {
-	e.mu.Lock()
-	eligible := e.runReturned
-	taskID := e.record.TaskID
-	e.mu.Unlock()
-	if !eligible {
-		return
-	}
-	record, err := r.store.Get(taskID)
-	if err != nil {
-		r.writeOutput("task %s settled but could not inspect name protection state: %v\n", taskID, err)
-		return
-	}
-	if !nameProtectionCanBeReleased(record) || len(record.ProtectedNames) == 0 {
-		return
-	}
-	store, ok := r.store.(ReconciliationStore)
-	if !ok {
-		r.writeOutput("task %s settled successfully but name protection could not be released: store does not support reconciliation\n", record.TaskID)
-		return
-	}
-	finding := Reconciliation{
-		Recovery: record.Recovery, RequiresAttention: false,
-		ProtectedNames: nil,
-	}
-	if err := store.Reconcile(record.TaskID, finding); err != nil {
-		r.writeOutput("task %s settled successfully but name protection could not be released: %v\n", record.TaskID, err)
-		return
-	}
-	e.mu.Lock()
-	e.record.ProtectedNames = nil
-	e.mu.Unlock()
 }
 
 func (r *Runner) finalizeWithoutExecution(rec Record, cause error, accepted bool) {
@@ -679,7 +437,7 @@ func (r *Runner) finalizeWithoutExecution(rec Record, cause error, accepted bool
 	rec.FinishedAt = &finished
 	rec.UpdatedAt = finished
 	if err := r.store.Save(rec); err != nil {
-		r.writeOutput("task %s could not persist start failure or final result: %v\n", rec.TaskID, errors.Join(cause, err))
+		r.writeOutput("task %s could not store start failure or final result: %v\n", rec.TaskID, errors.Join(cause, err))
 	} else if accepted {
 		observability.LogTaskEvent(context.Background(), "task.finished", rec.TaskID, rec.RequestID,
 			taskEventFields(rec, string(rec.Status), cause, r.now())...)
@@ -744,15 +502,13 @@ func taskEventFields(record Record, result string, cause error, now time.Time) [
 }
 
 func (r *Runner) markIdleLocked() {
-	if r.queued == 0 && r.active == 0 && !r.idle {
+	if r.active == 0 && !r.idle {
 		r.idle = true
 		close(r.idleCh)
 	}
 }
 
-// WaitIdle waits until accepted work has left the queue and all callbacks have
-// returned. A timed-out callback that ignores context continues to occupy a
-// worker, so this method will not report idle until that callback exits.
+// WaitIdle waits until every accepted task and recovery callback has returned.
 func (r *Runner) WaitIdle(ctx context.Context) error {
 	r.mu.Lock()
 	ch := r.idleCh
@@ -765,15 +521,12 @@ func (r *Runner) WaitIdle(ctx context.Context) error {
 	}
 }
 
-// Close stops acceptance, drains accepted work, and waits for callbacks. Task
-// callbacks must observe their context for shutdown to complete promptly.
+// Close stops acceptance and waits for accepted work and recovery callbacks.
 func (r *Runner) Close() {
 	r.mu.Lock()
-	if !r.closed {
-		r.closed = true
-		close(r.queue)
-	}
+	r.closed = true
 	r.mu.Unlock()
+	r.cancel()
 	r.workers.Wait()
 }
 
@@ -797,36 +550,6 @@ func invokeAccepted(fn func() error) (err error) {
 	return fn()
 }
 
-func invokeHandoff(fn func(Record) error, record Record) (err error) {
-	defer func() {
-		if value := recover(); value != nil {
-			err = fmt.Errorf("handoff callback panicked: %v", value)
-		}
-	}()
-	return fn(cloneRecord(record))
-}
-
-func (r *Runner) startHandoffRollback(ctx context.Context, fn func(context.Context, Record) error, record Record) <-chan error {
-	done := make(chan error, 1)
-	go func() {
-		if fn == nil {
-			done <- errors.New("pending install has no rollback callback")
-			return
-		}
-		done <- invokeRollback(fn, ctx, record)
-	}()
-	return done
-}
-
-func invokeRollback(fn func(context.Context, Record) error, ctx context.Context, record Record) (err error) {
-	defer func() {
-		if value := recover(); value != nil {
-			err = fmt.Errorf("handoff rollback callback panicked: %v", value)
-		}
-	}()
-	return fn(ctx, cloneRecord(record))
-}
-
 type taskOutcome struct {
 	err      error
 	panicked bool
@@ -834,29 +557,47 @@ type taskOutcome struct {
 
 func timePointer(t time.Time) *time.Time { return &t }
 
-// Execution exposes progress and durable checkpoints to a task callback.
+// Execution exposes process-local progress and checkpoints to a task callback.
 // Critical must succeed before the callback performs the destructive step it
-// describes. A failed critical write cancels the task context immediately.
+// describes. A failed checkpoint cancels the task context immediately.
 type Execution struct {
-	mu              sync.Mutex
-	store           RecordStore
-	record          Record
-	ctx             context.Context
-	cancel          context.CancelFunc
-	now             func() time.Time
-	report          func(string, ...any)
-	finalized       bool
-	criticalErr     error
-	recoveryCtx     context.Context
-	committed       bool
-	uncertainCommit bool
-	runReturned     bool
+	mu          sync.Mutex
+	store       RecordStore
+	record      Record
+	ctx         context.Context
+	cancel      context.CancelFunc
+	now         func() time.Time
+	report      func(string, ...any)
+	finalized   bool
+	criticalErr error
+	recoveryCtx context.Context
+	committed   bool
+	runReturned bool
 }
 
 func (e *Execution) markRunReturned() {
 	e.mu.Lock()
 	e.runReturned = true
 	e.mu.Unlock()
+}
+
+func (e *Execution) markWaitingForRun(cause error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.finalized {
+		return
+	}
+	next := cloneRecord(e.record)
+	next.Stage = "waiting-for-operation-exit"
+	next.Message = "操作期限已到，等待当前操作退出后再进行恢复"
+	if cause != nil {
+		next.Message = "操作已取消或超时，等待当前操作退出后再进行恢复"
+	}
+	next.UpdatedAt = e.now().UTC()
+	e.record = next
+	if err := e.store.Save(next); err != nil && e.report != nil {
+		e.report("task %s waiting status could not be updated in memory: %v\n", next.TaskID, err)
+	}
 }
 
 func (e *Execution) canReleaseSettledNameProtectionLocked(record Record, status Status) bool {
@@ -868,7 +609,7 @@ func nameProtectionCanBeReleased(record Record) bool {
 	settledStatus := record.Status == StatusSucceeded || record.Status == StatusFailed
 	settledRecovery := record.Recovery.Status == "not-needed" || record.Recovery.Status == "restored"
 	return record.Type == "container-update" && settledStatus && settledRecovery &&
-		!record.RequiresAttention && record.PendingInstall == nil
+		!record.RequiresAttention
 }
 
 func (e *Execution) TaskID() string { e.mu.Lock(); defer e.mu.Unlock(); return e.record.TaskID }
@@ -908,9 +649,8 @@ func (e *Execution) Progress(stage string, percentage int, message string) error
 }
 
 // Warning records a non-fatal result such as cleanup that failed after the
-// primary operation committed. A warning persistence error does not turn a
-// committed operation into a failed task; the finalizer will retry saving the
-// in-memory warning and report a final durability failure separately.
+// primary operation committed. A checkpoint error does not turn a committed
+// operation into a failed task.
 func (e *Execution) Warning(message string) {
 	message = strings.TrimSpace(message)
 	if message == "" {
@@ -933,7 +673,7 @@ func (e *Execution) Warning(message string) {
 	report, id := e.report, next.TaskID
 	e.mu.Unlock()
 	if err != nil && report != nil {
-		report("task %s warning was not durably saved yet: %v\n", id, err)
+		report("task %s warning could not be stored yet: %v\n", id, err)
 	}
 }
 
@@ -941,15 +681,15 @@ func (e *Execution) Critical(stage string, mutate func(*Record)) error {
 	return e.critical(stage, mutate, false)
 }
 
-// CriticalCommit atomically persists a primary-operation commit checkpoint
-// and records the commit under the same execution lock. It is for single-task
+// CriticalCommit atomically stores a primary-operation commit checkpoint in
+// memory and records the commit under the same execution lock. It is for single-task
 // operations whose later steps are cleanup only; batch items must not mark
 // their parent task committed.
 func (e *Execution) CriticalCommit(stage string, mutate func(*Record)) error {
 	return e.critical(stage, mutate, true)
 }
 
-// CriticalItemCommit persists one batch item's commit fact together with its
+// CriticalItemCommit stores one batch item's commit fact together with its
 // checkpoint. The item is considered committed only after Save succeeds;
 // this does not commit the parent batch task.
 func (e *Execution) CriticalItemCommit(index int, stage string, mutate func(*Record)) error {
@@ -978,33 +718,18 @@ func (e *Execution) CriticalItemCommit(index int, stage string, mutate func(*Rec
 		return errors.New("critical checkpoint cannot change task identity or status")
 	}
 	next.UpdatedAt = e.now().UTC()
-	writeNext := cloneRecord(next)
-	if !e.record.Items[index].Committed {
-		writeNext.RequiresAttention = true
-		writeNext.Recovery = Recovery{Status: "unknown", Detail: "commit checkpoint is being persisted; automatic compensation is unsafe until confirmed"}
-		writeNext.Items[index].RequiresAttention = true
-		writeNext.Items[index].Recovery = writeNext.Recovery
-	}
-	if err := e.store.Save(writeNext); err != nil {
+	if err := e.store.Save(next); err != nil {
 		e.criticalErr = fmt.Errorf("critical task checkpoint %q failed: %w", stage, err)
-		// Keep observations such as the replacement ID, but never promote an
-		// unpersisted commit. A previously durable commit remains true.
+		// Keep observed identity facts, but do not mark the mutation committed.
 		next.Items[index].Committed = e.record.Items[index].Committed
-		if !e.record.Items[index].Committed && IsPersistenceOutcomeUncertain(err) {
-			e.uncertainCommit = true
-			markUncertainItemCommit(&next, index)
-		}
 		e.record = next
 		if e.report != nil {
-			e.report("task %s critical persistence failure: %v\n", next.TaskID, e.criticalErr)
+			e.report("task %s critical checkpoint failure: %v\n", next.TaskID, e.criticalErr)
 		}
 		e.cancel()
 		return e.criticalErr
 	}
 	e.record = next
-	if !e.record.Items[index].RequiresAttention && e.record.Items[index].Recovery.Detail == "commit checkpoint is being persisted; automatic compensation is unsafe until confirmed" {
-		e.record.Items[index].Recovery = Recovery{}
-	}
 	if err := taskContextError(e.ctx); err != nil {
 		e.cancel()
 		return err
@@ -1034,24 +759,13 @@ func (e *Execution) critical(stage string, mutate func(*Record), commit bool) er
 		return errors.New("critical checkpoint cannot change task identity or status")
 	}
 	next.UpdatedAt = e.now().UTC()
-	writeNext := next
-	if commit && !e.committed {
-		writeNext = cloneRecord(next)
-		writeNext.RequiresAttention = true
-		writeNext.Recovery = Recovery{Status: "unknown", Detail: "commit checkpoint is being persisted; automatic compensation is unsafe until confirmed"}
-	}
-	if err := e.store.Save(writeNext); err != nil {
+	if err := e.store.Save(next); err != nil {
 		e.criticalErr = fmt.Errorf("critical task checkpoint %q failed: %w", stage, err)
-		// Preserve the observed in-memory facts for terminal persistence and
-		// recovery even though this checkpoint was not durable.
+		// Preserve the observed in-memory facts for final reporting and recovery,
+		// but do not authorize the mutation without a successful checkpoint.
 		e.record = next
-		if commit && !e.committed && IsPersistenceOutcomeUncertain(err) {
-			e.uncertainCommit = true
-			e.record.RequiresAttention = true
-			e.record.Recovery = Recovery{Status: "unknown", Detail: "commit persistence and rollback outcome are uncertain; automatic compensation was not attempted"}
-		}
 		if e.report != nil {
-			e.report("task %s critical persistence failure: %v\n", next.TaskID, e.criticalErr)
+			e.report("task %s critical checkpoint failure: %v\n", next.TaskID, e.criticalErr)
 		}
 		e.cancel()
 		return e.criticalErr
@@ -1060,7 +774,7 @@ func (e *Execution) critical(stage string, mutate func(*Record), commit bool) er
 	if commit {
 		e.committed = true
 	}
-	// A deadline may expire while persistence is in progress. Do not let the
+	// A deadline may expire while updating progress. Do not let the
 	// callback begin the described operation after its budget has elapsed.
 	if err := taskContextError(e.ctx); err != nil {
 		e.cancel()
@@ -1073,100 +787,6 @@ func (e *Execution) isCommitted() bool {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	return e.committed && e.criticalErr == nil
-}
-
-func (e *Execution) hasUncertainCommit() bool {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	return e.uncertainCommit
-}
-
-func markUncertainItemCommit(record *Record, index int) {
-	item := &record.Items[index]
-	item.Committed = false
-	item.RequiresAttention = true
-	item.Recovery = Recovery{Status: "unknown", Detail: "commit persistence and rollback outcome are uncertain; automatic compensation was not attempted"}
-	if item.Name != "" {
-		found := false
-		for _, name := range item.ProtectedNames {
-			if name == item.Name {
-				found = true
-				break
-			}
-		}
-		if !found {
-			item.ProtectedNames = append(item.ProtectedNames, item.Name)
-		}
-	}
-	record.RequiresAttention = true
-	record.Recovery = item.Recovery
-}
-
-// MarkPendingInstall durably records the verified handoff facts while the
-// program-update task is still running. A later successful task return is
-// deferred until the new process proves the installed binary and readiness.
-func (e *Execution) MarkPendingInstall(marker PendingInstallHandoff) error {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	if e.finalized {
-		return ErrExecutionClosed
-	}
-	if e.record.Type != TaskTypeProgramUpdate || e.record.Status != StatusRunning {
-		return errors.New("only a running program-update task can request install handoff")
-	}
-	if e.record.PendingInstall != nil {
-		return errors.New("program-update task already has a pending install handoff")
-	}
-	if !completePendingInstallMarker(&marker) {
-		return errors.New("pending install marker is incomplete or invalid")
-	}
-	if err := taskContextError(e.ctx); err != nil {
-		e.cancel()
-		return err
-	}
-	next := cloneRecord(e.record)
-	next.PendingInstall = &marker
-	next.Stage = "install-handoff"
-	next.Percentage = 95
-	next.Message = "已验证待安装程序，等待进程交接"
-	next.UpdatedAt = e.now().UTC()
-	if err := e.store.Save(next); err != nil {
-		e.criticalErr = fmt.Errorf("critical task checkpoint %q failed: %w", "install-handoff", err)
-		e.record = next
-		if e.report != nil {
-			e.report("task %s critical persistence failure: %v\n", next.TaskID, e.criticalErr)
-		}
-		e.cancel()
-		return e.criticalErr
-	}
-	e.record = next
-	if err := e.ctx.Err(); err != nil {
-		return err
-	}
-	return nil
-}
-
-func (e *Execution) hasPendingInstall() bool {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	return e.record.PendingInstall != nil
-}
-
-func (e *Execution) setPendingInstallFailureStage() {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	if e.record.PendingInstall == nil {
-		return
-	}
-	e.record.Stage = "handoff-failed"
-	e.record.Message = "程序交接失败，正在保留待恢复事实"
-	e.record.UpdatedAt = e.now().UTC()
-}
-
-func (e *Execution) deferFinalization() {
-	e.mu.Lock()
-	e.finalized = true
-	e.mu.Unlock()
 }
 
 func (e *Execution) Current() Record { return e.current() }
@@ -1185,12 +805,6 @@ func taskContextError(ctx context.Context) error {
 		return context.DeadlineExceeded
 	}
 	return nil
-}
-
-func (e *Execution) reconciliation(recovery Recovery, attention bool) Reconciliation {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	return Reconciliation{Recovery: recovery, RequiresAttention: attention, ProtectedNames: cloneStrings(e.record.ProtectedNames)}
 }
 
 func settleBatchItems(rec *Record, status Status) {
@@ -1250,12 +864,12 @@ func (e *Execution) batchRecoveryTimedOut(index int, timeoutErr error) error {
 	next.UpdatedAt = e.now().UTC()
 	recountBatchItems(&next)
 	if err := e.store.Save(next); err != nil {
-		e.criticalErr = fmt.Errorf("persist batch item recovery timeout: %w", err)
-		// Keep the in-memory fact for terminal persistence and cancellation even
-		// when this checkpoint itself could not be made durable.
+		e.criticalErr = fmt.Errorf("store batch item recovery timeout: %w", err)
+		// Keep the in-memory fact for final reporting and cancellation even when
+		// this checkpoint itself could not be stored.
 		e.record = next
 		if e.report != nil {
-			e.report("task %s recovery timeout persistence failure: %v\n", next.TaskID, e.criticalErr)
+			e.report("task %s recovery timeout checkpoint failure: %v\n", next.TaskID, e.criticalErr)
 		}
 		e.cancel()
 		return e.criticalErr
@@ -1288,9 +902,8 @@ type BatchOperation struct {
 	Recover            RecoveryFunc
 }
 
-// SubmitBatch runs every item serially inside one worker. It never submits
-// child tasks to the same queue and therefore cannot deadlock by holding a
-// worker while awaiting another worker from that pool.
+// SubmitBatch runs every item serially inside one worker, keeping one shared
+// progress record and recovery scope for the batch.
 func (r *Runner) SubmitBatch(record Record, operations []BatchOperation, recoverFn RecoveryFunc) (string, error) {
 	return r.SubmitBatchWithHooks(record, operations, recoverFn, nil, nil)
 }
@@ -1349,11 +962,6 @@ func (r *Runner) SubmitBatchWithHooks(record Record, operations []BatchOperation
 				return err
 			}
 			out := invokeTask(func(ctx context.Context, e *Execution) error { return operation.Run(ctx, e) }, ctx, e)
-			if e.hasUncertainCommit() {
-				// A commit whose durable outcome is uncertain must not enter the
-				// item's recovery callback or allow later batch items to mutate.
-				return errors.Join(errors.Join(failures...), out.err, e.failure(), ErrPersistenceOutcomeUncertain)
-			}
 			status := "succeeded"
 			detail := ""
 			if out.err != nil {

@@ -9,284 +9,272 @@ import (
 	"sync"
 	"time"
 
-	cerrdefs "github.com/containerd/errdefs"
 	"github.com/onlyLTY/dockerCopilot/internal/config"
-	containerService "github.com/onlyLTY/dockerCopilot/internal/container"
 	"github.com/onlyLTY/dockerCopilot/internal/task"
 	"github.com/onlyLTY/dockerCopilot/internal/updater"
-	"github.com/zeromicro/go-zero/core/logx"
 )
 
-// TaskRuntime owns the persistent task store, bounded runner, query service,
-// startup reconciliation, and periodic retention cleanup for one process.
+const (
+	programTaskRetention  = 10 * time.Minute
+	programTaskMaxRecords = 1000
+)
+
+// ProgramInstallValidator is deliberately specific to the self-update
+// handoff. The general task runtime does not interpret installation records.
+type ProgramInstallValidator interface {
+	VerifyProgramInstall(context.Context, updater.HandoffMetadata) error
+}
+
+// TaskRuntime owns process-local task progress and a bounded runner. Task
+// records are intentionally not loaded from or saved to a task directory.
 type TaskRuntime struct {
 	Store  *task.Store
 	Runner *task.Runner
 	Query  *task.QueryService
 
-	stopCleanup           chan struct{}
-	cleanupDone           chan struct{}
-	closeOnce             sync.Once
-	closeErr              error
-	pendingMu             sync.Mutex
-	pendingInstallTaskIDs []string
-	pendingValidator      task.PendingInstallValidator
-	handoffWorkDir        string
+	mu         sync.Mutex
+	handoff    *updater.HandoffMetadata
+	handoffErr error
+	workDir    string
+	validator  ProgramInstallValidator
+	closeOnce  sync.Once
+	closeErr   error
 }
 
+// TaskRuntimeOptions contains execution limits only. Directory and history
+// fields are retained for source compatibility and are ignored.
 type TaskRuntimeOptions struct {
-	Directory        string
-	MaxConcurrent    int
-	QueueCapacity    int
-	TaskTimeout      time.Duration
-	RecoveryTimeout  time.Duration
-	Retention        time.Duration
-	MaxRecords       int
-	StartupTimeout   time.Duration
-	PendingValidator task.PendingInstallValidator
-	HandoffWorkDir   string
+	Directory       string
+	MaxConcurrent   int
+	QueueCapacity   int
+	TaskTimeout     time.Duration
+	RecoveryTimeout time.Duration
+	Retention       time.Duration
+	MaxRecords      int
+	StartupTimeout  time.Duration
 }
 
-// NewTaskRuntime opens the exclusive task store and reconciles interrupted
-// work before constructing a runner that can accept new mutations.
-func NewTaskRuntime(ctx context.Context, opts TaskRuntimeOptions, inspector task.ContainerInspector) (*TaskRuntime, error) {
-	if opts.StartupTimeout <= 0 {
-		opts.StartupTimeout = 30 * time.Second
-	}
-	store, err := task.Open(task.Options{Dir: opts.Directory})
+// NewTaskRuntime creates an in-memory store, a bounded runner, and a small
+// progress query. Extra legacy arguments are ignored; no task files are read.
+func NewTaskRuntime(_ context.Context, opts TaskRuntimeOptions, _ ...any) (*TaskRuntime, error) {
+	store, err := task.Open(task.Options{})
 	if err != nil {
-		return nil, fmt.Errorf("open task store: %w", err)
+		return nil, fmt.Errorf("open in-memory task store: %w", err)
 	}
-	closeOnError := func(err error) (*TaskRuntime, error) {
+	query, err := task.NewQueryService(store, task.QueryOptions{Retention: programTaskRetention, MaxRecords: programTaskMaxRecords})
+	if err != nil {
 		_ = store.Close()
-		return nil, err
-	}
-	reconciler, err := task.NewStartupReconciler(store, inspector, opts.PendingValidator, nil)
-	if err != nil {
-		return closeOnError(fmt.Errorf("create task startup reconciler: %w", err))
-	}
-	startupCtx, cancelStartup := context.WithTimeout(ctx, opts.StartupTimeout)
-	report, reconcileErr := reconciler.Run(startupCtx)
-	cancelStartup()
-	if reconcileErr != nil {
-		return closeOnError(fmt.Errorf("reconcile task store at startup: %w", reconcileErr))
-	}
-	if err := reconcileUnverifiedHandoffStartup(store, report, opts.HandoffWorkDir); err != nil {
-		return closeOnError(err)
-	}
-	query, err := task.NewQueryService(store, task.QueryOptions{Retention: opts.Retention, MaxRecords: opts.MaxRecords})
-	if err != nil {
-		return closeOnError(fmt.Errorf("create task query service: %w", err))
-	}
-	if _, err := query.Cleanup(); err != nil {
-		logx.Infof("warning: initial task cleanup failed: %v", err)
+		return nil, fmt.Errorf("create task query service: %w", err)
 	}
 	runner, err := task.NewRunner(store, task.RunnerOptions{
-		MaxConcurrent: opts.MaxConcurrent, QueueCapacity: opts.QueueCapacity,
-		TaskTimeout: opts.TaskTimeout, RecoveryTimeout: opts.RecoveryTimeout,
+		MaxConcurrent: opts.MaxConcurrent, TaskTimeout: opts.TaskTimeout,
+		RecoveryTimeout: opts.RecoveryTimeout,
 	})
 	if err != nil {
-		return closeOnError(fmt.Errorf("create task runner: %w", err))
+		_ = store.Close()
+		return nil, fmt.Errorf("create task runner: %w", err)
 	}
-	runtime := &TaskRuntime{
-		Store: store, Runner: runner, Query: query,
-		stopCleanup: make(chan struct{}), cleanupDone: make(chan struct{}),
-		pendingInstallTaskIDs: append([]string(nil), report.PendingInstallTaskIDs...),
-		pendingValidator:      opts.PendingValidator, handoffWorkDir: opts.HandoffWorkDir,
+	return &TaskRuntime{Store: store, Runner: runner, Query: query}, nil
+}
+
+func NewTaskRuntimeForConfig(ctx context.Context, c config.Config, workDir string) (*TaskRuntime, error) {
+	return NewTaskRuntimeForConfigWithValidator(ctx, c, nil, workDir)
+}
+
+func NewTaskRuntimeForConfigWithValidator(ctx context.Context, c config.Config, validator ProgramInstallValidator, workDir string) (*TaskRuntime, error) {
+	c.ApplyDefaults()
+	taskTimeout, err := time.ParseDuration(c.Tasks.Timeout)
+	if err != nil {
+		return nil, fmt.Errorf("resolve task timeout: %w", err)
 	}
-	go runtime.cleanupLoop()
+	recoveryTimeout, err := time.ParseDuration(c.Tasks.RecoveryTimeout)
+	if err != nil {
+		return nil, fmt.Errorf("resolve task recovery timeout: %w", err)
+	}
+	runtime, err := NewTaskRuntime(ctx, TaskRuntimeOptions{
+		MaxConcurrent: *c.Tasks.MaxConcurrent, TaskTimeout: taskTimeout, RecoveryTimeout: recoveryTimeout,
+	})
+	if err != nil {
+		return nil, err
+	}
+	runtime.workDir = workDir
+	runtime.validator = validator
+	runtime.loadHandoffState()
 	return runtime, nil
 }
 
-func reconcileUnverifiedHandoffStartup(store *task.Store, report task.StartupReport, workDir string) error {
-	for _, taskID := range report.InterruptedTaskIDs {
-		record, err := store.Get(taskID)
-		if err != nil {
-			return fmt.Errorf("inspect interrupted program handoff %s: %w", taskID, err)
-		}
-		marker := record.PendingInstall
-		if record.Type != task.TaskTypeProgramUpdate || marker == nil {
-			continue
-		}
-		result, resultErr := updater.ReadHandoffResult(workDir)
-		metadata, metadataErr := updater.ReadHandoffMetadata(workDir)
-		metadataMatches := metadataErr == nil && resultMatchesMarker(metadata, record)
-		if metadataMatches && resultErr == nil && result.Result == "failed-start" && resultMatchesMarker(result.HandoffMetadata, record) {
-			// The launcher already rejected the candidate and restarted the old
-			// program. Keep the interrupted record for review but allow management.
-			continue
-		}
-		resultMatches := resultErr == nil && resultMatchesMarker(result.HandoffMetadata, record)
-		resultCanBeWritten := resultMatches || errors.Is(resultErr, os.ErrNotExist)
-		if metadataMatches && resultCanBeWritten {
-			if err := updater.WriteHandoffResult(workDir, updater.HandoffResult{
-				HandoffMetadata: metadata, Result: "failed-start", ErrorCode: "running_binary_unverified",
-			}); err != nil {
-				return fmt.Errorf("record rejected program handoff %s: %w", taskID, err)
-			}
-		}
-		cause := errors.Join(metadataErr, resultErr)
-		if metadataMatches && !resultCanBeWritten {
-			cause = errors.New("handoff result is corrupt or belongs to a different task")
-		}
-		if cause == nil {
-			cause = errors.New("handoff sidecar identity does not match the durable task")
-		}
-		return fmt.Errorf("program handoff %s could not be verified at startup; the handoff-capable launcher must restore the previous program: %w", taskID, cause)
+func (r *TaskRuntime) loadHandoffState() {
+	if r == nil || r.workDir == "" {
+		return
 	}
-	return nil
-}
-
-func resultMatchesMarker(metadata updater.HandoffMetadata, record task.Record) bool {
-	marker := record.PendingInstall
-	return marker != nil && metadata.TaskID == record.TaskID && metadata.HandoffID == marker.HandoffID &&
-		metadata.TargetVersion == marker.TargetVersion && metadata.GOARCH == marker.GOARCH &&
-		strings.EqualFold(metadata.BinarySHA256, marker.ArtifactSHA256)
-}
-
-func NewTaskRuntimeForConfig(ctx context.Context, c config.Config, inspector task.ContainerInspector) (*TaskRuntime, error) {
-	return NewTaskRuntimeForConfigWithValidator(ctx, c, inspector, nil, "")
-}
-
-func NewTaskRuntimeForConfigWithValidator(ctx context.Context, c config.Config, inspector task.ContainerInspector, validator task.PendingInstallValidator, workDir string) (*TaskRuntime, error) {
-	opts, err := c.TaskOptions()
+	metadata, err := updater.ReadHandoffMetadata(r.workDir)
+	if errors.Is(err, os.ErrNotExist) {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	if err != nil {
-		return nil, fmt.Errorf("resolve task runtime options: %w", err)
+		r.handoffErr = fmt.Errorf("read program handoff metadata: %w", err)
+		return
 	}
-	return NewTaskRuntime(ctx, TaskRuntimeOptions{
-		Directory: opts.Directory, MaxConcurrent: opts.MaxConcurrent, QueueCapacity: opts.QueueCapacity,
-		TaskTimeout: opts.Timeout, RecoveryTimeout: opts.RecoveryTimeout,
-		Retention: opts.Retention, MaxRecords: opts.MaxRecords, StartupTimeout: opts.RecoveryTimeout,
-		PendingValidator: validator, HandoffWorkDir: workDir,
-	}, inspector)
+	r.handoff = &metadata
 }
 
-// ConfirmPendingInstalls is called only after this process has served a local
-// readiness probe. The sidecar records process readiness first; durable task
-// confirmation is retried separately because the two files cannot be updated
-// as one transaction.
-func (r *TaskRuntime) ConfirmPendingInstalls(ctx context.Context) error {
+// MarkProgramHandoff records the in-process view only after the validated
+// sidecar has been written successfully.
+func (r *TaskRuntime) MarkProgramHandoff(metadata updater.HandoffMetadata) {
 	if r == nil {
-		return nil
+		return
 	}
-	r.pendingMu.Lock()
-	taskIDs := append([]string(nil), r.pendingInstallTaskIDs...)
-	r.pendingMu.Unlock()
-	if len(taskIDs) == 0 {
-		return nil
-	}
-	if r.pendingValidator == nil || r.handoffWorkDir == "" {
-		return errors.New("pending program handoff cannot be confirmed without validator and working directory")
-	}
-	for _, taskID := range taskIDs {
-		record, err := r.Store.Get(taskID)
-		if err != nil {
-			return fmt.Errorf("load pending program task %s: %w", taskID, err)
-		}
-		proof, err := r.pendingValidator.VerifyPendingInstall(ctx, record)
-		if err != nil {
-			return fmt.Errorf("verify running program for task %s: %w", taskID, err)
-		}
-		marker := record.PendingInstall
-		if marker == nil {
-			return fmt.Errorf("pending program task %s has no handoff marker", taskID)
-		}
-		proof.Ready = true
-		if existingResult, resultErr := updater.ReadHandoffResult(r.handoffWorkDir); resultErr == nil {
-			if !resultMatchesMarker(existingResult.HandoffMetadata, record) {
-				return fmt.Errorf("existing handoff result belongs to a different task; refusing to overwrite it")
-			}
-		} else if !errors.Is(resultErr, os.ErrNotExist) {
-			return fmt.Errorf("read existing handoff result before confirmation: %w", resultErr)
-		}
-		if err := updater.WriteHandoffResult(r.handoffWorkDir, updater.HandoffResult{
-			HandoffMetadata: updater.HandoffMetadata{TaskID: taskID, HandoffID: marker.HandoffID, TargetVersion: marker.TargetVersion, GOARCH: marker.GOARCH, BinarySHA256: marker.ArtifactSHA256},
-			Result:          "ready",
-		}); err != nil {
-			return fmt.Errorf("write ready handoff result for task %s: %w", taskID, err)
-		}
-		var confirmErr error
-		for attempt := 0; attempt < 10; attempt++ {
-			confirmErr = r.Store.ConfirmPendingInstall(taskID, proof)
-			if confirmErr == nil {
-				break
-			}
-			if attempt == 9 {
-				break
-			}
-			timer := time.NewTimer(500 * time.Millisecond)
-			select {
-			case <-ctx.Done():
-				timer.Stop()
-				return fmt.Errorf("confirm pending program task %s: %w", taskID, ctx.Err())
-			case <-timer.C:
-			}
-		}
-		if confirmErr != nil {
-			return fmt.Errorf("confirm pending program task %s: %w", taskID, confirmErr)
-		}
-	}
-	r.pendingMu.Lock()
-	r.pendingInstallTaskIDs = nil
-	r.pendingMu.Unlock()
-	return nil
+	r.mu.Lock()
+	copy := metadata
+	r.handoff = &copy
+	r.handoffErr = nil
+	r.mu.Unlock()
 }
 
+func (r *TaskRuntime) ClearProgramHandoff(taskID string) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	if r.handoff != nil && r.handoff.TaskID == taskID {
+		r.handoff = nil
+		r.handoffErr = nil
+	}
+	r.mu.Unlock()
+}
+
+// HasPendingInstall is retained for startup wiring. A sidecar, including a
+// malformed one, blocks mutations until readiness verification can resolve it.
 func (r *TaskRuntime) HasPendingInstall() bool {
 	if r == nil {
 		return false
 	}
-	r.pendingMu.Lock()
-	defer r.pendingMu.Unlock()
-	return len(r.pendingInstallTaskIDs) != 0
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.handoff != nil || r.handoffErr != nil
 }
 
-// HasUnresolvedProgramInstall also detects handoffs retained for manual review
-// after failed reconciliation or rollback. A confirmed succeeded marker is an
-// audit record and does not block a later update.
+// ConfirmPendingInstalls runs only after the new process has passed HTTP
+// readiness. It verifies the running executable before recording ready and
+// recreates the task result in this process's memory store.
+func (r *TaskRuntime) ConfirmPendingInstalls(ctx context.Context) error {
+	if r == nil {
+		return nil
+	}
+	r.mu.Lock()
+	if r.handoffErr != nil {
+		err := r.handoffErr
+		r.mu.Unlock()
+		return err
+	}
+	if r.handoff == nil {
+		r.mu.Unlock()
+		return nil
+	}
+	metadata := *r.handoff
+	r.mu.Unlock()
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	currentMetadata, err := updater.ReadHandoffMetadata(r.workDir)
+	if err != nil {
+		return fmt.Errorf("re-read program handoff metadata: %w", err)
+	}
+	if !sameHandoff(currentMetadata, metadata) {
+		return errors.New("program handoff metadata changed before confirmation")
+	}
+	result, err := updater.ReadHandoffResult(r.workDir)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("read program handoff result: %w", err)
+	}
+	if err == nil && !sameHandoff(result.HandoffMetadata, metadata) {
+		return errors.New("program handoff result identity does not match metadata")
+	}
+	if err == nil && result.Result == "failed-start" {
+		if err := r.recreateProgramTask(metadata, task.StatusFailed, "program update rolled back", result.ErrorCode); err != nil {
+			return err
+		}
+		r.ClearProgramHandoff(metadata.TaskID)
+		return nil
+	}
+	if r.validator == nil {
+		return errors.New("program handoff cannot be confirmed without an install validator")
+	}
+	if err := r.validator.VerifyProgramInstall(ctx, metadata); err != nil {
+		return fmt.Errorf("verify running program for handoff %s: %w", metadata.TaskID, err)
+	}
+	if err != nil || result.Result != "ready" {
+		if err := updater.WriteHandoffResult(r.workDir, updater.HandoffResult{HandoffMetadata: metadata, Result: "ready"}); err != nil {
+			// Keep the handoff marker and mutation drain. Never roll back a binary
+			// that has already started and passed verification because the result
+			// sidecar could not be synced.
+			return fmt.Errorf("record ready program handoff: %w", err)
+		}
+	}
+	if err := r.recreateProgramTask(metadata, task.StatusSucceeded, "program update ready", ""); err != nil {
+		return err
+	}
+	r.ClearProgramHandoff(metadata.TaskID)
+	return nil
+}
+
+func (r *TaskRuntime) recreateProgramTask(metadata updater.HandoffMetadata, status task.Status, message, errorCode string) error {
+	if _, err := r.Store.Get(metadata.TaskID); err == nil {
+		return nil
+	} else if !errors.Is(err, task.ErrTaskNotFound) {
+		return fmt.Errorf("inspect in-memory program task: %w", err)
+	}
+	now := time.Now().UTC()
+	started, finished := now, now
+	record := task.Record{
+		SchemaVersion: task.SchemaVersion, TaskID: metadata.TaskID, Type: task.TaskTypeProgramUpdate,
+		Status: status, Stage: string(status), Percentage: 100, Message: message,
+		Name: "在线更新程序", ImageRef: metadata.TargetVersion,
+		CreatedAt: now, StartedAt: &started, UpdatedAt: now, FinishedAt: &finished,
+		IsDone: true, RequestID: metadata.TaskID,
+	}
+	if errorCode != "" {
+		record.Error = "program handoff failed: " + errorCode
+		record.Recovery = task.Recovery{Status: "restored", Detail: "launcher restored the previous program"}
+	}
+	if err := r.Store.Create(record); err != nil && !errors.Is(err, os.ErrExist) {
+		return fmt.Errorf("recreate program task progress: %w", err)
+	}
+	return nil
+}
+
+func sameHandoff(a, b updater.HandoffMetadata) bool {
+	return a.TaskID == b.TaskID && a.HandoffID == b.HandoffID && a.TargetVersion == b.TargetVersion && a.GOARCH == b.GOARCH && strings.EqualFold(a.BinarySHA256, b.BinarySHA256)
+}
+
 func (r *TaskRuntime) HasUnresolvedProgramInstall() bool {
-	if r == nil || r.Store == nil {
+	if r == nil {
 		return false
+	}
+	if r.HasPendingInstall() {
+		return true
 	}
 	records, err := r.Store.List()
 	if err != nil {
 		return true
 	}
 	for _, record := range records {
-		if record.Type == task.TaskTypeProgramUpdate && record.PendingInstall != nil && record.Status != task.StatusSucceeded {
+		if record.Type == task.TaskTypeProgramUpdate && (!record.Status.Terminal() || record.RequiresAttention) {
 			return true
 		}
 	}
 	return false
 }
 
-func (r *TaskRuntime) cleanupLoop() {
-	defer close(r.cleanupDone)
-	ticker := time.NewTicker(time.Hour)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ticker.C:
-			if _, err := r.Query.Cleanup(); err != nil {
-				logx.Errorf("periodic task cleanup failed: %v", err)
-			}
-		case <-r.stopCleanup:
-			return
-		}
-	}
-}
-
-// Close stops cleanup, drains accepted tasks, and releases the exclusive
-// writer lock. It is safe to call more than once.
+// Close drains accepted work and closes the in-memory task store. It is safe
+// to call more than once.
 func (r *TaskRuntime) Close() error {
 	if r == nil {
 		return nil
 	}
 	r.closeOnce.Do(func() {
-		if r.stopCleanup != nil {
-			close(r.stopCleanup)
-			<-r.cleanupDone
-		}
 		if r.Runner != nil {
 			r.Runner.Close()
 		}
@@ -295,24 +283,4 @@ func (r *TaskRuntime) Close() error {
 		}
 	})
 	return r.closeErr
-}
-
-// serviceInspector restricts startup checks to the read-only Inspect API.
-type serviceInspector struct{ service *containerService.Service }
-
-func (i serviceInspector) Inspect(ctx context.Context, id string) (task.ContainerObservation, error) {
-	if i.service == nil {
-		return task.ContainerObservation{}, errors.New("container inspector is unavailable")
-	}
-	info, err := i.service.Inspect(ctx, id)
-	if err != nil {
-		if cerrdefs.IsNotFound(err) {
-			return task.ContainerObservation{}, task.ErrContainerNotFound
-		}
-		return task.ContainerObservation{}, err
-	}
-	if info.ContainerJSONBase == nil || info.State == nil {
-		return task.ContainerObservation{}, errors.New("container inspect returned incomplete state")
-	}
-	return task.ContainerObservation{Name: info.Name, State: info.State.Status, Running: info.State.Running}, nil
 }

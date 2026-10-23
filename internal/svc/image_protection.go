@@ -91,7 +91,7 @@ func (p taskImageProtection) ProtectedImages(ctx context.Context) (imageService.
 			for _, ref := range []string{item.ImageRef} {
 				addImageReference(result.References, ref, record.TaskID)
 			}
-			if item.SnapshotRef != "" && itemSnapshotIsDurable(item.Stage) {
+			if item.SnapshotRef != "" && itemSnapshotAvailable(item.Stage) {
 				snapshot, readErr := store.ReadItemSnapshot(record.TaskID, item.SnapshotRef)
 				if readErr != nil {
 					return imageService.ProtectedImages{}, fmt.Errorf("read update item snapshot for task %s: %w", record.TaskID, readErr)
@@ -112,10 +112,10 @@ func (p taskImageProtection) ProtectedImages(ctx context.Context) (imageService.
 	return result, nil
 }
 
-// Item snapshot references are assigned at admission, before the snapshot file
-// is durably written. Only snapshot-saved and subsequent stages may read it;
+// Item snapshot references are assigned at admission, before the snapshot
+// is stored in memory. Only snapshot-saved and subsequent stages may read it;
 // earlier stages still retain their admission-time ImageIDs and image refs.
-func itemSnapshotIsDurable(stage string) bool {
+func itemSnapshotAvailable(stage string) bool {
 	switch stage {
 	case "", "queued", "starting", "preflight", "snapshot":
 		return false
@@ -125,7 +125,7 @@ func itemSnapshotIsDurable(stage string) bool {
 }
 
 func protectsImageRecovery(record task.Record) bool {
-	if record.Status == task.StatusQueued || record.Status == task.StatusRunning || record.PendingInstall != nil || record.RequiresAttention {
+	if record.Status == task.StatusQueued || record.Status == task.StatusRunning || record.RequiresAttention {
 		return true
 	}
 	return record.Recovery.Status != "" && record.Recovery.Status != "not-needed" && record.Recovery.Status != "restored"

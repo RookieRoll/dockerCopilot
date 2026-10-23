@@ -38,17 +38,15 @@ func TestRollbackFailureWritesMatchingFailedStartToPreventRetry(t *testing.T) {
 			TaskID: "d7dce3a9-c3e9-4c3f-a7d8-486b12c5e63f", TargetVersion: "2.3.4", GOARCH: "amd64",
 			BinarySHA256: strings.Repeat("a", 64), Path: candidate,
 		},
+		metadata: &updater.HandoffMetadata{
+			TaskID: "d7dce3a9-c3e9-4c3f-a7d8-486b12c5e63f", HandoffID: "d7dce3a9-c3e9-4c3f-a7d8-486b12c5e640",
+			TargetVersion: "2.3.4", GOARCH: "amd64", BinarySHA256: strings.Repeat("a", 64),
+		},
 	}
-	marker := &task.PendingInstallHandoff{
-		HandoffID: "d7dce3a9-c3e9-4c3f-a7d8-486b12c5e640", TargetVersion: "2.3.4", GOARCH: "amd64",
-		ArtifactSHA256: strings.Repeat("a", 64),
-	}
-	record := task.Record{TaskID: state.placed.TaskID, PendingInstall: marker}
-	metadata := updater.HandoffMetadata{TaskID: record.TaskID, HandoffID: marker.HandoffID, TargetVersion: marker.TargetVersion, GOARCH: marker.GOARCH, BinarySHA256: marker.ArtifactSHA256}
-	if err := updater.WriteHandoffMetadata(workDir, metadata); err != nil {
+	if err := updater.WriteHandoffMetadata(workDir, *state.metadata); err != nil {
 		t.Fatal(err)
 	}
-	if err := state.rollback(record); err == nil {
+	if err := state.rollback(); err == nil {
 		t.Fatal("expected candidate cleanup to fail without its original file identity")
 	}
 	if _, err := os.Stat(candidate); err != nil {
@@ -58,7 +56,7 @@ func TestRollbackFailureWritesMatchingFailedStartToPreventRetry(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.Result != "failed-start" || result.ErrorCode != "rollback_failed" || result.TaskID != record.TaskID || result.HandoffID != marker.HandoffID {
+	if result.Result != "failed-start" || result.ErrorCode != "rollback_failed" || result.TaskID != state.metadata.TaskID || result.HandoffID != state.metadata.HandoffID {
 		t.Fatalf("rollback failure did not disable a future candidate retry: %#v", result)
 	}
 }
@@ -125,7 +123,7 @@ func TestProgramUpdateTaskDrainsAndRollsBackWhenHandoffSignalFails(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if completed.Status != task.StatusFailed || completed.PendingInstall != nil {
+	if completed.Status != task.StatusFailed || completed.Recovery.Status != "restored" {
 		t.Fatalf("failed handoff should be rolled back and finalized: %#v", completed)
 	}
 	if serviceContext.MutationGate().IsDraining() {
@@ -175,7 +173,7 @@ func TestProgramUpdateDrainTimeoutRestoresMutationAdmission(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if record.Status != task.StatusFailed || record.PendingInstall != nil {
+	if record.Status != task.StatusFailed || record.Recovery.Status != "restored" {
 		t.Fatalf("drain timeout should fail before handoff: %#v", record)
 	}
 	if ctx.MutationGate().IsDraining() {
@@ -186,7 +184,7 @@ func TestProgramUpdateDrainTimeoutRestoresMutationAdmission(t *testing.T) {
 	}
 }
 
-func TestProgramUpdateSuccessfulHandoffRemainsRunningUntilStartupProof(t *testing.T) {
+func TestProgramUpdateSuccessfulHandoffWaitsForNewProcessProof(t *testing.T) {
 	if runtime.GOARCH != "amd64" {
 		t.Skip("integration fixture emits an amd64 ELF archive")
 	}
@@ -203,15 +201,24 @@ func TestProgramUpdateSuccessfulHandoffRemainsRunningUntilStartupProof(t *testin
 		t.Fatalf("submit update: %v", err)
 	}
 	taskID := response.Data.(map[string]any)["taskID"].(string)
-	if err := runtimeTasks.Runner.WaitIdle(context.Background()); err != nil {
-		t.Fatal(err)
+	shutdownRequested := false
+	select {
+	case <-shutdown:
+		shutdownRequested = true
+	case <-time.After(5 * time.Second):
+		t.Fatal("program task did not request controlled shutdown")
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		record, getErr := runtimeTasks.Store.Get(taskID)
+		if getErr == nil && record.Status == task.StatusRunning {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 	record, err := runtimeTasks.Store.Get(taskID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if record.Status != task.StatusRunning || record.PendingInstall == nil || record.FinishedAt != nil {
-		t.Fatalf("handoff was finalized before startup proof: %#v", record)
+	if err != nil || record.Status != task.StatusRunning || record.FinishedAt != nil {
+		t.Fatalf("old process must keep handoff running until shutdown: record=%#v err=%v", record, err)
 	}
 	if record.RequestID != requestID {
 		t.Fatalf("task request ID did not preserve the client UUID: got %q", record.RequestID)
@@ -219,8 +226,17 @@ func TestProgramUpdateSuccessfulHandoffRemainsRunningUntilStartupProof(t *testin
 	if !ctx.MutationGate().IsDraining() {
 		t.Fatal("successful handoff reopened mutation admission")
 	}
-	if len(shutdown) != 1 {
+	if !runtimeTasks.HasPendingInstall() {
+		t.Fatal("task runtime did not retain the handoff for the restarted process")
+	}
+	if !shutdownRequested {
 		t.Fatal("successful handoff did not signal controlled shutdown")
+	}
+	if err := runtimeTasks.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(ctx.Config.Updates.WorkDir, "dockerCopilot-new")); err != nil {
+		t.Fatalf("handoff cleanup removed the candidate after shutdown: %v", err)
 	}
 }
 
@@ -294,7 +310,7 @@ func TestProgramUpdatePrepareFailureDoesNotSignalShutdown(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if record.Status != task.StatusFailed || record.PendingInstall != nil {
+	if record.Status != task.StatusFailed {
 		t.Fatalf("invalid package was not rejected before handoff: %#v", record)
 	}
 	if len(shutdown) != 0 {
@@ -385,24 +401,20 @@ func TestRollbackFailureDoesNotOverwriteOtherHandoffResult(t *testing.T) {
 	if err := os.WriteFile(candidate, []byte("candidate binary"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	marker := &task.PendingInstallHandoff{
-		HandoffID: "d7dce3a9-c3e9-4c3f-a7d8-486b12c5e640", TargetVersion: "2.3.4", GOARCH: "amd64",
-		ArtifactSHA256: strings.Repeat("a", 64),
-	}
 	taskID := "d7dce3a9-c3e9-4c3f-a7d8-486b12c5e63f"
-	metadata := updater.HandoffMetadata{TaskID: taskID, HandoffID: marker.HandoffID, TargetVersion: marker.TargetVersion, GOARCH: marker.GOARCH, BinarySHA256: marker.ArtifactSHA256}
+	metadata := updater.HandoffMetadata{TaskID: taskID, HandoffID: "d7dce3a9-c3e9-4c3f-a7d8-486b12c5e640", TargetVersion: "2.3.4", GOARCH: "amd64", BinarySHA256: strings.Repeat("a", 64)}
 	if err := updater.WriteHandoffMetadata(workDir, metadata); err != nil {
 		t.Fatal(err)
 	}
-	other := updater.HandoffMetadata{TaskID: "d7dce3a9-c3e9-4c3f-a7d8-486b12c5e641", HandoffID: "d7dce3a9-c3e9-4c3f-a7d8-486b12c5e642", TargetVersion: marker.TargetVersion, GOARCH: marker.GOARCH, BinarySHA256: marker.ArtifactSHA256}
+	other := updater.HandoffMetadata{TaskID: "d7dce3a9-c3e9-4c3f-a7d8-486b12c5e641", HandoffID: "d7dce3a9-c3e9-4c3f-a7d8-486b12c5e642", TargetVersion: metadata.TargetVersion, GOARCH: metadata.GOARCH, BinarySHA256: metadata.BinarySHA256}
 	if err := updater.WriteHandoffResult(workDir, updater.HandoffResult{HandoffMetadata: other, Result: "ready"}); err != nil {
 		t.Fatal(err)
 	}
 	state := &programTaskState{
-		workDir: workDir, stagingRoot: filepath.Join(t.TempDir(), "stage"),
-		placed: &updater.InstallHandoff{TaskID: taskID, TargetVersion: marker.TargetVersion, GOARCH: marker.GOARCH, BinarySHA256: marker.ArtifactSHA256, Path: candidate},
+		workDir: workDir, stagingRoot: filepath.Join(t.TempDir(), "stage"), metadata: &metadata,
+		placed: &updater.InstallHandoff{TaskID: taskID, TargetVersion: metadata.TargetVersion, GOARCH: metadata.GOARCH, BinarySHA256: metadata.BinarySHA256, Path: candidate},
 	}
-	if err := state.rollback(task.Record{TaskID: taskID, PendingInstall: marker}); err == nil {
+	if err := state.rollback(); err == nil {
 		t.Fatal("expected cleanup failure")
 	}
 	result, err := updater.ReadHandoffResult(workDir)

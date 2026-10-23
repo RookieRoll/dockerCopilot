@@ -72,3 +72,15 @@ func TestProgramHandoffRequiresExplicitIdentityForCustomHostname(t *testing.T) {
 		t.Fatal("missing Docker client and explicit self identity should reject handoff")
 	}
 }
+
+func TestProgramHandoffStagingIsScopedToProgramWorkDirectory(t *testing.T) {
+	workDir := t.TempDir()
+	ctx := &ServiceContext{Config: config.Config{Updates: config.UpdateConfig{WorkDir: workDir}, Tasks: config.TaskConfig{Directory: filepath.Join(t.TempDir(), "legacy-task-dir")}}}
+	options, err := ctx.ProgramHandoffOptions()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if options.WorkDir != workDir || options.StagingParent != filepath.Join(workDir, ".dockerCopilot-update-stage") {
+		t.Fatalf("program staging must be independent of task storage: %#v", options)
+	}
+}

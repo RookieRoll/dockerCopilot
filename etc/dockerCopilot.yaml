@@ -8,12 +8,8 @@ Auth:
   AccessSecret: ${secretKey}
   AccessExpire: 7257600
 Tasks:
-  Directory: /data/tasks
   MaxConcurrent: 2
-  QueueCapacity: 100
   Timeout: 30m
-  Retention: 168h
-  MaxRecords: 1000
   HealthcheckWait: 120s
   RunningObservation: 10s
   RecoveryTimeout: 2m

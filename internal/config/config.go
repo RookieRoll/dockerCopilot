@@ -29,6 +29,8 @@ type Config struct {
 }
 
 type TaskConfig struct {
+	// Directory, QueueCapacity, Retention and MaxRecords are accepted only for
+	// configuration compatibility. Progress is process-local and has no disk queue.
 	Directory          string `json:",optional,default=/data/tasks"`
 	MaxConcurrent      *int   `json:",optional"`
 	QueueCapacity      *int   `json:",optional"`
@@ -167,8 +169,6 @@ func (c *Config) ApplyEnvironment() error {
 		dest **int
 	}{
 		{"DOCKERCOPILOT_TASK_MAX_CONCURRENT", &c.Tasks.MaxConcurrent},
-		{"DOCKERCOPILOT_TASK_QUEUE_CAPACITY", &c.Tasks.QueueCapacity},
-		{"DOCKERCOPILOT_TASK_MAX_RECORDS", &c.Tasks.MaxRecords},
 		{"DOCKERCOPILOT_LOG_RETENTION_DAYS", &c.Logging.RetentionDays},
 	}
 	for _, override := range intOverrides {
@@ -246,16 +246,9 @@ func (c *Config) Validate() error {
 	if *c.Tasks.MaxConcurrent < 1 || *c.Tasks.MaxConcurrent > 64 {
 		return fmt.Errorf("Tasks.MaxConcurrent must be between 1 and 64")
 	}
-	if *c.Tasks.QueueCapacity < 1 || *c.Tasks.QueueCapacity > 10000 {
-		return fmt.Errorf("Tasks.QueueCapacity must be between 1 and 10000")
-	}
 	timeout, err := time.ParseDuration(c.Tasks.Timeout)
 	if err != nil || timeout <= 0 {
 		return fmt.Errorf("Tasks.Timeout must be a positive duration")
-	}
-	retention, err := time.ParseDuration(c.Tasks.Retention)
-	if err != nil || retention <= 0 {
-		return fmt.Errorf("Tasks.Retention must be a positive duration")
 	}
 	if err := validatePositiveDuration("Tasks.HealthcheckWait", c.Tasks.HealthcheckWait); err != nil {
 		return err
@@ -265,9 +258,6 @@ func (c *Config) Validate() error {
 	}
 	if err := validatePositiveDuration("Tasks.RecoveryTimeout", c.Tasks.RecoveryTimeout); err != nil {
 		return err
-	}
-	if *c.Tasks.MaxRecords < 1 {
-		return fmt.Errorf("Tasks.MaxRecords must be positive")
 	}
 	if *c.Logging.RetentionDays < 1 || *c.Logging.MaxFileSizeMiB < 1 || *c.Logging.MaxTotalSizeMiB < 1 {
 		return fmt.Errorf("logging retention and size limits must be positive")
@@ -284,8 +274,8 @@ func (c *Config) Validate() error {
 	if level := c.Logging.Level; level != "debug" && level != "info" && level != "error" && level != "severe" {
 		return fmt.Errorf("Logging.Level must be debug, info, error, or severe")
 	}
-	if strings.TrimSpace(c.Tasks.Directory) == "" || strings.TrimSpace(c.Backup.Directory) == "" || strings.TrimSpace(c.Logging.Directory) == "" || strings.TrimSpace(c.Docker.PortOverridesPath) == "" {
-		return fmt.Errorf("task, backup, log, and port override paths must not be empty")
+	if strings.TrimSpace(c.Backup.Directory) == "" || strings.TrimSpace(c.Logging.Directory) == "" || strings.TrimSpace(c.Docker.PortOverridesPath) == "" {
+		return fmt.Errorf("backup, log, and port override paths must not be empty")
 	}
 	if self := strings.TrimSpace(c.Docker.SelfContainer); self != "" && !validContainerReference.MatchString(self) {
 		return fmt.Errorf("Docker.SelfContainer must be a container name or ID")
@@ -350,10 +340,6 @@ func (c Config) TaskOptions() (TaskOptions, error) {
 	if err != nil {
 		return TaskOptions{}, err
 	}
-	retention, err := time.ParseDuration(c.Tasks.Retention)
-	if err != nil {
-		return TaskOptions{}, err
-	}
 	healthcheckWait, err := time.ParseDuration(c.Tasks.HealthcheckWait)
 	if err != nil {
 		return TaskOptions{}, err
@@ -366,7 +352,7 @@ func (c Config) TaskOptions() (TaskOptions, error) {
 	if err != nil {
 		return TaskOptions{}, err
 	}
-	return TaskOptions{Directory: c.Tasks.Directory, MaxConcurrent: *c.Tasks.MaxConcurrent, QueueCapacity: *c.Tasks.QueueCapacity, Timeout: timeout, Retention: retention, MaxRecords: *c.Tasks.MaxRecords, HealthcheckWait: healthcheckWait, RunningObservation: runningObservation, RecoveryTimeout: recoveryTimeout}, nil
+	return TaskOptions{MaxConcurrent: *c.Tasks.MaxConcurrent, Timeout: timeout, Retention: 10 * time.Minute, MaxRecords: 1000, HealthcheckWait: healthcheckWait, RunningObservation: runningObservation, RecoveryTimeout: recoveryTimeout}, nil
 }
 
 func (c Config) LogOptions() LogOptions {

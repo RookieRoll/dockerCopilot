@@ -12,7 +12,6 @@ import (
 	containertypes "github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/client"
 	"github.com/onlyLTY/dockerCopilot/internal/config"
-	"github.com/onlyLTY/dockerCopilot/internal/task"
 	"github.com/onlyLTY/dockerCopilot/internal/updater"
 )
 
@@ -35,33 +34,26 @@ func newProgramInstallValidator(c config.Config, docker *client.Client, workDir 
 	return &programInstallValidator{config: c, docker: docker, workDir: workDir}
 }
 
-func (v *programInstallValidator) VerifyPendingInstall(ctx context.Context, record task.Record) (task.PendingInstallProof, error) {
-	marker := record.PendingInstall
-	if marker == nil || record.Type != task.TaskTypeProgramUpdate {
-		return task.PendingInstallProof{}, errors.New("pending program handoff record is incomplete")
-	}
+func (v *programInstallValidator) VerifyProgramInstall(ctx context.Context, metadata updater.HandoffMetadata) error {
 	if err := v.validateRuntime(ctx); err != nil {
-		return task.PendingInstallProof{}, err
+		return err
 	}
-	metadata, err := updater.ReadHandoffMetadata(v.workDir)
+	current, err := updater.ReadHandoffMetadata(v.workDir)
 	if err != nil {
-		return task.PendingInstallProof{}, err
+		return err
 	}
-	if metadata.TaskID != record.TaskID || metadata.HandoffID != marker.HandoffID || metadata.TargetVersion != marker.TargetVersion || metadata.GOARCH != marker.GOARCH || !strings.EqualFold(metadata.BinarySHA256, marker.ArtifactSHA256) {
-		return task.PendingInstallProof{}, errors.New("handoff sidecar identity does not match the durable task")
+	if current.TaskID != metadata.TaskID || current.HandoffID != metadata.HandoffID || current.TargetVersion != metadata.TargetVersion || current.GOARCH != metadata.GOARCH || !strings.EqualFold(current.BinarySHA256, metadata.BinarySHA256) {
+		return errors.New("handoff sidecar identity changed during verification")
 	}
 	executable, err := v.currentExecutable()
 	if err != nil {
-		return task.PendingInstallProof{}, fmt.Errorf("resolve running program: %w", err)
+		return fmt.Errorf("resolve running program: %w", err)
 	}
-	handoff := updater.InstallHandoff{TaskID: record.TaskID, TargetVersion: marker.TargetVersion, GOARCH: marker.GOARCH, BinarySHA256: marker.ArtifactSHA256}
+	handoff := updater.InstallHandoff{TaskID: metadata.TaskID, TargetVersion: metadata.TargetVersion, GOARCH: metadata.GOARCH, BinarySHA256: metadata.BinarySHA256}
 	if err := updater.VerifyRunningProgram(ctx, executable, config.Version, handoff, 256<<20); err != nil {
-		return task.PendingInstallProof{}, err
+		return err
 	}
-	return task.PendingInstallProof{
-		Verified: true, Ready: false, TaskID: record.TaskID, HandoffID: marker.HandoffID,
-		TargetVersion: marker.TargetVersion, GOARCH: marker.GOARCH, ArtifactSHA256: marker.ArtifactSHA256,
-	}, nil
+	return nil
 }
 
 func (v *programInstallValidator) validateRuntime(ctx context.Context) error {
@@ -184,12 +176,8 @@ func (ctx *ServiceContext) ProgramHandoffOptions() (ProgramHandoffOptions, error
 	if err != nil {
 		return ProgramHandoffOptions{}, err
 	}
-	tasks, err := ctx.Config.TaskOptions()
-	if err != nil {
-		return ProgramHandoffOptions{}, err
-	}
 	return ProgramHandoffOptions{
-		WorkDir: workDir, StagingParent: filepath.Join(tasks.Directory, "program-update-stage"),
+		WorkDir: workDir, StagingParent: filepath.Join(workDir, ".dockerCopilot-update-stage"),
 		SelfContainer: strings.TrimSpace(ctx.Config.Docker.SelfContainer),
 	}, nil
 }
