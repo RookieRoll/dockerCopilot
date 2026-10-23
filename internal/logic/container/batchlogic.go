@@ -73,7 +73,7 @@ func (e batchUnavailableError) Error() string     { return string(e) }
 func (e batchUnavailableError) HTTPStatus() int   { return http.StatusServiceUnavailable }
 func (e batchUnavailableError) ErrorCode() string { return "TASK_SERVICE_UNAVAILABLE" }
 
-// Submit accepts a durable batch task. Each target is inspected before
+// Submit accepts a batch task. Each target is inspected before
 // reservation, exact targets are de-duplicated, and operation conflicts are
 // retained as skipped item results while independent targets continue.
 func (l *BatchLogic) Submit(req *BatchRequest) (string, error) {
@@ -295,10 +295,11 @@ func (l *BatchLogic) Submit(req *BatchRequest) (string, error) {
 }
 
 func (l *BatchLogic) runBatchUpdate(ctx context.Context, taskID string, execution *task.Execution, itemIndex, totalItems int, target operation.Target, item task.Item, deleteOld bool) error {
-	if l.store == nil {
-		return errors.New("private batch snapshot store is unavailable")
-	}
 	pullProgress := newPullProgressThrottle(time.Second)
+	bridge := updateTaskBridge{
+		taskID: taskID, ownerID: item.SnapshotRef, targetName: target.Name,
+		itemIndex: itemIndex, execution: execution, store: l.store, service: l.service,
+	}
 	callbacks := containerService.UpdateCallbacks{
 		CandidateOwnerID: item.SnapshotRef,
 		Progress: func(stage string, percentage int, message string) error {
@@ -315,74 +316,32 @@ func (l *BatchLogic) runBatchUpdate(ctx context.Context, taskID string, executio
 			}
 			return execution.Progress(fmt.Sprintf("item-%d-%s", itemIndex+1, stage), batchPercentage, fmt.Sprintf("%s: %s", item.Name, message))
 		},
-		Warning: execution.Warning,
-		SaveSnapshot: func(snapshot []byte) error {
-			return l.store.SaveItemSnapshot(taskID, item.SnapshotRef, snapshot)
-		},
-		Checkpoint: func(checkpoint containerService.UpdateCheckpoint) error {
-			mutate := func(record *task.Record) {
-				current := &record.Items[itemIndex]
-				current.Stage = checkpoint.Stage
-				if checkpoint.OldContainerID != "" {
-					current.OldContainerID = checkpoint.OldContainerID
-					record.OldContainerID = checkpoint.OldContainerID
-					record.ContainerIDs = appendTaskIdentity(record.ContainerIDs, checkpoint.OldContainerID)
-				}
-				if checkpoint.NewContainerID != "" {
-					current.NewContainerID = checkpoint.NewContainerID
-					record.NewContainerID = checkpoint.NewContainerID
-					record.ContainerIDs = appendTaskIdentity(record.ContainerIDs, checkpoint.NewContainerID)
-				}
-				if checkpoint.BackupName != "" {
-					current.BackupContainerName = checkpoint.BackupName
-					record.BackupContainerName = checkpoint.BackupName
-				}
-				if checkpoint.PreviousImageID != "" {
-					current.ImageIDs = appendTaskIdentity(current.ImageIDs, checkpoint.PreviousImageID)
-					record.ImageIDs = appendTaskIdentity(record.ImageIDs, checkpoint.PreviousImageID)
-				}
-				if checkpoint.ResolvedImageID != "" {
-					current.ImageIDs = appendTaskIdentity(current.ImageIDs, checkpoint.ResolvedImageID)
-					record.ImageIDs = appendTaskIdentity(record.ImageIDs, checkpoint.ResolvedImageID)
-				}
-				if checkpoint.Stage == "stopping-old" || checkpoint.Stage == "old-stopped" || strings.HasPrefix(checkpoint.Stage, "renaming-old") || strings.HasPrefix(checkpoint.Stage, "old-renamed") || strings.HasPrefix(checkpoint.Stage, "creating-new") || strings.HasPrefix(checkpoint.Stage, "created-new") || checkpoint.Stage == "new-started" || checkpoint.Stage == "replacement-committed" {
-					current.ProtectedNames = appendTaskIdentity(current.ProtectedNames, target.Name)
-				}
-			}
-			stage := "batch-item-" + checkpoint.Stage
-			if checkpoint.Stage == "replacement-committed" {
-				return execution.CriticalItemCommit(itemIndex, stage, mutate)
-			}
-			return execution.Critical(stage, mutate)
-		},
+		Warning:      execution.Warning,
+		SaveSnapshot: bridge.saveSnapshot,
+		Checkpoint:   bridge.checkpoint,
 		OnCreated: func(newID string) error {
-			persistErr := execution.Critical("batch-item-created-new-container", func(record *task.Record) {
-				record.Items[itemIndex].NewContainerID = newID
-				record.NewContainerID = newID
-				record.ContainerIDs = appendTaskIdentity(record.ContainerIDs, target.ID, newID)
-				record.Items[itemIndex].ProtectedNames = appendTaskIdentity(record.Items[itemIndex].ProtectedNames, target.Name)
+			return bridge.created(newID, func(id string) error {
+				if ops := l.service.Operations(); ops != nil {
+					return ops.AddAlias(taskID, operation.Target{ID: id, Name: target.Name})
+				}
+				return nil
 			})
-			aliasErr := error(nil)
-			if lease := l.service.Operations(); lease != nil {
-				aliasErr = lease.AddAlias(taskID, operation.Target{ID: newID, Name: target.Name})
-			}
-			return errors.Join(persistErr, aliasErr)
 		},
 		Validation: containerService.UpdateValidationOptions{HealthcheckWait: l.healthcheckWait, RunningObservation: l.runningObservation},
 	}
 	if err := l.service.UpdateWithOptions(ctx, target.ID, target.Name, item.ImageRef, deleteOld, taskID, callbacks); err != nil {
 		return err
 	}
-	if err := execution.CriticalItemCommit(itemIndex, "batch-item-committed", func(record *task.Record) {
+	return execution.Critical("batch-item-committed", func(record *task.Record) {
+		if itemIndex >= len(record.Items) {
+			return
+		}
 		current := &record.Items[itemIndex]
 		current.Stage = "committed"
 		current.Recovery = task.Recovery{Status: "not-needed"}
 		current.RequiresAttention = false
 		current.ProtectedNames = nil
-	}); err != nil {
-		return err
-	}
-	return nil
+	})
 }
 
 func (l *BatchLogic) recoverBatchUpdates(ctx context.Context, taskID string, execution *task.Execution, cause error) (task.Recovery, error) {
@@ -435,7 +394,7 @@ func (l *BatchLogic) recoverBatchUpdates(ctx context.Context, taskID string, exe
 	}
 	for _, status := range statuses {
 		if status == "unknown" || status == "failed" {
-			return task.Recovery{Status: "unknown", Detail: "one or more batch update items remain uncertain"}, nil
+			return task.Recovery{Status: "unknown", Detail: "one or more batch update items need manual review"}, nil
 		}
 	}
 	for _, status := range statuses {
@@ -450,62 +409,16 @@ func (l *BatchLogic) recoverBatchUpdateItem(ctx context.Context, taskID string, 
 	if execution == nil {
 		return task.Recovery{Status: "unknown", Detail: "batch update execution is unavailable"}, errors.New("batch update execution is unavailable")
 	}
-	if l.store == nil {
-		return task.Recovery{Status: "unknown", Detail: "batch update recovery context is unavailable"}, errors.New("batch update recovery context is unavailable")
-	}
-	record := execution.Current()
-	if index < 0 || index >= len(record.Items) {
+	if index < 0 || index >= len(execution.Current().Items) {
 		return task.Recovery{Status: "unknown", Detail: "batch update item index is invalid"}, errors.New("batch update item index is invalid")
 	}
-	item = record.Items[index]
-	if item.Committed {
-		return task.Recovery{Status: "not-needed", Detail: "replacement commit was durably recorded; cleanup only"}, nil
-	}
-	if item.SnapshotRef == "" || !batchUpdateStageNeedsRecovery(item.Stage) {
-		return task.Recovery{Status: "not-needed", Detail: "update item did not enter the replacement phase"}, nil
-	}
-	snapshot, snapshotErr := l.store.ReadItemSnapshot(taskID, item.SnapshotRef)
-	if snapshotErr != nil {
-		return task.Recovery{Status: "unknown", Detail: "private item snapshot could not be read; no automatic recovery performed"}, snapshotErr
-	}
-	resolvedImageID := ""
-	if len(item.ImageIDs) > 0 {
-		resolvedImageID = item.ImageIDs[len(item.ImageIDs)-1]
-	}
-	recoveryStage := item.Stage
-	if recoveryStage == "replacement-committed" {
-		// This stage can survive in memory after its commit write fails. The
-		// item commit bit is the durable authority; allow pre-commit rollback.
-		recoveryStage = "new-started"
-	}
-	result, recoverErr := l.service.RecoverUpdateWithOwner(ctx, taskID, item.SnapshotRef, snapshot, containerService.UpdateRecoveryState{
-		Stage: recoveryStage, OldContainerID: item.OldContainerID, NewContainerID: item.NewContainerID,
-		BackupName: item.BackupContainerName, ResolvedImageID: resolvedImageID,
-	}, func(checkpoint containerService.UpdateCheckpoint) error {
-		return execution.RecoveryCheckpoint(ctx, "batch-item-"+checkpoint.Stage, func(current *task.Record) {
-			fact := &current.Items[index]
-			fact.Stage = checkpoint.Stage
-			if checkpoint.OldContainerID != "" {
-				fact.OldContainerID = checkpoint.OldContainerID
-				current.ContainerIDs = appendTaskIdentity(current.ContainerIDs, checkpoint.OldContainerID)
-			}
-			if checkpoint.NewContainerID != "" {
-				fact.NewContainerID = checkpoint.NewContainerID
-				current.ContainerIDs = appendTaskIdentity(current.ContainerIDs, checkpoint.NewContainerID)
-			}
-			if checkpoint.BackupName != "" {
-				fact.BackupContainerName = checkpoint.BackupName
-			}
-		})
-	})
-	return task.Recovery{Status: result.Status, Detail: result.Detail}, recoverErr
+	item = execution.Current().Items[index]
+	return updateTaskBridge{
+		taskID: taskID, ownerID: item.SnapshotRef, targetName: item.Name,
+		itemIndex: index, execution: execution, store: l.store, service: l.service,
+	}.recover(ctx, nil)
 }
 
 func batchUpdateStageNeedsRecovery(stage string) bool {
-	switch stage {
-	case "", "starting", "preflight", "snapshot-saved", "pulling-image", "resolving-image", "image-resolved":
-		return false
-	default:
-		return true
-	}
+	return updateStageNeedsRecovery(stage)
 }

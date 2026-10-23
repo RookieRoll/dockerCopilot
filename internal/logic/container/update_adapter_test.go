@@ -20,7 +20,7 @@ import (
 	"github.com/onlyLTY/dockerCopilot/internal/types"
 )
 
-func TestUpdateLogicDeduplicatesEquivalentQueuedTaskAndRejectsDifferentOptions(t *testing.T) {
+func TestUpdateLogicDeduplicatesEquivalentActiveTaskAndRejectsDifferentOptions(t *testing.T) {
 	pullEntered := make(chan struct{}, 2)
 	releasePull := make(chan struct{})
 	daemon := newUpdateAdapterDaemon(t, func(w http.ResponseWriter, r *http.Request) {
@@ -52,11 +52,11 @@ func TestUpdateLogicDeduplicatesEquivalentQueuedTaskAndRejectsDifferentOptions(t
 		}
 	})
 	defer daemon.Close()
-	ctx := newUpdateAdapterContext(t, daemon.URL, 1, 2)
+	ctx := newUpdateAdapterContext(t, daemon.URL, 1, 0)
 	defer func() { close(releasePull); ctx.TaskRuntime.Close(); _ = ctx.DockerClient.Close() }()
 
 	first := NewUpdateLogic(context.Background(), ctx)
-	firstResp, err := first.Update(updateReq("c1", "one", "nginx:latest", false))
+	firstResp, err := first.Update(updateReq("c2", "two", "nginx:stable", false))
 	if err != nil {
 		t.Fatalf("submit first update: %v", err)
 	}
@@ -68,31 +68,25 @@ func TestUpdateLogicDeduplicatesEquivalentQueuedTaskAndRejectsDifferentOptions(t
 		t.Fatalf("first update never entered image pull: record=%+v readError=%v", record, getErr)
 	}
 
-	queued := NewUpdateLogic(context.Background(), ctx)
-	queuedResp, err := queued.Update(updateReq("c2", "two", "nginx:stable", false))
+	activeRecord, err := ctx.TaskStore.Get(firstID)
 	if err != nil {
-		t.Fatalf("submit queued update: %v", err)
+		t.Fatalf("read active update record: %v", err)
 	}
-	queuedID := queuedResp.Data.(map[string]string)["taskID"]
-	if queuedID == firstID {
-		t.Fatal("distinct queued update reused the running task ID")
+	if activeRecord.Status != task.StatusRunning {
+		t.Fatalf("update should be active during image pull; got status %q", activeRecord.Status)
 	}
-	queuedRecord, err := ctx.TaskStore.Get(queuedID)
-	if err != nil {
-		t.Fatalf("read queued update record: %v", err)
-	}
-	if !containsTaskID(queuedRecord.ImageIDs, "sha256:old-image") {
-		t.Fatalf("queued update did not durably protect its original image before worker execution: %+v", queuedRecord.ImageIDs)
+	if !containsTaskID(activeRecord.ImageIDs, "sha256:old-image") {
+		t.Fatalf("active update did not retain its original image in task state before mutation: %+v", activeRecord.ImageIDs)
 	}
 
 	duplicateResp, err := NewUpdateLogic(context.Background(), ctx).Update(updateReq("c2", "two", "nginx:stable", false))
-	if err != nil || duplicateResp.Data.(map[string]string)["taskID"] != queuedID {
-		t.Fatalf("equivalent queued update should return accepted task ID %q, resp=%+v err=%v", queuedID, duplicateResp, err)
+	if err != nil || duplicateResp.Data.(map[string]string)["taskID"] != firstID {
+		t.Fatalf("equivalent active update should return its task ID %q, resp=%+v err=%v", firstID, duplicateResp, err)
 	}
 	_, err = NewUpdateLogic(context.Background(), ctx).Update(updateReq("c2", "two", "nginx:stable", true))
 	var conflict interface{ HTTPStatus() int }
 	if !errors.As(err, &conflict) || conflict.HTTPStatus() != http.StatusConflict {
-		t.Fatalf("different effective options should conflict with queued owner, got %v", err)
+		t.Fatalf("different effective options should conflict with active owner, got %v", err)
 	}
 }
 
@@ -115,7 +109,7 @@ func TestUpdateLogicDeleteOldRequestOverrideAndGlobalDefault(t *testing.T) {
 	}
 }
 
-func TestUpdateLogicReleasesReservationWhenInitialTaskPersistenceFails(t *testing.T) {
+func TestUpdateLogicReleasesReservationWhenTaskAcceptanceFails(t *testing.T) {
 	daemon := newUpdateAdapterDaemon(t, func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/json") {
 			writeUpdateInspect(w, "c1")
@@ -137,16 +131,16 @@ func TestUpdateLogicReleasesReservationWhenInitialTaskPersistenceFails(t *testin
 
 	_, err = NewUpdateLogic(context.Background(), ctx).Update(updateReq("c1", "one", "nginx:latest", false))
 	if err == nil {
-		t.Fatal("expected initial task persistence failure")
+		t.Fatal("expected task acceptance failure")
 	}
 	lease, duplicateID, reserveErr := ctx.ContainerService().ReserveUpdate(context.Background(), "c1", "next-owner", "different-fingerprint")
 	if reserveErr != nil || lease == nil || duplicateID != "" {
-		t.Fatalf("reservation leaked after failed durable submit: lease=%v duplicate=%q err=%v", lease, duplicateID, reserveErr)
+		t.Fatalf("reservation leaked after rejected task submission: lease=%v duplicate=%q err=%v", lease, duplicateID, reserveErr)
 	}
 	lease.Release()
 }
 
-func TestUpdateLogicPersistsCreatedContainerCheckpoint(t *testing.T) {
+func TestUpdateLogicRecordsCreatedContainerCheckpoint(t *testing.T) {
 	daemon := newUpdateAdapterDaemon(t, func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/v1.45/containers/") && strings.HasSuffix(r.URL.Path, "/json"):
@@ -178,29 +172,29 @@ func TestUpdateLogicPersistsCreatedContainerCheckpoint(t *testing.T) {
 		record, getErr := ctx.TaskStore.Get(taskID)
 		if getErr == nil && record.Status == task.StatusSucceeded {
 			if record.NewContainerID != "new-container-id" {
-				t.Fatalf("new container ID was not durably checkpointed: %+v", record)
+				t.Fatalf("new container ID was not recorded in task state: %+v", record)
 			}
 			if record.BackupContainerName == "" {
-				t.Fatalf("planned and completed backup name was not persisted: %+v", record)
+				t.Fatalf("planned and completed backup name was not recorded: %+v", record)
 			}
 			if record.Options.HealthWaitSeconds != 1 {
 				t.Fatalf("configured healthcheck wait was not recorded: %+v", record.Options)
 			}
 			if !containsTaskID(record.ImageIDs, "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa") {
-				t.Fatalf("resolved image ID was not persisted: %+v", record.ImageIDs)
+				t.Fatalf("resolved image ID was not recorded: %+v", record.ImageIDs)
 			}
 			if !containsTaskID(record.ImageIDs, "sha256:old-image") {
-				t.Fatalf("previous image ID was not persisted: %+v", record.ImageIDs)
+				t.Fatalf("previous image ID was not recorded: %+v", record.ImageIDs)
 			}
 			return
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
 	record, _ := ctx.TaskStore.Get(taskID)
-	t.Fatalf("update did not finish with persisted checkpoint: %+v", record)
+	t.Fatalf("update did not finish with runtime task facts: %+v", record)
 }
 
-func TestUpdateStartFailureRetainsSnapshotAndObjectFactsForManualReview(t *testing.T) {
+func TestUpdateStartFailureRetainsRuntimeSnapshotAndObjectFactsForManualReview(t *testing.T) {
 	var removes atomic.Int32
 	daemon := newUpdateAdapterDaemon(t, func(w http.ResponseWriter, r *http.Request) {
 		switch {
@@ -241,10 +235,10 @@ func TestUpdateStartFailureRetainsSnapshotAndObjectFactsForManualReview(t *testi
 		record, getErr := ctx.TaskStore.Get(taskID)
 		if getErr == nil && record.Status.Terminal() {
 			if record.Status != task.StatusFailed || !record.RequiresAttention || record.Recovery.Status != "unknown" {
-				t.Fatalf("start failure was not kept as an uncertain failed update: %+v", record)
+				t.Fatalf("start failure was not kept as a failed update requiring manual review: %+v", record)
 			}
 			if record.SnapshotRef == "" || record.BackupContainerName == "" || record.NewContainerID != "new-container-id" {
-				t.Fatalf("recovery facts were not persisted before start: %+v", record)
+				t.Fatalf("recovery facts were not retained before start: %+v", record)
 			}
 			if !containsTaskID(record.ContainerIDs, "c1") || !containsTaskID(record.ContainerIDs, "new-container-id") {
 				t.Fatalf("old/new container identities are missing: %+v", record.ContainerIDs)
@@ -378,7 +372,7 @@ func updateReq(id, name, image string, deleteOld bool) *types.ContainerUpdateReq
 type failCreateStore struct{}
 
 func (failCreateStore) Create(task.Record) error {
-	return errors.New("intentional persistence failure")
+	return errors.New("intentional task acceptance failure")
 }
 func (failCreateStore) Save(task.Record) error { return nil }
 func (failCreateStore) Get(string) (task.Record, error) {

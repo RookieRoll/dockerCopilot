@@ -14,7 +14,7 @@ import (
 	"github.com/onlyLTY/dockerCopilot/internal/task"
 )
 
-func TestBatchUpdatePersistsPrivateSnapshotAndPerItemFacts(t *testing.T) {
+func TestBatchUpdateRetainsRuntimeSnapshotAndPerItemFacts(t *testing.T) {
 	var created int
 	daemon := newUpdateAdapterDaemon(t, func(w http.ResponseWriter, r *http.Request) {
 		switch {
@@ -79,7 +79,7 @@ func TestBatchUpdatePersistsPrivateSnapshotAndPerItemFacts(t *testing.T) {
 	}
 }
 
-func TestBatchUpdateCommitCheckpointFailureRestoresOldContainer(t *testing.T) {
+func TestBatchUpdateCheckpointFailureRestoresOldContainer(t *testing.T) {
 	var mu sync.Mutex
 	oldName, newID, replacementLabel := "web", "", ""
 	oldRunning, replacementRunning, replacementExists := true, false, false
@@ -187,13 +187,13 @@ func TestBatchUpdateCommitCheckpointFailureRestoresOldContainer(t *testing.T) {
 		t.Fatalf("batch update task recovery did not settle: %+v", result)
 	}
 	if result.Status != task.StatusFailed || len(result.Items) != 1 || result.Items[0].Status != "failed" || result.Items[0].Committed || result.Items[0].Recovery.Status != "restored" || result.Items[0].NewContainerID != "new-1" {
-		t.Fatalf("nondurable batch commit was promoted or recovery facts lost: %+v", result)
+		t.Fatalf("failed in-memory checkpoint was promoted or recovery facts lost: %+v", result)
 	}
 	mu.Lock()
 	restoredName, restoredRunning, replacementStillExists := oldName, oldRunning, replacementExists
 	mu.Unlock()
 	if restoredName != "web" || !restoredRunning || replacementStillExists {
-		t.Fatalf("failed commit did not restore old instance conservatively: oldName=%q running=%v newExists=%v", restoredName, restoredRunning, replacementStillExists)
+		t.Fatalf("checkpoint failure did not restore old instance conservatively: oldName=%q running=%v newExists=%v", restoredName, restoredRunning, replacementStillExists)
 	}
 }
 
@@ -217,7 +217,7 @@ func (s *failingBatchRecordStore) Save(record task.Record) error {
 	if !s.failed && record.Status == task.StatusRunning && record.Stage == s.failStage {
 		s.failed = true
 		s.mu.Unlock()
-		return errors.New("synthetic durable item commit failure")
+		return errors.New("synthetic in-memory item checkpoint failure")
 	}
 	s.mu.Unlock()
 	return s.Store.Save(record)

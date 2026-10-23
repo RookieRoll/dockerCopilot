@@ -22,9 +22,9 @@ import (
 	"github.com/zeromicro/go-zero/core/logx"
 )
 
-// UpdateCheckpoint contains only non-secret facts that must be durably stored
-// before the next update step. The complete inspected configuration is stored
-// separately through SaveSnapshot.
+// UpdateCheckpoint contains only non-secret facts that must be added to the
+// live task state before the next update step. The complete inspected
+// configuration is held separately through SaveSnapshot.
 type UpdateCheckpoint struct {
 	Stage           string
 	SnapshotRef     string
@@ -48,9 +48,9 @@ type UpdateRecoveryResult struct {
 	Detail string
 }
 
-// UpdateCallbacks are narrow persistence/progress hooks supplied by the task
+// UpdateCallbacks are narrow task-state/progress hooks supplied by the task
 // owner. SaveSnapshot and Checkpoint are mandatory: updates never begin a
-// destructive step unless their required facts have been durably recorded.
+// destructive step unless their recovery facts are recorded in the live task.
 type UpdateCallbacks struct {
 	Progress     func(stage string, percentage int, message string) error
 	Warning      func(message string)
@@ -86,7 +86,7 @@ func (s *Service) UpdateWithOptions(ctx context.Context, id, name, imageRef stri
 		return errors.New("update task ID is required")
 	}
 	if callbacks.SaveSnapshot == nil || callbacks.Checkpoint == nil || callbacks.OnCreated == nil {
-		return errors.New("update requires private snapshot, critical checkpoint, and created-ID persistence callbacks")
+		return errors.New("update requires a runtime snapshot, critical checkpoint, and created-ID callback")
 	}
 
 	before, err := s.docker.ContainerInspect(ctx, id)
@@ -185,7 +185,7 @@ func (s *Service) UpdateWithOptions(ctx context.Context, id, name, imageRef stri
 	}
 	snapshotRef := taskID + ".snapshot"
 	if err := checkpoint(UpdateCheckpoint{Stage: "snapshot-saved", SnapshotRef: snapshotRef, OldContainerID: canonicalID, PreviousImageID: before.Image}); err != nil {
-		return fail("snapshot", "持久化快照检查点失败，未修改旧容器", err)
+		return fail("snapshot", "记录快照检查点失败，未修改旧容器", err)
 	}
 
 	if err := publish("pulling-image", 10, "正在拉取目标镜像"); err != nil {
@@ -222,7 +222,7 @@ func (s *Service) UpdateWithOptions(ctx context.Context, id, name, imageRef stri
 		return fail("resolving-image", "Docker未返回可固定的镜像ID，旧容器未修改", errors.New("resolved image ID is missing or not immutable"))
 	}
 	if err := checkpoint(UpdateCheckpoint{Stage: "image-resolved", SnapshotRef: snapshotRef, OldContainerID: canonicalID, PreviousImageID: before.Image, ResolvedImageID: resolved.ID}); err != nil {
-		return fail("resolving-image", "持久化镜像身份失败，旧容器未修改", err)
+		return fail("resolving-image", "记录镜像身份失败，旧容器未修改", err)
 	}
 
 	wasRunning := before.State != nil && before.State.Running
@@ -232,13 +232,13 @@ func (s *Service) UpdateWithOptions(ctx context.Context, id, name, imageRef stri
 			return fail("stopping-old", "更新准备失败", err)
 		}
 		if err := checkpoint(UpdateCheckpoint{Stage: "stopping-old", SnapshotRef: snapshotRef, OldContainerID: canonicalID, PreviousImageID: before.Image, ResolvedImageID: resolved.ID}); err != nil {
-			return fail("stopping-old", "持久化停止检查点失败，旧容器未修改", err)
+			return fail("stopping-old", "记录停止检查点失败，旧容器未修改", err)
 		}
 		if err := s.docker.ContainerStop(ctx, canonicalID, container.StopOptions{Signal: before.Config.StopSignal, Timeout: before.Config.StopTimeout}); err != nil {
 			return fail("stopping-old", "停止旧容器失败", err)
 		}
 		if err := checkpoint(UpdateCheckpoint{Stage: "old-stopped", SnapshotRef: snapshotRef, OldContainerID: canonicalID, PreviousImageID: before.Image, ResolvedImageID: resolved.ID}); err != nil {
-			return fail("old-stopped", "旧容器已停止但保存阶段检查点失败", err)
+			return fail("old-stopped", "旧容器已停止但记录阶段检查点失败", err)
 		}
 	}
 
@@ -246,20 +246,20 @@ func (s *Service) UpdateWithOptions(ctx context.Context, id, name, imageRef stri
 		return fail("renaming-old", "更新准备失败", err)
 	}
 	if err := checkpoint(UpdateCheckpoint{Stage: "renaming-old", SnapshotRef: snapshotRef, OldContainerID: canonicalID, ResolvedImageID: resolved.ID, BackupName: backupName}); err != nil {
-		return fail("renaming-old", "持久化旧容器改名检查点失败，旧容器未改名", err)
+		return fail("renaming-old", "记录旧容器改名检查点失败，旧容器未改名", err)
 	}
 	if err := s.docker.ContainerRename(ctx, canonicalID, backupName); err != nil {
 		return fail("renaming-old", "重命名旧容器失败", err)
 	}
 	if err := checkpoint(UpdateCheckpoint{Stage: "old-renamed", SnapshotRef: snapshotRef, OldContainerID: canonicalID, ResolvedImageID: resolved.ID, BackupName: backupName}); err != nil {
-		return fail("old-renamed", "旧容器已改名但保存阶段检查点失败", err)
+		return fail("old-renamed", "旧容器已改名但记录阶段检查点失败", err)
 	}
 
 	if err := publish("creating-new", 70, "正在使用固定镜像ID创建新容器"); err != nil {
 		return fail("creating-new", "更新准备失败", err)
 	}
 	if err := checkpoint(UpdateCheckpoint{Stage: "creating-new", SnapshotRef: snapshotRef, OldContainerID: canonicalID, ResolvedImageID: resolved.ID, BackupName: backupName}); err != nil {
-		return fail("creating-new", "持久化新容器创建检查点失败，未创建新容器", err)
+		return fail("creating-new", "记录新容器创建检查点失败，未创建新容器", err)
 	}
 	createConfig := *before.Config
 	createConfig.Image = resolved.ID
@@ -285,7 +285,7 @@ func (s *Service) UpdateWithOptions(ctx context.Context, id, name, imageRef stri
 		return fail("created-new", "保护新容器身份失败", err)
 	}
 	if err := checkpoint(UpdateCheckpoint{Stage: "created-new", SnapshotRef: snapshotRef, OldContainerID: canonicalID, ResolvedImageID: resolved.ID, BackupName: backupName}); err != nil {
-		return fail("created-new", "已创建新容器但保存阶段检查点失败", err)
+		return fail("created-new", "已创建新容器但记录阶段检查点失败", err)
 	}
 	if wasRunning {
 		if err := publish("starting-new", 85, "正在启动新容器"); err != nil {
@@ -295,7 +295,7 @@ func (s *Service) UpdateWithOptions(ctx context.Context, id, name, imageRef stri
 			return fail("starting-new", "启动新容器失败", err)
 		}
 		if err := checkpoint(UpdateCheckpoint{Stage: "new-started", SnapshotRef: snapshotRef, OldContainerID: canonicalID, ResolvedImageID: resolved.ID, BackupName: backupName}); err != nil {
-			return fail("new-started", "新容器已启动但保存阶段检查点失败", err)
+			return fail("new-started", "新容器已启动但记录阶段检查点失败", err)
 		}
 		if err := publish("validating-new", 90, "正在验证新容器健康或持续运行状态"); err != nil {
 			return fail("validating-new", "保存容器验证阶段失败", err)
@@ -306,7 +306,7 @@ func (s *Service) UpdateWithOptions(ctx context.Context, id, name, imageRef stri
 		}
 	}
 	if err := checkpoint(UpdateCheckpoint{Stage: "replacement-committed", SnapshotRef: snapshotRef, OldContainerID: canonicalID, NewContainerID: created.ID, PreviousImageID: before.Image, ResolvedImageID: resolved.ID, BackupName: backupName}); err != nil {
-		return fail("replacement-commit", "新容器已验证，但提交检查点保存失败；未清理旧容器", err)
+		return fail("replacement-commit", "新容器已验证，但提交检查点未记录；未清理旧容器", err)
 	}
 	if deleteOld {
 		cleanupStarted := true
@@ -355,7 +355,7 @@ func (s *Service) updateWarning(callback func(string), message, oldID string, ca
 	callback(fmt.Sprintf("%s（旧容器ID %s）：%v", message, oldID, cause))
 }
 
-// RecoverUpdate uses only the private inspect snapshot and durable identity
+// RecoverUpdate uses only the private inspect snapshot and live task identity
 // facts. It removes only a uniquely verified replacement created by this task,
 // then restores the original container name and running state when possible.
 // Any ambiguity is reported as unknown without deleting or renaming anything.
@@ -387,7 +387,7 @@ func (s *Service) RecoverUpdateWithOwner(ctx context.Context, taskID, candidateO
 		oldID = before.ID
 	}
 	if oldID != before.ID {
-		return unknown("持久化旧容器ID与快照不一致；未执行自动恢复"), errors.New("update recovery old container ID does not match snapshot")
+		return unknown("任务记录中的旧容器ID与快照不一致；未执行自动恢复"), errors.New("update recovery old container ID does not match snapshot")
 	}
 	stage := state.Stage
 	switch stage {
@@ -447,7 +447,7 @@ func (s *Service) RecoverUpdateWithOwner(ctx context.Context, taskID, candidateO
 			return unknown("无法检查任务标签对应的新容器；未执行自动恢复"), fmt.Errorf("inspect task-labeled replacement: %w", inspectErr)
 		}
 		if !matchesUpdateCandidate(inspected, candidateOwnerID, state.ResolvedImageID, originalName) {
-			return unknown("任务标签对应容器与持久化镜像或名称不匹配；未执行删除"), nil
+			return unknown("任务标签对应容器与记录的镜像或名称不匹配；未执行删除"), nil
 		}
 		if candidate != nil && candidate.ID != inspected.ID {
 			return unknown("发现多个任务标签对应的新容器；未执行自动恢复"), nil
@@ -465,7 +465,7 @@ func (s *Service) RecoverUpdateWithOwner(ctx context.Context, taskID, candidateO
 		if newID == "" {
 			newID = candidate.ID
 			if err := checkpoint(UpdateCheckpoint{Stage: "recovery-new-discovered", OldContainerID: oldID, NewContainerID: newID, ResolvedImageID: state.ResolvedImageID, BackupName: state.BackupName}); err != nil {
-				return unknown("已发现新容器，但持久化身份失败；未执行删除"), fmt.Errorf("persist discovered replacement identity: %w", err)
+				return unknown("已发现新容器，但任务身份记录失败；未执行删除"), fmt.Errorf("record discovered replacement identity: %w", err)
 			}
 		}
 		if err := s.Operations().AddAlias(taskID, operation.Target{ID: newID}); err != nil {
@@ -484,7 +484,7 @@ func (s *Service) RecoverUpdateWithOwner(ctx context.Context, taskID, candidateO
 
 	if candidate != nil {
 		if err := checkpoint(UpdateCheckpoint{Stage: "recovery-removing-new", OldContainerID: oldID, NewContainerID: candidate.ID, ResolvedImageID: state.ResolvedImageID, BackupName: state.BackupName}); err != nil {
-			return unknown("删除新容器前无法保存恢复检查点；未执行删除"), fmt.Errorf("persist recovery removal checkpoint: %w", err)
+			return unknown("删除新容器前无法记录恢复检查点；未执行删除"), fmt.Errorf("record recovery removal checkpoint: %w", err)
 		}
 		if err := s.docker.ContainerRemove(ctx, candidate.ID, container.RemoveOptions{Force: true}); err != nil {
 			remaining, inspectErr := s.docker.ContainerInspect(ctx, candidate.ID)
@@ -497,7 +497,7 @@ func (s *Service) RecoverUpdateWithOwner(ctx context.Context, taskID, candidateO
 
 	if oldName == state.BackupName {
 		if err := checkpoint(UpdateCheckpoint{Stage: "recovery-restoring-name", OldContainerID: oldID, NewContainerID: newID, ResolvedImageID: state.ResolvedImageID, BackupName: state.BackupName}); err != nil {
-			return unknown("恢复旧容器名称前无法保存检查点"), fmt.Errorf("persist recovery rename checkpoint: %w", err)
+			return unknown("恢复旧容器名称前无法记录检查点"), fmt.Errorf("record recovery rename checkpoint: %w", err)
 		}
 		if err := s.docker.ContainerRename(ctx, oldID, originalName); err != nil {
 			return unknown("恢复旧容器名称失败；请人工处理"), fmt.Errorf("rename original container back: %w", err)
@@ -514,14 +514,14 @@ func (s *Service) RecoverUpdateWithOwner(ctx context.Context, taskID, candidateO
 	currentlyRunning := old.State != nil && old.State.Running
 	if originallyRunning && !currentlyRunning {
 		if err := checkpoint(UpdateCheckpoint{Stage: "recovery-starting-old", OldContainerID: oldID, NewContainerID: newID, ResolvedImageID: state.ResolvedImageID, BackupName: state.BackupName}); err != nil {
-			return unknown("启动旧容器前无法保存检查点"), fmt.Errorf("persist recovery start checkpoint: %w", err)
+			return unknown("启动旧容器前无法记录检查点"), fmt.Errorf("record recovery start checkpoint: %w", err)
 		}
 		if err := s.docker.ContainerStart(ctx, oldID, container.StartOptions{}); err != nil {
 			return unknown("重新启动旧容器失败；请人工处理"), fmt.Errorf("restart original container after rollback: %w", err)
 		}
 	} else if !originallyRunning && currentlyRunning {
 		if err := checkpoint(UpdateCheckpoint{Stage: "recovery-stopping-old", OldContainerID: oldID, NewContainerID: newID, ResolvedImageID: state.ResolvedImageID, BackupName: state.BackupName}); err != nil {
-			return unknown("停止旧容器前无法保存检查点"), fmt.Errorf("persist recovery stop checkpoint: %w", err)
+			return unknown("停止旧容器前无法记录检查点"), fmt.Errorf("record recovery stop checkpoint: %w", err)
 		}
 		if err := s.docker.ContainerStop(ctx, oldID, container.StopOptions{Signal: before.Config.StopSignal, Timeout: before.Config.StopTimeout}); err != nil {
 			return unknown("恢复旧容器的停止状态失败；请人工处理"), fmt.Errorf("stop original container after rollback: %w", err)

@@ -21,7 +21,7 @@ import (
 	"github.com/onlyLTY/dockerCopilot/internal/types"
 )
 
-func TestRestoreTaskPersistsPerContainerPartialResults(t *testing.T) {
+func TestRestoreTaskRetainsPerContainerPartialResults(t *testing.T) {
 	backupDir := t.TempDir()
 	backupData := `[
 {"Name":"pull-fails","Config":{"Image":"example/broken:1"},"HostConfig":{}},
@@ -98,6 +98,6 @@ func TestRestoreTaskPersistsPerContainerPartialResults(t *testing.T) {
 		t.Fatalf("unexpected restore counts: success=%d failed=%d skipped=%d", record.SuccessCount, record.FailedCount, record.SkippedCount)
 	}
 	if record.Items[0].Name != "pull-fails" || record.Items[0].Status != "failed" || record.Items[0].Error == "" || record.Items[1].Name != "create-succeeds" || record.Items[1].Status != "succeeded" {
-		t.Fatalf("task did not persist the per-container outcomes: %+v", record.Items)
+		t.Fatalf("task did not retain the per-container outcomes: %+v", record.Items)
 	}
 }

@@ -134,7 +134,7 @@ func TestListDetailsWithoutCleanupPreservesMappings(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(entries["temporarily-unknown"]) != 1 {
-		t.Fatalf("list without durable task protections removed mapping: %#v", entries)
+		t.Fatalf("list without active task protections removed mapping: %#v", entries)
 	}
 }
 

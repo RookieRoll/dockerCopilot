@@ -106,7 +106,7 @@ func (l *RestoreLogic) Restore(req *types.ContainerRestoreReq) (resp *types.Resp
 						})
 					}
 				}); err != nil {
-					return errors.Join(restoreErr, fmt.Errorf("persist restore item results: %w", err))
+					return errors.Join(restoreErr, fmt.Errorf("record restore item results: %w", err))
 				}
 			}
 			if restoreErr != nil {

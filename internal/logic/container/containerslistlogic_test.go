@@ -70,7 +70,7 @@ func TestInfoPortsUseLowerCamelCaseJSON(t *testing.T) {
 	}
 }
 
-func TestProtectedPortNamesUsesUnresolvedDurableTaskFacts(t *testing.T) {
+func TestProtectedPortNamesUsesUnresolvedActiveTaskFacts(t *testing.T) {
 	records := []task.Record{
 		{Status: task.StatusRunning, Name: "running", ProtectedNames: []string{"old-running"}},
 		{Status: task.StatusFailed, RequiresAttention: true, Name: "failed-review", BackupContainerName: "backup-review"},
@@ -84,7 +84,7 @@ func TestProtectedPortNamesUsesUnresolvedDurableTaskFacts(t *testing.T) {
 	}
 	for _, name := range []string{"running", "old-running", "failed-review", "backup-review", "item-review", "old-item"} {
 		if !seen[name] {
-			t.Errorf("unresolved durable name %q is not protected: %#v", name, got)
+			t.Errorf("unresolved active task name %q is not protected: %#v", name, got)
 		}
 	}
 	if seen["done"] {

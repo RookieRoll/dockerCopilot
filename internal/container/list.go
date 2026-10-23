@@ -104,19 +104,19 @@ func (s *Service) ListDetails(ctx context.Context, portSettings PortSettings) ([
 
 // ListDetailsWithProtectedNames only removes stale port settings when both
 // the Docker list snapshot and operation coordinator remained stable while it
-// was collected. Protected names come from durable task recovery records.
+// was collected. Protected names come from active in-memory task records.
 func (s *Service) ListDetailsWithProtectedNames(ctx context.Context, portSettings PortSettings, protectedNames []string) ([]Info, error) {
 	return s.ListDetailsWithOperationVersion(ctx, portSettings, protectedNames, s.Operations().CaptureVersion())
 }
 
 // ListDetailsWithOperationVersion accepts a revision captured before the
-// caller reads durable task protections, closing the window between those
+// caller reads active task protections, closing the window between those
 // facts and the Docker list snapshot.
 func (s *Service) ListDetailsWithOperationVersion(ctx context.Context, portSettings PortSettings, protectedNames []string, opVersion uint64) ([]Info, error) {
 	return s.listDetails(ctx, portSettings, protectedNames, opVersion, true)
 }
 
-// ListDetailsWithoutCleanupWithOperationVersion serves a list when durable
+// ListDetailsWithoutCleanupWithOperationVersion serves a list when task-state
 // recovery protections could not be read. Existing mappings are loaded for
 // display, but cleanup is skipped entirely.
 func (s *Service) ListDetailsWithoutCleanupWithOperationVersion(ctx context.Context, portSettings PortSettings, opVersion uint64) ([]Info, error) {

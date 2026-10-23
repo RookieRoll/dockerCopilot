@@ -69,7 +69,7 @@ func TestUpdatePullFailureLeavesOriginalUnmodified(t *testing.T) {
 	}
 }
 
-func TestUpdateCriticalSnapshotFailuresPreventDockerMutation(t *testing.T) {
+func TestUpdateRuntimeSnapshotFailuresPreventDockerMutation(t *testing.T) {
 	for _, failAt := range []string{"save-snapshot", "snapshot-checkpoint"} {
 		t.Run(failAt, func(t *testing.T) {
 			var pulls, stops, renames, creates int
@@ -94,21 +94,21 @@ func TestUpdateCriticalSnapshotFailuresPreventDockerMutation(t *testing.T) {
 			})
 			callbacks := testUpdateCallbacks(func(string) error { return nil })
 			if failAt == "save-snapshot" {
-				callbacks.SaveSnapshot = func([]byte) error { return errors.New("snapshot disk full") }
+				callbacks.SaveSnapshot = func([]byte) error { return errors.New("task runtime is unavailable") }
 			} else {
 				callbacks.Checkpoint = func(checkpoint UpdateCheckpoint) error {
 					if checkpoint.Stage == "snapshot-saved" {
-						return errors.New("task checkpoint disk full")
+						return errors.New("task runtime is unavailable")
 					}
 					return nil
 				}
 			}
 			err := service.UpdateWithOptions(context.Background(), "old-canonical-id", "web", "web:next", true, "task-snapshot-failure", callbacks)
 			if err == nil {
-				t.Fatal("expected injected critical persistence failure")
+				t.Fatal("expected injected task-state failure")
 			}
 			if pulls != 0 || stops != 0 || renames != 0 || creates != 0 {
-				t.Fatalf("Docker changed before snapshot was durable: pull=%d stop=%d rename=%d create=%d", pulls, stops, renames, creates)
+				t.Fatalf("Docker changed before runtime snapshot was recorded: pull=%d stop=%d rename=%d create=%d", pulls, stops, renames, creates)
 			}
 		})
 	}
@@ -139,7 +139,7 @@ func TestRecoverUpdateRestoresOnlyVerifiedReplacement(t *testing.T) {
 		{name: "image mismatch", candidateLabel: "task-recovery", candidateImage: "sha256:other-image", nameOccupant: "new-id", wantStatus: "unknown"},
 		{name: "task label mismatch", recordedNewID: "new-id", candidateLabel: "other-task", candidateImage: "sha256:resolved-image-id", nameOccupant: "new-id", wantStatus: "unknown"},
 		{name: "multiple candidates", candidateLabel: "task-recovery", candidateImage: "sha256:resolved-image-id", nameOccupant: "new-id", wantStatus: "unknown", multipleCandidates: true},
-		{name: "durable commit is not rolled back", stage: "replacement-committed", candidateLabel: "task-recovery", candidateImage: "sha256:resolved-image-id", nameOccupant: "new-id", wantStatus: "not-needed"},
+		{name: "committed replacement is not rolled back", stage: "replacement-committed", candidateLabel: "task-recovery", candidateImage: "sha256:resolved-image-id", nameOccupant: "new-id", wantStatus: "not-needed"},
 		{name: "cleanup stage is not rolled back", stage: "removing-old", candidateLabel: "task-recovery", candidateImage: "sha256:resolved-image-id", nameOccupant: "new-id", wantStatus: "not-needed"},
 		{name: "original was stopped", recordedNewID: "new-id", candidateLabel: "task-recovery", candidateImage: "sha256:resolved-image-id", nameOccupant: "new-id", wantStatus: "restored", wantRemove: true, wantRename: true, snapshotStopped: true},
 		{name: "start response did not restore running state", recordedNewID: "new-id", candidateLabel: "task-recovery", candidateImage: "sha256:resolved-image-id", nameOccupant: "new-id", wantStatus: "unknown", wantRemove: true, wantRename: true, wantStart: true, ignoreStart: true},
@@ -225,7 +225,7 @@ func TestRecoverUpdateRestoresOnlyVerifiedReplacement(t *testing.T) {
 					discoveredID = checkpoint.NewContainerID
 				}
 				if tc.failCheckpoint && checkpoint.Stage == "recovery-removing-new" {
-					return errors.New("checkpoint disk full")
+					return errors.New("task runtime is unavailable")
 				}
 				return nil
 			})
@@ -343,7 +343,7 @@ func TestUpdatePinsResolvedImagePreservesConfigurationAndHonorsDeleteOption(t *t
 				t.Fatalf("image facts missing: previous=%t pulls=%d", previousImageSaved, pullCount)
 			}
 			if !backupNamePlanned.Load() || !renameConfirmed.Load() {
-				t.Fatal("planned backup name and post-rename confirmation checkpoints were not persisted")
+				t.Fatal("planned backup name and post-rename confirmation checkpoints were not recorded")
 			}
 			if createBody.Image != "sha256:resolved-image-id" {
 				t.Fatalf("create used mutable reference instead of inspected ID: %q", createBody.Image)
@@ -528,7 +528,7 @@ func TestUpdateCleanupFailureAfterCommitIsSuccessfulWithWarning(t *testing.T) {
 	}
 }
 
-func TestUpdateCleanupDeadlineDoesNotRollbackCommittedReplacement(t *testing.T) {
+func TestUpdateCleanupCancellationDoesNotRollbackCommittedReplacement(t *testing.T) {
 	deleteStarted := make(chan struct{})
 	var oldStartCalls atomic.Int32
 	var cleanupWarning string
@@ -566,7 +566,7 @@ func TestUpdateCleanupDeadlineDoesNotRollbackCommittedReplacement(t *testing.T) 
 			http.NotFound(w, r)
 		}
 	})
-	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	callbacks := testUpdateCallbacks(func(string) error { return nil })
 	callbacks.Validation = UpdateValidationOptions{RunningObservation: time.Millisecond, PollInterval: time.Millisecond}
@@ -577,16 +577,17 @@ func TestUpdateCleanupDeadlineDoesNotRollbackCommittedReplacement(t *testing.T) 
 	}()
 	select {
 	case <-deleteStarted:
+		cancel() // Cancel only after cleanup begins; setup speed must not select the phase.
 	case <-time.After(time.Second):
 		t.Fatal("cleanup request did not start")
 	}
 	select {
 	case err := <-finished:
 		if err != nil {
-			t.Fatalf("cleanup deadline changed committed update result: %v", err)
+			t.Fatalf("cleanup cancellation changed committed update result: %v", err)
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("update did not finish after cleanup deadline")
+		t.Fatal("update did not finish after cleanup cancellation")
 	}
 	if oldStartCalls.Load() != 0 {
 		t.Fatalf("old container was restarted after committed replacement: %d starts", oldStartCalls.Load())

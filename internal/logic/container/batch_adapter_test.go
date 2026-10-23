@@ -110,7 +110,7 @@ func TestBatchPreflightKeepsCaseSensitiveNamesAndRejectsEmptyInspect(t *testing.
 	}
 }
 
-func TestBatchTaskPersistsPartialFailureAndRunsIndependentItems(t *testing.T) {
+func TestBatchTaskRetainsPartialFailureAndRunsIndependentItems(t *testing.T) {
 	var mu sync.Mutex
 	var calls []string
 	daemon := newUpdateAdapterDaemon(t, func(w http.ResponseWriter, r *http.Request) {
@@ -140,7 +140,7 @@ func TestBatchTaskPersistsPartialFailureAndRunsIndependentItems(t *testing.T) {
 	}
 	record := waitForBatchTask(t, ctx, taskID)
 	if record.Status != task.StatusFailed || record.SuccessCount != 1 || record.FailedCount != 1 || record.SkippedCount != 0 {
-		t.Fatalf("batch should persist partial failure: %+v", record)
+		t.Fatalf("batch should retain partial failure in task state: %+v", record)
 	}
 	if record.Items[0].Status != "succeeded" || record.Items[1].Status != "failed" || !strings.Contains(record.Items[1].Error, "daemon refused restart") {
 		t.Fatalf("item results lost original failure: %+v", record.Items)

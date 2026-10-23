@@ -152,9 +152,9 @@ func (s *Service) Update(ctx context.Context, id, name, imageNameAndTag string, 
 	return s.UpdateWithOptions(ctx, id, name, imageNameAndTag, deleteOld, taskID, UpdateCallbacks{})
 }
 
-// UpdateWithCallbacks is retained for source compatibility. Durable update
+// UpdateWithCallbacks is retained for source compatibility. Safe update
 // execution requires the full UpdateWithOptions callback set; callers that do
-// not provide private snapshot and checkpoint storage fail before mutation.
+// not provide runtime snapshot and checkpoint callbacks fail before mutation.
 func (s *Service) UpdateWithCallbacks(ctx context.Context, id, name, imageNameAndTag string, deleteOld bool, taskID string, onCreated func(string) error) error {
 	return s.UpdateWithOptions(ctx, id, name, imageNameAndTag, deleteOld, taskID, UpdateCallbacks{OnCreated: onCreated})
 }
