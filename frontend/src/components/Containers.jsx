@@ -21,10 +21,9 @@ import {
 import { containerAPI, taskAPI } from '../api/client.js'
 import { cn } from '../utils/cn.js'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
-import { IMAGE_ICON_MAX_BYTES, IMAGE_ICON_SUPPORTED_FORMATS, useImageIcons, uploadImageIcon } from '../hooks/useImageIcons.js'
+import { useImageIcons, uploadImageIcon } from '../hooks/useImageIcons.js'
 import { useTask } from '../hooks/useTask.js'
 import { taskListPayload, validateTaskRecord } from '../hooks/taskPolling.js'
-import { TaskStatusPanel } from './tasks/TaskStatusPanel.jsx'
 import { startTaskRecoveryDiscovery } from './tasks/taskRecoveryDiscovery.js'
 import { getImageLogo } from '../config/imageLogos.js'
 import icons8Img from '../assets/icons8.png'
@@ -91,6 +90,29 @@ const MAX_VISIBLE_PORTS = 4
 const CONTAINER_UPDATE_TASK_STORAGE_KEY = 'docker_copilot_container_update_task'
 const CONTAINER_UPDATE_TASKS_KEY = `${CONTAINER_UPDATE_TASK_STORAGE_KEY}:active-by-name`
 const CONTAINER_BATCH_TASK_STORAGE_KEY = 'docker_copilot_container_batch_task'
+const CONTAINER_BATCH_SUBMISSION_STORAGE_KEY = `${CONTAINER_BATCH_TASK_STORAGE_KEY}:pending`
+
+function readSavedBatchSubmission() {
+  try {
+    const value = JSON.parse(globalThis.localStorage?.getItem(CONTAINER_BATCH_SUBMISSION_STORAGE_KEY) || 'null')
+    if (!value || !['start', 'stop', 'restart', 'update'].includes(value.action) ||
+      !Array.isArray(value.containerIDs) || value.containerIDs.length === 0) return null
+    return { ...value, uncertain: true, nonce: value.nonce || submissionNonce() }
+  } catch { return null }
+}
+
+function saveBatchSubmission(submission) {
+  try {
+    if (submission) {
+      const { action, containerIDs, deleteOldContainer, nonce } = submission
+      globalThis.localStorage?.setItem(CONTAINER_BATCH_SUBMISSION_STORAGE_KEY, JSON.stringify({ action, containerIDs, deleteOldContainer, nonce }))
+    } else {
+      globalThis.localStorage?.removeItem(CONTAINER_BATCH_SUBMISSION_STORAGE_KEY)
+    }
+  } catch {
+    // A pending batch is still held in memory when browser storage is unavailable.
+  }
+}
 
 function readSavedUpdateTasks() {
   try {
@@ -115,6 +137,26 @@ function submissionNonce() {
   return globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random()}`
 }
 
+function terminalFailureMessage(task, { batch = false } = {}) {
+  const status = String(task?.status || '').toLowerCase()
+  const items = Array.isArray(task?.items) ? task.items : []
+  const failedItems = items.filter((item) => ['failed', 'interrupted'].includes(String(item?.status || '').toLowerCase()))
+  const failedCount = Math.max(Number(task?.failedCount) || 0, failedItems.length)
+  const isFailure = ['failed', 'interrupted'].includes(status) || (batch && failedCount > 0)
+  if (!isFailure) return null
+
+  const label = status === 'interrupted' ? '任务中断' : (batch && failedCount > 0 ? '批量操作部分失败' : '任务失败')
+  const details = failedItems
+    .slice(0, 5)
+    .map((item) => {
+      const name = item.name || item.id || item.containerID || '容器'
+      const reason = item.error || item.detailMsg || item.message
+      return reason ? `${name}：${reason}` : name
+    })
+  const summary = task?.error || task?.detailMsg || task?.message
+  return [label, summary, ...details].filter(Boolean).join('\n')
+}
+
 function updateTaskKey(name, containerId) {
   const stableName = String(name || '').trim().replace(/^\/+/, '')
   return stableName ? `name:${stableName}` : `id:${containerId}`
@@ -133,6 +175,28 @@ async function listActiveContainerUpdateTasks({ signal } = {}) {
   }
   records.sort((a, b) => Date.parse(b.createdAt || '') - Date.parse(a.createdAt || ''))
   return records
+}
+
+async function findActiveBatchTask(submission, signal) {
+  const type = `container-batch-${submission.action}`
+  const expectedIDs = [...new Set(submission.containerIDs.map(String))].sort()
+  for (const status of ['queued', 'running']) {
+    for (let page = 1; ; page += 1) {
+      const response = await taskAPI.listTasks({ status, type, page, limit: 100 }, { signal })
+      const items = taskListPayload(response).map((record) => validateTaskRecord(record, response))
+      const match = items.find((record) => {
+        if (record.status !== status || record.type !== type) return false
+        const actualIDs = [...new Set([
+          ...(Array.isArray(record.containerIDs) ? record.containerIDs : []),
+          ...(Array.isArray(record.items) ? record.items.map((item) => item?.id).filter(Boolean) : []),
+        ].map(String))].sort()
+        return actualIDs.length === expectedIDs.length && actualIDs.every((id, index) => id === expectedIDs[index])
+      })
+      if (match) return match
+      if (!response.data?.data?.hasMore || items.length < 100) break
+    }
+  }
+  return null
 }
 
 function ContainerUpdateTaskTracker({ entry, onAccepted, onSubmissionError, onTaskUpdate, onTerminal }) {
@@ -166,17 +230,7 @@ function ContainerUpdateTaskTracker({ entry, onAccepted, onSubmissionError, onTa
     if (tracker.task) callbacks.current.onTaskUpdate?.(entry.key, entry, tracker.task)
   }, [entry.key, entry.containerId, tracker.task])
 
-  return (
-    <TaskStatusPanel
-      task={tracker.task}
-      taskId={tracker.taskId}
-      connectionError={tracker.connectionError}
-      unauthorized={tracker.unauthorized}
-      submitError={tracker.submitError}
-      isTracking={tracker.isTracking}
-      containerName={entry.name}
-    />
-  )
+  return null
 }
 
 function ContainerBatchTaskTracker({ submission, onAccepted, onSubmissionError, onTaskUpdate, onTerminal }) {
@@ -190,7 +244,7 @@ function ContainerBatchTaskTracker({ submission, onAccepted, onSubmissionError, 
   callbacks.current = { onAccepted, onSubmissionError, onTaskUpdate }
 
   React.useEffect(() => {
-    if (!submission || submitted.current.has(submission.nonce)) return
+    if (!submission || submission.uncertain || submitted.current.has(submission.nonce)) return
     submitted.current.add(submission.nonce)
     tracker.submit(() => containerAPI.batchContainers(submission.action, submission.containerIDs, submission.deleteOldContainer))
       .then(({ taskID }) => callbacks.current.onAccepted?.(taskID))
@@ -198,20 +252,47 @@ function ContainerBatchTaskTracker({ submission, onAccepted, onSubmissionError, 
   }, [submission?.nonce, tracker.submit])
 
   React.useEffect(() => {
+    if (!submission?.uncertain || tracker.taskId) return
+    let active = true
+    let timer = null
+    let attempt = 0
+    let controller = null
+    const discover = async () => {
+      if (!active) return
+      controller = new AbortController()
+      try {
+        const task = await findActiveBatchTask(submission, controller.signal)
+        if (!active) return
+        if (task) {
+          const taskID = task.taskID || task.taskId
+          if (taskID) {
+            tracker.track(taskID)
+            callbacks.current.onAccepted?.(taskID)
+            return
+          }
+        }
+      } catch {
+        // A query outage does not determine whether the original POST committed.
+      }
+      if (active) {
+        const delay = Math.min(1000 * (2 ** attempt), 30000)
+        attempt += 1
+        timer = setTimeout(discover, delay)
+      }
+    }
+    void discover()
+    return () => {
+      active = false
+      controller?.abort()
+      if (timer !== null) clearTimeout(timer)
+    }
+  }, [submission?.nonce, submission?.uncertain, tracker.taskId, tracker.track])
+
+  React.useEffect(() => {
     if (tracker.task) callbacks.current.onTaskUpdate?.(tracker.task)
   }, [tracker.task])
 
-  return (
-    <TaskStatusPanel
-      task={tracker.task}
-      taskId={tracker.taskId}
-      connectionError={tracker.connectionError}
-      unauthorized={tracker.unauthorized}
-      submitError={tracker.submitError}
-      isTracking={tracker.isTracking}
-      containerName={submission ? `批量${({ start: '启动', stop: '停止', restart: '重启', update: '更新' })[submission.action] || '操作'}` : '批量容器操作'}
-    />
-  )
+  return null
 }
 
 function PortMappingTile({ port }) {
@@ -382,10 +463,8 @@ export function Containers() {
   // 添加操作状态跟踪
   const [containerActions, setContainerActions] = useState({}) // 跟踪每个容器的操作状态
   const [taskTrackers, setTaskTrackers] = useState(readSavedUpdateTasks)
-  const [batchSubmission, setBatchSubmission] = useState(null)
+  const [batchSubmission, setBatchSubmission] = useState(readSavedBatchSubmission)
   const [batchTask, setBatchTask] = useState(null)
-  const [taskDiscoveryError, setTaskDiscoveryError] = useState(null)
-  const [taskDiscoveryAttempt, setTaskDiscoveryAttempt] = useState(0)
   const recoveryStarted = React.useRef(false)
   // 添加筛选状态
   const [filterStatus, setFilterStatus] = useState(null) // null 表示显示全部
@@ -444,15 +523,15 @@ export function Containers() {
         saveUpdateTasksByName(next)
         return next
       })
-    }, { onError: setTaskDiscoveryError })
+    })
     return () => {
       cancelDiscovery()
       recoveryStarted.current = false
     }
-  }, [isLoading, taskDiscoveryAttempt])
+  }, [isLoading])
 
   // 获取自定义图标配置
-  const { data: customIcons = {}, isError: customIconsError, error: customIconsQueryError } = useImageIcons()
+  const { data: customIcons = {} } = useImageIcons()
 
   const handleContainerAction = async (containerId, action) => {
     try {
@@ -542,12 +621,54 @@ export function Containers() {
       // Preserve the established bulk-update behavior explicitly.
       ...(action === 'update' ? { deleteOldContainer: true } : {}),
     }
+    saveBatchSubmission(request)
     setBatchSubmission(request)
+    setContainerActions((previous) => {
+      const next = { ...previous }
+      for (const id of request.containerIDs) {
+        next[id] = { action: 'batch', loading: true, progress: '正在提交批量操作', percentage: 0 }
+      }
+      return next
+    })
   }
 
   const handleBatchAccepted = () => {
+    saveBatchSubmission(null)
     setSelectedContainers([])
     setIsBatchMode(false)
+  }
+
+  const handleBatchSubmissionError = (error) => {
+    const status = Number(error?.status)
+    const definitelyRejected = status >= 400 && status < 500 && status !== 408 && status !== 429
+    if (definitelyRejected) {
+      const ids = batchSubmission?.containerIDs || []
+      setContainerActions((previous) => {
+        const next = { ...previous }
+        for (const id of ids) delete next[id]
+        return next
+      })
+      saveBatchSubmission(null)
+      setBatchSubmission(null)
+      setConfirmModal({
+        isOpen: true,
+        title: '操作失败',
+        message: '批量操作失败: ' + (error.response?.data?.msg || error.message || '未知错误'),
+        onConfirm: () => setConfirmModal({ isOpen: false }),
+        onCancel: null,
+        type: 'danger',
+      })
+      return
+    }
+
+    setBatchSubmission((previous) => previous ? { ...previous, uncertain: true } : previous)
+    setContainerActions((previous) => {
+      const next = { ...previous }
+      for (const id of batchSubmission?.containerIDs || []) {
+        next[id] = { action: 'batch', loading: true, progress: '提交结果待确认', percentage: 0 }
+      }
+      return next
+    })
   }
 
   const handleBatchTaskUpdate = (task) => {
@@ -570,6 +691,17 @@ export function Containers() {
   const handleBatchTerminal = (task) => {
     handleBatchTaskUpdate(task)
     setBatchTask(task)
+    const failure = terminalFailureMessage(task, { batch: true })
+    if (failure) {
+      setConfirmModal({
+        isOpen: true,
+        title: '批量操作未完全成功',
+        message: failure,
+        onConfirm: () => setConfirmModal({ isOpen: false }),
+        onCancel: null,
+        type: 'danger',
+      })
+    }
     void refetch()
   }
 
@@ -653,6 +785,16 @@ export function Containers() {
       else next[containerId] = { action: 'update', loading: true, progress: '提交结果待确认', percentage: 0 }
       return next
     })
+    if (definitelyRejected) {
+      setConfirmModal({
+        isOpen: true,
+        title: '更新失败',
+        message: error.response?.data?.msg || error.message || '更新失败',
+        onConfirm: () => setConfirmModal({ isOpen: false }),
+        onCancel: null,
+        type: 'danger',
+      })
+    }
   }
 
   const handleTaskUpdate = (key, entry, task) => {
@@ -691,6 +833,17 @@ export function Containers() {
       saveUpdateTasksByName(next)
       return next
     })
+    const failure = terminalFailureMessage(task)
+    if (failure) {
+      setConfirmModal({
+        isOpen: true,
+        title: '容器更新未成功',
+        message: failure,
+        onConfirm: () => setConfirmModal({ isOpen: false }),
+        onCancel: null,
+        type: 'danger',
+      })
+    }
     void refetch()
   }
 
@@ -768,21 +921,6 @@ export function Containers() {
           50% { transform: translateY(-4px); }
         }
       `}</style>
-
-      {customIconsError && (
-        <div role="alert" className="mb-4 rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-800 dark:border-red-900 dark:bg-red-900/20 dark:text-red-200">
-          图标映射加载失败：{customIconsQueryError?.message || '请检查服务后重试'}
-          <button className="ml-3 underline" onClick={() => queryClient.invalidateQueries({ queryKey: ['customIcons'] })}>重试</button>
-        </div>
-      )}
-
-      {taskDiscoveryError && (
-        <div role="alert" className="mb-4 rounded-lg border border-amber-300 bg-amber-50 p-3 text-sm text-amber-900 dark:border-amber-800 dark:bg-amber-950/40 dark:text-amber-200">
-          <span>无法查询刷新后仍在执行的容器任务；页面会继续重试，现有任务不会自动重放。</span>
-          {taskDiscoveryError.message && <p className="mt-1 break-words text-xs">查询错误：{taskDiscoveryError.message}</p>}
-          <button className="ml-3 underline" onClick={() => setTaskDiscoveryAttempt((value) => value + 1)}>立即重试</button>
-        </div>
-      )}
 
       {/* 自定义确认弹窗 */}
       {confirmModal.isOpen && (
@@ -941,7 +1079,7 @@ export function Containers() {
           setBatchSubmission(null)
           handleBatchAccepted()
         }}
-        onSubmissionError={() => setBatchSubmission(null)}
+        onSubmissionError={handleBatchSubmissionError}
         onTaskUpdate={handleBatchTaskUpdate}
         onTerminal={handleBatchTerminal}
       />
@@ -1121,7 +1259,7 @@ export function Containers() {
                       )}
                     >
                       {/* 背景进度条 */}
-                      {containerActions[container.id]?.loading && containerActions[container.id]?.action === 'update' && (
+                      {containerActions[container.id]?.loading && ['update', 'batch'].includes(containerActions[container.id]?.action) && (
                         <div className="absolute inset-0 pointer-events-none rounded-2xl overflow-hidden">
                           <div
                             className="absolute top-0 left-0 bottom-0 bg-gradient-to-r from-primary-500/30 via-primary-400/30 to-primary-500/30 transition-all duration-500 ease-out"
@@ -1248,6 +1386,7 @@ export function Containers() {
                                 {containerActions[container.id].action === 'stop' && '停止中'}
                                 {containerActions[container.id].action === 'restart' && '重启中'}
                                 {containerActions[container.id].action === 'update' && `更新中${containerActions[container.id].percentage ? ` ${Math.round(containerActions[container.id].percentage)}%` : ''}`}
+                                {containerActions[container.id].action === 'batch' && '批量操作中'}
                               </span>
                             </div>
                           ) : (
@@ -1622,12 +1761,11 @@ function ContainerDetailModal({ container, onClose, onRename, onUpdate, onAction
     const file = event.target.files[0]
     if (!file) return
 
-    const extension = file.name.split('.').pop()?.toLowerCase()
-    if (file.size > IMAGE_ICON_MAX_BYTES) {
+    if (file.size > 2 * 1024 * 1024) {
       setConfirmModal({
         isOpen: true,
         title: '上传失败',
-        message: '图标文件大小不能超过 10 MiB',
+        message: '图标文件大小不能超过 2MB',
         onConfirm: () => setConfirmModal({ isOpen: false }),
         onCancel: null,
         type: 'danger'
@@ -1635,19 +1773,6 @@ function ContainerDetailModal({ container, onClose, onRename, onUpdate, onAction
       event.target.value = '' // 重置 input
       return
     }
-    if (!IMAGE_ICON_SUPPORTED_FORMATS.includes(extension)) {
-      setConfirmModal({
-        isOpen: true,
-        title: '上传失败',
-        message: '仅支持 PNG、JPG、JPEG、WEBP 和 GIF 格式',
-        onConfirm: () => setConfirmModal({ isOpen: false }),
-        onCancel: null,
-        type: 'danger'
-      })
-      event.target.value = ''
-      return
-    }
-
     try {
       setIsUploadingIcon(true)
       // 使用容器当前的镜像名作为 Key
@@ -1802,14 +1927,14 @@ function ContainerDetailModal({ container, onClose, onRename, onUpdate, onAction
       <div
         className="relative group cursor-pointer"
         onClick={() => !isUploadingIcon && fileInputRef.current?.click()}
-        title="点击上传自定义图标（PNG/JPG/JPEG/WEBP/GIF，最大 10 MiB）"
+        title="点击上传自定义图标"
       >
         <input
           type="file"
           ref={fileInputRef}
           onChange={handleIconUpload}
           className="hidden"
-          accept=".png,.jpg,.jpeg,.webp,.gif,image/png,image/jpeg,image/webp,image/gif"
+          accept="image/png,image/jpeg,image/webp,image/svg+xml"
         />
 
         <IconContent />
