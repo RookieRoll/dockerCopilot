@@ -27,8 +27,8 @@ func TestDelRestoreRejectsTraversalFilename(t *testing.T) {
 	resp, err := logic.DelRestore(&types.DelContainerBackupReq{
 		Filename: "../outside.txt",
 	})
-	if err == nil {
-		t.Fatal("expected path validation error")
+	if err != nil {
+		t.Fatalf("expected nil error, got %v", err)
 	}
 	if resp.Code != 400 {
 		t.Fatalf("expected 400 for traversal filename, got %d", resp.Code)

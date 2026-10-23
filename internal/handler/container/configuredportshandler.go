@@ -4,7 +4,6 @@ import (
 	"net/http"
 
 	"github.com/onlyLTY/dockerCopilot/internal/logic/container"
-	"github.com/onlyLTY/dockerCopilot/internal/observability"
 	"github.com/onlyLTY/dockerCopilot/internal/svc"
 	"github.com/onlyLTY/dockerCopilot/internal/types"
 	"github.com/zeromicro/go-zero/rest/httpx"
@@ -14,12 +13,16 @@ func ConfiguredPortsHandler(svcCtx *svc.ServiceContext) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var req types.ContainerConfiguredPortsReq
 		if err := httpx.Parse(r, &req); err != nil {
-			observability.WriteBadRequest(w, r, err)
+			httpx.ErrorCtx(r.Context(), w, err)
 			return
 		}
 
 		l := container.NewConfiguredPortsLogic(r.Context(), svcCtx)
 		resp, err := l.Save(&req)
-		observability.WriteAPIResult(w, r, resp, err)
+		if err != nil {
+			httpx.WriteJson(w, resp.Code, resp)
+			return
+		}
+		httpx.OkJsonCtx(r.Context(), w, resp)
 	}
 }

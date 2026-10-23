@@ -18,74 +18,12 @@ import (
 	"time"
 
 	dockerClient "github.com/docker/docker/client"
-	"github.com/google/uuid"
 	"github.com/onlyLTY/dockerCopilot/internal/config"
 	apphandler "github.com/onlyLTY/dockerCopilot/internal/handler"
 	"github.com/onlyLTY/dockerCopilot/internal/module"
-	"github.com/onlyLTY/dockerCopilot/internal/observability"
 	"github.com/onlyLTY/dockerCopilot/internal/svc"
 	"github.com/zeromicro/go-zero/rest"
 )
-
-func TestUnauthorizedCallbackReturnsSafeCorrelatedEnvelope(t *testing.T) {
-	const secret = "authorization-parser-secret"
-	port := getEmbeddedTestPort(t)
-	cfg := config.Config{}
-	cfg.Host = "127.0.0.1"
-	cfg.Port = port
-	server := rest.MustNewServer(cfg.RestConf, rest.WithUnauthorizedCallback(unauthorizedCallback))
-	server.Use(observability.RequestIDMiddleware)
-	server.AddRoute(rest.Route{
-		Method: http.MethodGet,
-		Path:   "/protected",
-		Handler: func(w http.ResponseWriter, _ *http.Request) {
-			w.WriteHeader(http.StatusNoContent)
-		},
-	}, rest.WithJwt(secret))
-	t.Cleanup(server.Stop)
-	go server.Start()
-	waitForEmbeddedServer(t, port, "/protected")
-
-	request, err := http.NewRequest(http.MethodGet, fmt.Sprintf("http://127.0.0.1:%d/protected", port), nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	request.Header.Set("Authorization", "Bearer "+secret)
-	request.Header.Set("X-Request-ID", "not-a-uuid")
-	response, err := http.DefaultClient.Do(request)
-	if err != nil {
-		t.Fatalf("call protected route: %v", err)
-	}
-	defer response.Body.Close()
-	body, err := io.ReadAll(response.Body)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if response.StatusCode != http.StatusUnauthorized {
-		t.Fatalf("status = %d, want 401: %s", response.StatusCode, body)
-	}
-	var envelope struct {
-		Code      int    `json:"code"`
-		Msg       string `json:"msg"`
-		ErrorCode string `json:"errorCode"`
-		RequestID string `json:"requestId"`
-	}
-	if err := json.Unmarshal(body, &envelope); err != nil {
-		t.Fatalf("decode unauthorized envelope: %v: %s", err, body)
-	}
-	if envelope.Code != http.StatusUnauthorized || envelope.Msg != "未授权" || envelope.ErrorCode != "UNAUTHORIZED" {
-		t.Fatalf("unexpected unauthorized envelope: %+v", envelope)
-	}
-	if envelope.RequestID == "" || envelope.RequestID != response.Header.Get("X-Request-ID") {
-		t.Fatalf("request ID body/header mismatch: body=%q header=%q", envelope.RequestID, response.Header.Get("X-Request-ID"))
-	}
-	if _, err := uuid.Parse(envelope.RequestID); err != nil {
-		t.Fatalf("request ID is not a UUID: %q", envelope.RequestID)
-	}
-	if strings.Contains(string(body), secret) || strings.Contains(string(body), "not-a-uuid") {
-		t.Fatalf("unauthorized response echoed credential or invalid request ID: %s", body)
-	}
-}
 
 func TestEmbeddedManagerAssets(t *testing.T) {
 	port := getEmbeddedTestPort(t)

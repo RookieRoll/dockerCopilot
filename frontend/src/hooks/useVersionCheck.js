@@ -1,105 +1,111 @@
-import { useState, useCallback } from 'react'
+import { useEffect, useState, useCallback } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { versionAPI } from '../api/client.js'
-import { useTask } from './useTask.js'
-import { programUpdateState, newProgramUpdateRequestId } from './programUpdateModel.js'
-import { normalizeHttpError } from '../api/errors.js'
-import { shouldUpdate } from './versionUtils.js'
 
-export const PROGRAM_UPDATE_TASK_STORAGE_KEY = 'docker_copilot_program_update_task'
-const PROGRAM_UPDATE_ATTEMPT_STORAGE_KEY = 'docker_copilot_program_update_pending_acceptance'
-
-function readPendingAcceptance() {
-  try {
-    const value = globalThis.localStorage?.getItem(PROGRAM_UPDATE_ATTEMPT_STORAGE_KEY)
-    return value || ''
-  } catch { return '' }
+/**
+ * 检查版本是否需要更新
+ * @param {string} currentVersion 当前版本
+ * @param {string} latestVersion 最新版本
+ * @returns {boolean} 是否需要更新
+ */
+function shouldUpdate(currentVersion, latestVersion) {
+  if (currentVersion === 'unknown' || latestVersion === 'unknown') {
+    return false
+  }
+  
+  const current = parseVersion(currentVersion)
+  const latest = parseVersion(latestVersion)
+  
+  if (current === null || latest === null) {
+    return false
+  }
+  
+  // 比较 major.minor.patch
+  if (latest.major > current.major) return true
+  if (latest.major === current.major && latest.minor > current.minor) return true
+  if (latest.major === current.major && latest.minor === current.minor && latest.patch > current.patch) return true
+  
+  return false
 }
 
-function writePendingAcceptance(startedAt) {
-  try {
-    if (startedAt) globalThis.localStorage?.setItem(PROGRAM_UPDATE_ATTEMPT_STORAGE_KEY, String(startedAt))
-    else globalThis.localStorage?.removeItem(PROGRAM_UPDATE_ATTEMPT_STORAGE_KEY)
-  } catch {
-    // Task tracking remains available in memory when browser storage is blocked.
+/**
+ * 解析版本号
+ * @param {string} version 版本号字符串 (e.g., "1.0.0")
+ * @returns {Object|null} 解析后的版本对象或 null
+ */
+function parseVersion(version) {
+  if (!version || typeof version !== 'string') return null
+  
+  const match = version.match(/^(\d+)\.(\d+)\.(\d+)(?:-.+)?$/)
+  if (!match) return null
+  
+  return {
+    major: parseInt(match[1], 10),
+    minor: parseInt(match[2], 10),
+    patch: parseInt(match[3], 10),
+    raw: version,
   }
-}
-
-function requireVersionPayload(response, kind) {
-  if (response?.data?.code !== 0 && response?.data?.code !== 200) {
-    throw new Error(response?.data?.msg || `${kind}版本接口返回错误`)
-  }
-  const value = response.data.data
-  const version = typeof value === 'string'
-    ? value
-    : kind === '本地' ? value?.version : value?.remoteVersion
-  if (typeof version !== 'string' || !version) throw new Error(`${kind}版本信息缺失`)
-  return { version, buildDate: typeof value === 'object' && value ? value.buildDate || '' : '' }
 }
 
 /**
  * 版本检查 Hook
  * 用于检查后端版本，并提示用户是否有更新
  */
-export function useVersionCheck({ enabled = true } = {}) {
+export function useVersionCheck() {
   const [showUpdatePrompt, setShowUpdatePrompt] = useState(false)
-  const [isSubmittingUpdate, setIsSubmittingUpdate] = useState(false)
-  const [programTaskRequestId, setProgramTaskRequestId] = useState(readPendingAcceptance)
-  const handleProgramTaskTerminal = useCallback((task) => {
-    writePendingAcceptance(false)
-    setProgramTaskRequestId('')
-    if (task?.status === 'succeeded') {
-      // A queued/accepted task is not an installation result. Reload only after
-      // the backend has durably confirmed the handoff and reports success.
-      globalThis.setTimeout?.(() => globalThis.location?.reload(), 3000)
-    } else if (task?.status === 'failed' || task?.status === 'interrupted') {
-      globalThis.alert?.('后端更新失败，请手动重启应用')
-    }
-  }, [])
-  const programTask = useTask({
-    enabled,
-    storageKey: PROGRAM_UPDATE_TASK_STORAGE_KEY,
-    taskType: 'program-update',
-    discoverTaskType: Boolean(programTaskRequestId),
-    taskRequestId: programTaskRequestId,
-    invalidateKeys: [['version']],
-    onTerminal: handleProgramTaskTerminal,
-  })
 
   // 查询后端版本信息
   const { data: versionData, refetch } = useQuery({
     queryKey: ['version'],
-    enabled,
     queryFn: async () => {
       try {
+        // 获取本地版本信息
         const localResponse = await versionAPI.getVersion('local')
-        const local = requireVersionPayload(localResponse, '本地')
-        const result = {
-          backendVersion: local.version,
-          remoteVersion: 'unknown',
-          buildDate: local.buildDate,
-          hasBackendUpdate: false,
-          localError: '',
-          remoteError: '',
+        
+        let backendVersion = 'unknown'
+        let buildDate = ''
+        
+        if (localResponse.data.code === 200 || localResponse.data.code === 0) {
+          const localData = localResponse.data.data
+          if (localData && typeof localData === 'object') {
+            backendVersion = localData.version || 'unknown'
+            buildDate = localData.buildDate || ''
+          } else if (typeof localData === 'string') {
+            backendVersion = localData
+          }
         }
+        
+        // 获取远端版本信息
+        let remoteVersion = 'unknown'
+        
         try {
           const remoteResponse = await versionAPI.getVersion('remote')
-          const remote = requireVersionPayload(remoteResponse, '远端')
-          result.remoteVersion = remote.version
-          result.hasBackendUpdate = shouldUpdate(local.version, remote.version)
+          
+          if (remoteResponse.data.code === 200 || remoteResponse.data.code === 0) {
+            const remoteData = remoteResponse.data.data
+            if (remoteData && typeof remoteData === 'object') {
+              remoteVersion = remoteData.remoteVersion || remoteVersion
+            } else if (typeof remoteData === 'string') {
+              remoteVersion = remoteData
+            }
+          }
         } catch (error) {
-          result.remoteError = normalizeHttpError(error).message
+          console.warn('获取远端版本信息失败:', error)
         }
-        return result
+        
+        return {
+          backendVersion,
+          remoteVersion,
+          buildDate,
+          hasBackendUpdate: shouldUpdate(backendVersion, remoteVersion)
+        }
       } catch (error) {
-        const message = normalizeHttpError(error).message
+        console.error('获取版本信息失败:', error)
         return {
           backendVersion: 'unknown',
           remoteVersion: 'unknown',
           buildDate: '',
-          hasBackendUpdate: false,
-          localError: message,
-          remoteError: '',
+          hasBackendUpdate: false
         }
       }
     },
@@ -110,42 +116,23 @@ export function useVersionCheck({ enabled = true } = {}) {
 
   // 更新后端
   const updateBackend = useCallback(async () => {
-    const state = programUpdateState({ task: programTask.task, taskId: programTask.taskId, isSubmitting: isSubmittingUpdate, submitError: programTask.submitError, discoveryPending: Boolean(programTaskRequestId) })
-    if (state === 'submitting' || state === 'active' || state === 'uncertain') return null
-    const attemptRequestId = newProgramUpdateRequestId()
-    setIsSubmittingUpdate(true)
-    writePendingAcceptance(attemptRequestId)
     try {
-      const accepted = await programTask.submit(() => versionAPI.updateProgram(attemptRequestId))
-      writePendingAcceptance(false)
-      setProgramTaskRequestId('')
+      await versionAPI.updateProgram()
       setShowUpdatePrompt(true)
-      return accepted
+      // 3秒后自动刷新
+      setTimeout(() => {
+        window.location.reload()
+      }, 3000)
     } catch (error) {
-      // A failed POST can have an unknown outcome. Keep tracking its request ID
-      // without replaying it; only a definite rejection gets the old error
-      // prompt. The legacy UI has no task-status panel.
-      const normalized = normalizeHttpError(error)
-      const definitelyRejected = Number.isFinite(normalized.status) && normalized.status >= 400 && normalized.status < 500 && normalized.status !== 408 && normalized.status !== 429
-      if (definitelyRejected) {
-        writePendingAcceptance(false)
-        setProgramTaskRequestId('')
-        globalThis.alert?.('后端更新失败，请手动重启应用')
-      } else {
-        setProgramTaskRequestId(attemptRequestId)
-      }
-      return null
-    } finally {
-      setIsSubmittingUpdate(false)
+      console.error('后端更新失败:', error)
+      alert('后端更新失败，请手动重启应用')
     }
-  }, [isSubmittingUpdate, programTask.submit, programTask.submitError, programTask.task, programTask.taskId, programTaskRequestId])
+  }, [])
 
   // 手动检查更新
   const checkForUpdates = useCallback(async () => {
     await refetch()
   }, [refetch])
-
-  const updateState = programUpdateState({ task: programTask.task, taskId: programTask.taskId, isSubmitting: isSubmittingUpdate, submitError: programTask.submitError, discoveryPending: Boolean(programTaskRequestId) })
 
   return {
     // 状态
@@ -156,7 +143,6 @@ export function useVersionCheck({ enabled = true } = {}) {
     remoteVersion: versionData?.remoteVersion,
     buildDate: versionData?.buildDate,
     hasBackendUpdate: versionData?.hasBackendUpdate,
-    isUpdating: updateState === 'submitting' || updateState === 'active' || updateState === 'uncertain',
     
     // 方法
     setShowUpdatePrompt,

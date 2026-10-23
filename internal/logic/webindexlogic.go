@@ -9,13 +9,15 @@ import (
 
 type WebindexLogic struct {
 	logx.Logger
-	ctx context.Context
+	ctx    context.Context
+	svcCtx *svc.ServiceContext
 }
 
 func NewWebindexLogic(ctx context.Context, svcCtx *svc.ServiceContext) *WebindexLogic {
 	return &WebindexLogic{
 		Logger: logx.WithContext(ctx),
 		ctx:    ctx,
+		svcCtx: svcCtx,
 	}
 }
 

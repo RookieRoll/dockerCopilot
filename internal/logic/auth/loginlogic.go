@@ -3,20 +3,17 @@ package auth
 import (
 	"context"
 	"errors"
-	"time"
-
 	"github.com/golang-jwt/jwt/v4"
-	"github.com/onlyLTY/dockerCopilot/internal/observability"
 	"github.com/onlyLTY/dockerCopilot/internal/svc"
 	"github.com/onlyLTY/dockerCopilot/internal/types"
 	"github.com/zeromicro/go-zero/core/logx"
+	"time"
 )
 
 type LoginLogic struct {
 	logx.Logger
-	ctx     context.Context
-	secret  string
-	expires int64
+	ctx    context.Context
+	svcCtx *svc.ServiceContext
 }
 
 type JwtResponse struct {
@@ -25,24 +22,23 @@ type JwtResponse struct {
 
 func NewLoginLogic(ctx context.Context, svcCtx *svc.ServiceContext) *LoginLogic {
 	return &LoginLogic{
-		Logger:  logx.WithContext(ctx),
-		ctx:     ctx,
-		secret:  svcCtx.Config.Auth.AccessSecret,
-		expires: svcCtx.Config.Auth.AccessExpire,
+		Logger: logx.WithContext(ctx),
+		ctx:    ctx,
+		svcCtx: svcCtx,
 	}
 }
 
 func (l *LoginLogic) Login(req *types.LoginReq) (resp *types.Resp, err error) {
 	resp = &types.Resp{}
-	if l.secret != req.SecretKey {
+	if l.svcCtx.Config.Auth.AccessSecret != req.SecretKey {
 		resp.Code = 401
 		resp.Msg = "无效的secretKey"
 		resp.Data = JwtResponse{Jwt: ""}
-		return resp, observability.Unauthorized(errors.New("无效的secretKey"))
+		return resp, errors.New("无效的secretKey")
 	}
-	jwtToken, err := l.getJwtToken(l.secret,
+	jwtToken, err := l.getJwtToken(l.svcCtx.Config.Auth.AccessSecret,
 		time.Now().Unix(),
-		l.expires,
+		l.svcCtx.Config.Auth.AccessExpire,
 	)
 	if err != nil {
 		resp.Code = 500

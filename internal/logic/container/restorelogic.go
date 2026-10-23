@@ -2,19 +2,12 @@ package container
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"github.com/google/uuid"
-	"net/http"
-
-	backupService "github.com/onlyLTY/dockerCopilot/internal/backup"
+	"github.com/onlyLTY/dockerCopilot/internal/utiles"
 	"path/filepath"
-	"sync"
 
-	"github.com/onlyLTY/dockerCopilot/internal/observability"
-	"github.com/onlyLTY/dockerCopilot/internal/operation"
 	"github.com/onlyLTY/dockerCopilot/internal/svc"
-	"github.com/onlyLTY/dockerCopilot/internal/task"
 	"github.com/onlyLTY/dockerCopilot/internal/types"
 
 	"github.com/zeromicro/go-zero/core/logx"
@@ -22,34 +15,28 @@ import (
 
 type RestoreLogic struct {
 	logx.Logger
-	ctx        context.Context
-	taskRunner *task.Runner
-	service    *backupService.Service
-	gate       *operation.MutationGate
+	ctx    context.Context
+	svcCtx *svc.ServiceContext
 }
 
 func NewRestoreLogic(ctx context.Context, svcCtx *svc.ServiceContext) *RestoreLogic {
 	return &RestoreLogic{
-		Logger:     logx.WithContext(ctx),
-		ctx:        ctx,
-		taskRunner: svcCtx.TaskRunner,
-		service:    backupServiceFromContext(svcCtx),
-		gate:       svcCtx.MutationGate(),
+		Logger: logx.WithContext(ctx),
+		ctx:    ctx,
+		svcCtx: svcCtx,
 	}
 }
 
 func (l *RestoreLogic) Restore(req *types.ContainerRestoreReq) (resp *types.Resp, err error) {
 	resp = &types.Resp{}
-	if req == nil {
-		return &types.Resp{Code: http.StatusBadRequest, Msg: "filename is required", Data: map[string]any{}}, requestError("filename is required")
-	}
+	taskID := uuid.New().String()
 	fileName := req.Filename
-	fullPath, pathErr := l.service.Resolve(fileName, ".json")
+	fullPath, pathErr := utiles.ResolveBackupPath(fileName, ".json")
 	if pathErr != nil {
 		resp.Code = 400
 		resp.Msg = pathErr.Error()
 		resp.Data = map[string]interface{}{}
-		return resp, requestError(pathErr.Error())
+		return resp, pathErr
 	}
 	fileName = filepath.Base(fullPath)
 	if filepath.Ext(fileName) != ".json" {
@@ -57,71 +44,20 @@ func (l *RestoreLogic) Restore(req *types.ContainerRestoreReq) (resp *types.Resp
 		resp.Code = 400
 		resp.Msg = err.Error()
 		resp.Data = map[string]interface{}{}
-		return resp, requestError(err.Error())
+		return resp, err
 	}
-	if l.taskRunner == nil {
-		return nil, taskUnavailableError("task runner is unavailable")
-	}
-	releaseFile, leaseErr := l.service.AcquireRestoreFileLease(fileName)
-	if leaseErr != nil {
-		return &types.Resp{Msg: leaseErr.Error(), Data: map[string]any{}}, leaseErr
-	}
-	var releaseFileOnce sync.Once
-	finishFileLease := func() { releaseFileOnce.Do(releaseFile) }
-	taskID := uuid.NewString()
-	var mutationLease *operation.MutationLease
-	taskID, submitErr := l.taskRunner.Submit(task.TaskSpec{
-		Record: task.Record{TaskID: taskID, Type: "backup-restore", Name: fileName, RequestID: observability.RequestIDFromContext(l.ctx)},
-		OnAccepted: func() error {
-			var acquireErr error
-			mutationLease, acquireErr = l.gate.Acquire(l.ctx, taskID)
-			return acquireErr
-		},
-		OnSettled: func() {
-			finishFileLease()
-			if mutationLease != nil {
-				mutationLease.Release()
+	go func() {
+		// Catch any panic and log the error
+		defer func() {
+			if r := recover(); r != nil {
+				l.Errorf("Recovered from panic in restoreContainer: %v", r)
 			}
-		},
-		Run: func(ctx context.Context, execution *task.Execution) error {
-			if err := execution.Progress("restoring", 0, "备份恢复已开始"); err != nil {
-				return err
-			}
-			result, restoreErr := l.service.RestoreWithResults(ctx, fileName, execution.TaskID())
-			if len(result.Items) > 0 {
-				if err := execution.Critical("restore-items", func(record *task.Record) {
-					record.SuccessCount, record.FailedCount, record.SkippedCount = 0, 0, 0
-					for _, item := range result.Items {
-						switch item.Status {
-						case "succeeded":
-							record.SuccessCount++
-						case "failed":
-							record.FailedCount++
-						case "skipped":
-							record.SkippedCount++
-						}
-						record.Items = append(record.Items, task.Item{
-							ID: fmt.Sprintf("%d", item.Index), Name: item.Name,
-							Status: item.Status, Error: item.Error,
-						})
-					}
-				}); err != nil {
-					return errors.Join(restoreErr, fmt.Errorf("record restore item results: %w", err))
-				}
-			}
-			if restoreErr != nil {
-				return restoreErr
-			}
-			return execution.Progress("completed", 100, "备份恢复完成")
-		},
-	})
-	if submitErr != nil {
-		finishFileLease()
-		if mutationLease != nil {
-			mutationLease.Release()
+		}()
+		err := utiles.RestoreContainer(l.svcCtx, fileName, taskID)
+		if err != nil {
+			l.Errorf("Error in restoreContainer: %v", err)
 		}
-		return &types.Resp{Msg: submitErr.Error(), Data: map[string]any{}}, taskSubmitError{cause: submitErr}
-	}
+	}()
 	resp.Code = 200
 	resp.Msg = "success"
 	resp.Data = map[string]interface{}{

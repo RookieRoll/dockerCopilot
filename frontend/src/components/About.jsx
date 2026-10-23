@@ -25,7 +25,7 @@ export function About() {
 
           <div className="flex flex-wrap items-center justify-center gap-3">
             <a
-              href="https://github.com/RookieRoll/dockerCopilot"
+              href="https://github.com/onlyLTY/dockercopilot"
               target="_blank"
               rel="noopener noreferrer"
               className="flex items-center gap-2 px-4 py-2 bg-gray-900 text-white rounded-lg hover:bg-gray-800 transition-colors shadow-sm"
@@ -65,7 +65,7 @@ export function About() {
               在项目使用中遇到 Bug 或有新的功能想法？欢迎提交 Issue 或直接联系我。您的每一个反馈都至关重要。
             </p>
             <a
-              href="https://github.com/RookieRoll/dockerCopilot/issues"
+              href="https://github.com/onlyLTY/dockercopilot/issues"
               target="_blank"
               rel="noopener noreferrer"
               className="inline-flex items-center text-primary-600 dark:text-primary-400 hover:underline font-medium"

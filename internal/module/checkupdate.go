@@ -1,10 +1,8 @@
 package module
 
 import (
-	"context"
 	"crypto/sha256"
 	"crypto/tls"
-	"crypto/x509"
 	"errors"
 	"fmt"
 	ref "github.com/distribution/reference"
@@ -14,7 +12,6 @@ import (
 	"net"
 	"net/http"
 	url2 "net/url"
-	"os"
 	"regexp"
 	"strings"
 	"sync"
@@ -23,28 +20,12 @@ import (
 
 // ImageCheckList 检查更新处理后的镜像列表
 type ImageCheckList struct {
-	NeedUpdate    bool      `json:"needUpdate"`
-	Known         bool      `json:"known"`
-	Stale         bool      `json:"stale"`
-	Error         string    `json:"error,omitempty"`
-	LastCheckedAt time.Time `json:"lastCheckedAt,omitempty"`
-	LastSuccessAt time.Time `json:"lastSuccessAt,omitempty"`
+	NeedUpdate bool
 }
 type ImageUpdateData struct {
-	mu        sync.RWMutex
-	checkMu   sync.Mutex
-	Data      map[string]ImageCheckList
-	client    *http.Client
-	freshness time.Duration
+	mu   sync.RWMutex
+	Data map[string]ImageCheckList
 }
-
-type ImageCheckOptions struct {
-	Client        *http.Client
-	TrustedCAFile string
-	Freshness     time.Duration
-}
-
-var ErrImageCheckInProgress = errors.New("image update check is already running")
 
 const ContentDigestHeader = "Docker-Content-Digest"
 
@@ -52,61 +33,15 @@ const ContentDigestHeader = "Docker-Content-Digest"
 var pinnedVersionTagPattern = regexp.MustCompile(`^v?\d+(?:\.\d+){1,3}$`)
 
 func NewImageCheck() *ImageUpdateData {
-	data, _ := NewImageCheckWithOptions(ImageCheckOptions{})
-	return data
-}
-
-func NewImageCheckWithOptions(options ImageCheckOptions) (*ImageUpdateData, error) {
-	client := options.Client
-	if client == nil {
-		transport := http.DefaultTransport.(*http.Transport).Clone()
-		transport.TLSClientConfig = &tls.Config{MinVersion: tls.VersionTLS12}
-		if options.TrustedCAFile != "" {
-			pem, err := os.ReadFile(options.TrustedCAFile)
-			if err != nil {
-				return nil, fmt.Errorf("read trusted registry CA: %w", err)
-			}
-			pool, err := x509.SystemCertPool()
-			if err != nil || pool == nil {
-				pool = x509.NewCertPool()
-			}
-			if !pool.AppendCertsFromPEM(pem) {
-				return nil, errors.New("trusted registry CA file contains no valid certificates")
-			}
-			transport.TLSClientConfig.RootCAs = pool
-		}
-		client = &http.Client{Timeout: 30 * time.Second, Transport: transport}
-	}
-	freshness := options.Freshness
-	if freshness <= 0 {
-		freshness = 2 * time.Hour
-	}
 	return &ImageUpdateData{
-		Data: map[string]ImageCheckList{}, client: client, freshness: freshness,
-	}, nil
+		Data: map[string]ImageCheckList{},
+	}
 }
 func isDockerCopilotImage(imageName string) bool {
 	return strings.Contains(imageName, "0nlylty/dockercopilot") ||
 		strings.Contains(imageName, "2807645688/dockercopilot")
 }
 func (i *ImageUpdateData) CheckUpdate(imageList []types.Image) {
-	if err := i.CheckUpdateContext(context.Background(), imageList); err != nil && !errors.Is(err, ErrImageCheckInProgress) {
-		logx.Errorf("image registry digest check failed: %v", err)
-	}
-}
-
-func (i *ImageUpdateData) CheckUpdateContext(ctx context.Context, imageList []types.Image) error {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	if !i.checkMu.TryLock() {
-		return ErrImageCheckInProgress
-	}
-	defer i.checkMu.Unlock()
-	if i.client == nil {
-		return errors.New("registry HTTP client is unavailable")
-	}
-	var firstErr error
 	for _, image := range imageList {
 		if isDockerCopilotImage(image.ImageName) {
 			continue
@@ -114,28 +49,24 @@ func (i *ImageUpdateData) CheckUpdateContext(ctx context.Context, imageList []ty
 		if pinnedVersionTagPattern.MatchString(image.ImageTag) {
 			continue
 		}
-		if err := i.checkSingleImage(ctx, image); err != nil && firstErr == nil {
-			firstErr = err
-		}
+		i.checkSingleImage(image)
 	}
-	return firstErr
 }
 
-func (i *ImageUpdateData) checkSingleImage(ctx context.Context, image types.Image) error {
-	token, err := getTokenWithClient(ctx, image, "", i.client)
+func (i *ImageUpdateData) checkSingleImage(image types.Image) {
+	token, err := GetToken(image, "")
 	if err != nil {
-		i.recordCheckFailure(image.ID, err)
-		return fmt.Errorf("registry authentication check for %s:%s: %w", image.ImageName, image.ImageTag, err)
+		logx.Error("获取token失败或者无需获取token，继续尝试检查" + err.Error())
 	}
 	if len(image.RepoDigests) == 0 {
-		err := errors.New("local image has no repo digest to compare")
-		i.recordCheckFailure(image.ID, err)
-		return fmt.Errorf("registry digest check for %s:%s: %w", image.ImageName, image.ImageTag, err)
+		logx.Error("未在本地获取到repoDigest" + image.ImageName + ":" + image.ImageTag)
+		return
 	}
-	remoteDigest, err := digestOfTagWithClient(ctx, image, token, i.client)
+	remoteDigest, err := digestOfTag(image, token)
 	if err != nil {
-		i.recordCheckFailure(image.ID, err)
-		return fmt.Errorf("registry manifest digest check for %s:%s: %w", image.ImageName, image.ImageTag, err)
+		logx.Error("获取digest失败" + err.Error())
+		// 检查失败时保留上一次结果,避免瞬时网络故障清掉已有更新提示
+		return
 	}
 	// 只要远端 digest 不在本地任一 RepoDigests 中,即认为该 tag 内容已更新
 	needUpdate := !containsDigest(image.RepoDigests, remoteDigest)
@@ -145,44 +76,16 @@ func (i *ImageUpdateData) checkSingleImage(ctx context.Context, image types.Imag
 		logx.Info(image.ImageName + ":" + image.ImageTag + " not need update")
 	}
 	i.mu.Lock()
-	previous := i.Data[image.ID]
-	now := time.Now().UTC()
-	result := ImageCheckList{NeedUpdate: needUpdate, Known: true, LastCheckedAt: now, LastSuccessAt: now}
-	if previous.LastSuccessAt.After(now) {
-		result.LastSuccessAt = previous.LastSuccessAt
-	}
-	i.Data[image.ID] = result
+	i.Data[image.ID] = ImageCheckList{NeedUpdate: needUpdate}
 	i.mu.Unlock()
-	return nil
-}
-
-func (i *ImageUpdateData) recordCheckFailure(id string, cause error) {
-	i.mu.Lock()
-	defer i.mu.Unlock()
-	now := time.Now().UTC()
-	previous := i.Data[id]
-	previous.Stale = true
-	previous.Error = cause.Error()
-	previous.LastCheckedAt = now
-	if !previous.LastSuccessAt.IsZero() {
-		previous.Known = true
-	} else {
-		previous.Known = false
-		previous.NeedUpdate = false
-	}
-	i.Data[id] = previous
 }
 
 func digestOfTag(image types.Image, token string) (string, error) {
-	return digestOfTagWithClient(context.Background(), image, token, digestHTTPClient)
-}
-
-func digestOfTagWithClient(ctx context.Context, image types.Image, token string, client *http.Client) (string, error) {
 	digestURL, err := BuildManifestURL(image)
 	if err != nil {
 		return "", err
 	}
-	return getDigestWithClient(ctx, client, digestURL, token)
+	return GetDigest(digestURL, token)
 }
 
 // containsDigest 判断远端 digest 是否已存在于本地 RepoDigests 中。
@@ -200,23 +103,7 @@ func (i *ImageUpdateData) Get(id string) (ImageCheckList, bool) {
 	i.mu.RLock()
 	defer i.mu.RUnlock()
 	v, ok := i.Data[id]
-	if ok && !v.LastSuccessAt.IsZero() && time.Since(v.LastSuccessAt) > i.freshness {
-		v.Stale = true
-	}
 	return v, ok
-}
-
-func (i *ImageUpdateData) GetAll() map[string]ImageCheckList {
-	i.mu.RLock()
-	defer i.mu.RUnlock()
-	result := make(map[string]ImageCheckList, len(i.Data))
-	for id, value := range i.Data {
-		if !value.LastSuccessAt.IsZero() && time.Since(value.LastSuccessAt) > i.freshness {
-			value.Stale = true
-		}
-		result[id] = value
-	}
-	return result
 }
 
 func BuildManifestURL(image types.Image) (string, error) {
@@ -258,7 +145,7 @@ var digestHTTPClient = &http.Client{
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
-		TLSClientConfig:       &tls.Config{MinVersion: tls.VersionTLS12},
+		TLSClientConfig:       &tls.Config{InsecureSkipVerify: true},
 	},
 }
 
@@ -270,11 +157,7 @@ func setManifestAccept(req *http.Request) {
 }
 
 func GetDigest(url string, token string) (string, error) {
-	return getDigestWithClient(context.Background(), digestHTTPClient, url, token)
-}
-
-func getDigestWithClient(ctx context.Context, client *http.Client, manifestURL string, token string) (string, error) {
-	req, err := http.NewRequestWithContext(ctx, "HEAD", manifestURL, nil)
+	req, err := http.NewRequest("HEAD", url, nil)
 	if err != nil {
 		return "", err
 	}
@@ -283,9 +166,9 @@ func getDigestWithClient(ctx context.Context, client *http.Client, manifestURL s
 	}
 	setManifestAccept(req)
 
-	res, err := client.Do(req)
+	res, err := digestHTTPClient.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("HEAD manifest request: %w", err)
+		return "", err
 	}
 	_, _ = io.Copy(io.Discard, res.Body)
 	res.Body.Close()
@@ -295,15 +178,11 @@ func getDigestWithClient(ctx context.Context, client *http.Client, manifestURL s
 		}
 	}
 	// 部分镜像加速站不支持 HEAD 或不返回 Docker-Content-Digest,回退 GET 再取/计算 digest
-	return getDigestByGetWithClient(ctx, client, manifestURL, token, res.Status)
+	return getDigestByGet(url, token, res.Status)
 }
 
 func getDigestByGet(url string, token string, headStatus string) (string, error) {
-	return getDigestByGetWithClient(context.Background(), digestHTTPClient, url, token, headStatus)
-}
-
-func getDigestByGetWithClient(ctx context.Context, client *http.Client, manifestURL string, token string, headStatus string) (string, error) {
-	req, err := http.NewRequestWithContext(ctx, "GET", manifestURL, nil)
+	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
 		return "", err
 	}
@@ -312,9 +191,9 @@ func getDigestByGetWithClient(ctx context.Context, client *http.Client, manifest
 	}
 	setManifestAccept(req)
 
-	res, err := client.Do(req)
+	res, err := digestHTTPClient.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("GET manifest request: %w", err)
+		return "", err
 	}
 	defer func(Body io.ReadCloser) {
 		err := Body.Close()
@@ -324,17 +203,18 @@ func getDigestByGetWithClient(ctx context.Context, client *http.Client, manifest
 	}(res.Body)
 
 	if res.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("registry manifest request returned %s (head: %s)", res.Status, headStatus)
+		wwwAuthHeader := res.Header.Get("www-authenticate")
+		if wwwAuthHeader == "" {
+			wwwAuthHeader = "not present"
+		}
+		return "", fmt.Errorf("registry responded to manifest request with %q (head: %s), auth: %q", res.Status, headStatus, wwwAuthHeader)
 	}
 	if digest := res.Header.Get(ContentDigestHeader); digest != "" {
 		return digest, nil
 	}
-	body, err := io.ReadAll(io.LimitReader(res.Body, 4<<20+1))
+	body, err := io.ReadAll(res.Body)
 	if err != nil {
 		return "", err
-	}
-	if len(body) > 4<<20 {
-		return "", errors.New("registry manifest exceeds 4 MiB limit")
 	}
 	sum := sha256.Sum256(body)
 	return fmt.Sprintf("sha256:%x", sum), nil

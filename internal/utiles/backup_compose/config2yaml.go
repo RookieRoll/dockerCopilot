@@ -1,11 +1,9 @@
 package backupCompose
 
 import (
-	"fmt"
 	composeType "github.com/compose-spec/compose-go/types"
 	dockerTypes "github.com/docker/docker/api/types"
 	composeNat "github.com/docker/go-connections/nat"
-	"github.com/onlyLTY/dockerCopilot/internal/config"
 	"github.com/zeromicro/go-zero/core/logx"
 	"os"
 	"path/filepath"
@@ -17,36 +15,6 @@ import (
 
 // DockerConfig2ComposeYaml 将docker config转换为docker-compose.yaml
 func DockerConfig2ComposeYaml(containerJSONs []dockerTypes.ContainerJSON) (err error) {
-	return DockerConfig2ComposeYamlInDir(containerJSONs, config.LegacyBackupDirectory())
-}
-
-func DockerConfig2ComposeYamlInDir(containerJSONs []dockerTypes.ContainerJSON, backupDir string) (err error) {
-	yamlData, err := MarshalComposeYaml(containerJSONs)
-	if err != nil {
-		return err
-	}
-	_, err = os.Stat(backupDir)
-	if os.IsNotExist(err) {
-		err = os.MkdirAll(backupDir, 0755)
-		if err != nil {
-			logx.Error("Error creating backup directory:", err)
-			return err
-		}
-	}
-	currentDate := time.Now().Format("2006-01-02")
-	fileName := fmt.Sprintf("backup-%s-%s.yaml", currentDate, time.Now().Format("150405.000000000"))
-	fullPath := filepath.Join(backupDir, fileName)
-	err = os.WriteFile(fullPath, yamlData, 0600)
-	if err != nil {
-		logx.Error("Error writing to file:", err)
-		return err
-	}
-	return nil
-}
-
-// MarshalComposeYaml returns the legacy Compose document without writing a
-// file. Backup service owns naming, permissions, and atomic publication.
-func MarshalComposeYaml(containerJSONs []dockerTypes.ContainerJSON) ([]byte, error) {
 	var c composeYaml
 	c.Services = make(map[string]composeType.ServiceConfig, len(containerJSONs))
 	for _, containerJSON := range containerJSONs {
@@ -57,11 +25,32 @@ func MarshalComposeYaml(containerJSONs []dockerTypes.ContainerJSON) ([]byte, err
 		formatVolumeServiceConfig(containerJSON, &s)
 		c.Services[s.Name] = s
 	}
+	// write to file
+	backupDir := os.Getenv("BACKUP_DIR") // 从环境变量中获取备份目录
+	if backupDir == "" {
+		backupDir = "/data/backups" // 如果环境变量未设置，使用默认值
+	}
+	_, err = os.Stat(backupDir)
+	if os.IsNotExist(err) {
+		err = os.MkdirAll(backupDir, 0755)
+		if err != nil {
+			logx.Error("Error creating backup directory:", err)
+			return err
+		}
+	}
 	yamlData, yamlMarshalErr := yaml.Marshal(c)
 	if yamlMarshalErr != nil {
-		return nil, fmt.Errorf("marshal Compose backup: %w", yamlMarshalErr)
+		logx.Errorf("Error marshalling data err is: %v", yamlMarshalErr)
 	}
-	return yamlData, nil
+	currentDate := time.Now().Format("2006-01-02")
+	fileName := "backup-" + currentDate + ".yaml"
+	fullPath := filepath.Join(backupDir, fileName)
+	err = os.WriteFile(fullPath, yamlData, 0644)
+	if err != nil {
+		logx.Error("Error writing to file:", err)
+		return err
+	}
+	return
 }
 
 func formatBaseServiceConfig(containerJSON dockerTypes.ContainerJSON, s *composeType.ServiceConfig) {
@@ -73,7 +62,6 @@ func formatBaseServiceConfig(containerJSON dockerTypes.ContainerJSON, s *compose
 	s.ContainerName = name
 	s.Name = name
 	s.Tty = containerJSON.Config.Tty
-	s.Hostname = containerJSON.Config.Hostname
 	if len(containerJSON.Config.Entrypoint) > 0 {
 		s.Entrypoint = composeType.ShellCommand(containerJSON.Config.Entrypoint)
 	}

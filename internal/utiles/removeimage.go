@@ -2,14 +2,14 @@ package utiles
 
 import (
 	"context"
-	imageService "github.com/onlyLTY/dockerCopilot/internal/image"
+	"github.com/docker/docker/api/types/image"
 	"github.com/onlyLTY/dockerCopilot/internal/svc"
 )
 
 func RemoveImage(ctx *svc.ServiceContext, imageID string, force bool) error {
-	service := ctx.Images
-	if service == nil {
-		service = imageService.NewService(ctx.DockerClient)
+	_, err := ctx.DockerClient.ImageRemove(context.Background(), imageID, image.RemoveOptions{Force: force})
+	if err != nil {
+		return err
 	}
-	return service.Remove(context.Background(), imageID, force)
+	return nil
 }

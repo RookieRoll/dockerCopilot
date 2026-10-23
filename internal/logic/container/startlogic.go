@@ -2,45 +2,30 @@ package container
 
 import (
 	"context"
-	containerService "github.com/onlyLTY/dockerCopilot/internal/container"
-	"github.com/onlyLTY/dockerCopilot/internal/observability"
 	"github.com/onlyLTY/dockerCopilot/internal/svc"
 	"github.com/onlyLTY/dockerCopilot/internal/types"
-	"time"
+	"github.com/onlyLTY/dockerCopilot/internal/utiles"
 
 	"github.com/zeromicro/go-zero/core/logx"
 )
 
 type StartLogic struct {
 	logx.Logger
-	ctx     context.Context
-	service *containerService.Service
-}
-
-func serviceFromContext(svcCtx *svc.ServiceContext) *containerService.Service {
-	if svcCtx == nil {
-		return nil
-	}
-	return svcCtx.ContainerService()
+	ctx    context.Context
+	svcCtx *svc.ServiceContext
 }
 
 func NewStartLogic(ctx context.Context, svcCtx *svc.ServiceContext) *StartLogic {
 	return &StartLogic{
-		Logger:  logx.WithContext(ctx),
-		ctx:     ctx,
-		service: serviceFromContext(svcCtx),
+		Logger: logx.WithContext(ctx),
+		ctx:    ctx,
+		svcCtx: svcCtx,
 	}
 }
 
 func (l *StartLogic) Start(req *types.IdReq) (resp *types.Resp, err error) {
 	resp = &types.Resp{}
-	started := time.Now()
-	err = l.service.Start(l.ctx, req.Id)
-	if err != nil {
-		observability.LogOperationResultWithDuration(l.ctx, "container.start", req.Id, "failed", time.Since(started), err)
-	} else {
-		observability.LogOperationResultWithDuration(l.ctx, "container.start", req.Id, "succeeded", time.Since(started))
-	}
+	err = utiles.StartContainer(l.svcCtx, req.Id)
 	if err != nil {
 		resp.Code = 400
 		resp.Msg = err.Error()

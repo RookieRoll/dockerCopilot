@@ -2,14 +2,13 @@ package utiles
 
 import (
 	"context"
-	containerService "github.com/onlyLTY/dockerCopilot/internal/container"
 	"github.com/onlyLTY/dockerCopilot/internal/svc"
 )
 
 func RenameContainer(ctx *svc.ServiceContext, id string, newName string) error {
-	service := ctx.Containers
-	if service == nil {
-		service = containerService.NewService(ctx.DockerClient)
+	err := ctx.DockerClient.ContainerRename(context.TODO(), id, newName)
+	if err != nil {
+		return err
 	}
-	return service.Rename(context.TODO(), id, newName)
+	return nil
 }

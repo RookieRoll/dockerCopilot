@@ -1,21 +1,28 @@
 package utiles
 
 import (
-	backupService "github.com/onlyLTY/dockerCopilot/internal/backup"
 	"github.com/onlyLTY/dockerCopilot/internal/svc"
+	"os"
+	"path/filepath"
 )
 
 func BackupList(ctx *svc.ServiceContext) ([]string, error) {
-	dir := BackupDir()
-	if ctx != nil {
-		dir = ctx.Config.BackupDirectory()
+	var backupList []string
+	dir := os.Getenv("BACKUP_DIR") // 从环境变量中获取备份目录
+	if dir == "" {
+		dir = "/data/backups" // 如果环境变量未设置，使用默认值
 	}
-	if ctx != nil && ctx.Backups != nil {
-		return ctx.Backups.List()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
 	}
-	return backupService.NewService(nil, dir).List()
-}
+	for _, entry := range entries {
+		if !entry.IsDir() && filepath.Ext(entry.Name()) == ".json" {
+			backupList = append(backupList, entry.Name())
+		} else if !entry.IsDir() && filepath.Ext(entry.Name()) == ".yaml" {
+			backupList = append(backupList, entry.Name())
+		}
+	}
 
-func BackupListIn(dir string) ([]string, error) {
-	return backupService.NewService(nil, dir).List()
+	return backupList, nil
 }

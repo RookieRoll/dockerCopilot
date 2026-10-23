@@ -1,11 +1,10 @@
 import axios from 'axios'
-import { createBusinessApiError, hasApiEnvelope, isSuccessApiCode, normalizeHttpError } from './errors.js'
 
 // 动态获取 API 基础地址
 // 优先级：环境变量 > window.__API_BASE_URL > localStorage > 当前主机 > 默认值
 function getAPIBaseURL() {
   // 1. 最高优先级：环境变量（构建时注入）
-  if (import.meta.env?.VITE_API_BASE_URL) {
+  if (import.meta.env.VITE_API_BASE_URL) {
     console.log('Using build-time API URL:', import.meta.env.VITE_API_BASE_URL)
     return import.meta.env.VITE_API_BASE_URL
   }
@@ -17,7 +16,7 @@ function getAPIBaseURL() {
   }
 
   // 3. 检查 localStorage（用户保存的地址）
-  const savedURL = typeof localStorage !== 'undefined' ? localStorage.getItem('api_base_url') : null
+  const savedURL = localStorage.getItem('api_base_url')
   if (savedURL) {
     console.log('Using localStorage API URL:', savedURL)
     return savedURL
@@ -63,12 +62,7 @@ apiClient.interceptors.request.use(
 
 // 响应拦截器 - 处理认证过期
 apiClient.interceptors.response.use(
-  (response) => {
-    if (hasApiEnvelope(response.data) && !isSuccessApiCode(response.data.code)) {
-      throw createBusinessApiError(response)
-    }
-    return response
-  },
+  (response) => response,
   (error) => {
     if (error.response?.status === 401) {
       // 只在有token的情况下移除它
@@ -78,7 +72,7 @@ apiClient.interceptors.response.use(
         window.dispatchEvent(new CustomEvent('authChange', { detail: { authenticated: false } }))
       }
     }
-    return Promise.reject(normalizeHttpError(error))
+    return Promise.reject(error)
   }
 )
 
@@ -102,17 +96,12 @@ export const versionAPI = {
     }
     return apiClient.get(`/api/version?type=${type}`)
   },
-  updateProgram: (requestId) => apiClient.put('/api/program', undefined, requestId ? { headers: { 'X-Request-ID': requestId } } : undefined),
+  updateProgram: () => apiClient.put('/api/program'),
 }
 
 // 容器相关API
 export const containerAPI = {
   getContainers: () => apiClient.get('/api/containers'),
-  batchContainers: (action, containerIDs, deleteOldContainer) => apiClient.post('/api/containers/batch', {
-    action,
-    containerIDs,
-    ...(deleteOldContainer === undefined ? {} : { deleteOldContainer }),
-  }),
   saveConfiguredPorts: (id, ports) => apiClient.put(`/api/container/${id}/configured-ports`, { ports }),
   startContainer: (id) => apiClient.post(`/api/container/${id}/start`),
   stopContainer: (id) => apiClient.post(`/api/container/${id}/stop`),
@@ -130,21 +119,18 @@ export const containerAPI = {
     })
   },
   backupContainer: () => apiClient.get('/api/container/backup'),
-  backupContainerAsync: () => apiClient.post('/api/container/backup'),
   listBackups: () => apiClient.get('/api/container/listBackups'),
   restoreContainer: (filename) => {
-    return apiClient.post('/api/container/backups/restore', { filename })
+    return apiClient.post(`/api/container/backups/${filename}/restore`)
   },
   deleteBackup: (filename) => apiClient.delete(`/api/container/backups?filename=${encodeURIComponent(filename)}`),
   backupToCompose: () => apiClient.get('/api/container/backup2compose'),
-  backupToComposeAsync: () => apiClient.post('/api/container/backup2compose'),
 }
 
 // 镜像相关API
 export const imageAPI = {
   getImages: () => apiClient.get('/api/images'),
-  cleanupImages: (policy) => apiClient.post('/api/images/cleanup', { policy }),
-  getIcons: (config) => apiClient.get('/api/icons', config),
+  getIcons: () => apiClient.get('/api/icons'),
   deleteImage: (id, force = false) => apiClient.delete(`/api/image/${id}?force=${force}`),
   uploadIcon: (file, imageName, containerName) => {
     const formData = new FormData()
@@ -161,12 +147,7 @@ export const imageAPI = {
 
 // 进度查询API
 export const progressAPI = {
-  getProgress: (taskid, config) => apiClient.get(`/api/progress/${encodeURIComponent(taskid)}`, config),
-}
-
-export const taskAPI = {
-  getTask: (taskId, config) => progressAPI.getProgress(taskId, config),
-  listTasks: (params = {}, config) => apiClient.get('/api/tasks', { ...config, params }),
+  getProgress: (taskid) => apiClient.get(`/api/progress/${taskid}`),
 }
 
 // GitHub API - 用于检查前端更新

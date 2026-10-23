@@ -1,10 +1,9 @@
-import React, { useState, useEffect, useCallback } from 'react'
+import React, { useState, useEffect } from 'react'
+import { useQuery } from '@tanstack/react-query'
 import { HardDrive, Trash2, RefreshCw, Link, BrushCleaning, X, AlertCircle, CheckCircle } from 'lucide-react'
 import { imageAPI } from '../api/client.js'
 import { cn } from '../utils/cn.js'
 import { getImageLogo } from '../config/imageLogos.js'
-import { useImageIcons } from '../hooks/useImageIcons.js'
-import { useTask } from '../hooks/useTask.js'
 
 // 安全的图片组件
 function SafeImage({ src, alt, className, fallback }) {
@@ -35,9 +34,37 @@ export function Images() {
   const [successModal, setSuccessModal] = useState({ isOpen: false, message: '' })
 
   // 获取自定义图标配置
-  const { data: customIcons = {} } = useImageIcons()
+  const { data: customIcons = {} } = useQuery({
+    queryKey: ['customIcons'],
+    queryFn: async () => {
+      try {
+        const response = await imageAPI.getIcons()
+        if (response.data.code === 200 || response.data.code === 0) {
+          const icons = response.data.data || {}
+          // update localStorage
+          localStorage.setItem('docker_copilot_image_logos', JSON.stringify(icons))
+          return icons
+        }
+      } catch (err) {
+        console.error('获取图标失败:', err)
+      }
+      return {}
+    },
+    // 初始数据尝试从localStorage获取
+    initialData: () => {
+      const saved = localStorage.getItem('docker_copilot_image_logos')
+      if (saved) {
+        try {
+          return JSON.parse(saved)
+        } catch (e) {
+          console.error('解析本地图标配置失败:', e)
+        }
+      }
+      return undefined
+    }
+  })
 
-  const fetchImages = useCallback(async () => {
+  const fetchImages = async () => {
     try {
       setIsLoading(true)
       setError(null)
@@ -58,44 +85,11 @@ export function Images() {
     } finally {
       setIsLoading(false)
     }
-  }, [])
-
-  const onCleanupTerminal = (task) => {
-    setIsLoading(false)
-    const failedCount = Number(task.failedCount) || 0
-    if (task.status === 'succeeded' && failedCount === 0) {
-      setError(null)
-      setSuccessModal({ isOpen: true, message: '镜像清理成功' })
-      setTimeout(() => setSuccessModal({ isOpen: false, message: '' }), 3000)
-      void fetchImages()
-      return
-    }
-    const message = task.error || task.detailMsg || (failedCount > 0 ? '部分镜像清理失败' : `镜像清理失败，状态：${task.status}`)
-    void fetchImages().finally(() => setError(message))
   }
-  const cleanupTask = useTask({
-    taskType: 'image-cleanup', discoverTaskType: true,
-    storageKey: 'docker_copilot_image_cleanup_task', onTerminal: onCleanupTerminal,
-  })
-  const cleanupTaskActive = cleanupTask.task?.status === 'queued' || cleanupTask.task?.status === 'running' ||
-    (cleanupTask.isTracking && Boolean(cleanupTask.taskId)) || (Boolean(cleanupTask.taskId) && cleanupTask.unauthorized)
 
   useEffect(() => {
-    if (cleanupTask.isTracking && cleanupTask.taskId) setIsLoading(true)
-    if (cleanupTask.unauthorized) setIsLoading(false)
-  }, [cleanupTask.isTracking, cleanupTask.taskId, cleanupTask.unauthorized])
-
-  useEffect(() => {
-    const unavailable = cleanupTask.unauthorized || cleanupTask.connectionError
-    if (!unavailable) return
-    setError(cleanupTask.unauthorized
-      ? '任务查询未授权，请重新登录后查看清理结果'
-      : cleanupTask.connectionError?.message || '任务查询连接中断，正在重试')
-  }, [cleanupTask.unauthorized, cleanupTask.connectionError])
-
-  useEffect(() => {
-    void fetchImages()
-  }, [fetchImages])
+    fetchImages()
+  }, [])
 
   const handleDeleteImage = async (imageId, force = false) => {
     try {
@@ -118,15 +112,34 @@ export function Images() {
     try {
       setIsLoading(true)
       setError(null)
-      const candidates = type === 'dangling'
-        ? images.filter(img => img.tag === 'None' || img.tag === '<none>')
-        : images.filter(img => !img.inUsed)
-      if (candidates.length === 0) {
+
+      let imagesToDelete = []
+      if (type === 'dangling') {
+        imagesToDelete = images.filter(img => img.tag === 'None' || img.tag === '<none>')
+      } else if (type === 'unused') {
+        imagesToDelete = images.filter(img => !img.inUsed)
+      }
+
+      if (imagesToDelete.length === 0) {
         setError('没有找到需要清理的镜像')
         setIsLoading(false)
         return
       }
-      await cleanupTask.submit(() => imageAPI.cleanupImages(type))
+
+      // 批量删除
+      const deletePromises = imagesToDelete.map(image =>
+        imageAPI.deleteImage(image.id, false)
+      )
+
+      await Promise.all(deletePromises)
+
+      const message = type === 'dangling'
+        ? `成功清理 ${imagesToDelete.length} 个无Tag镜像`
+        : `成功清理 ${imagesToDelete.length} 个未使用的镜像`
+
+      setSuccessModal({ isOpen: true, message })
+      fetchImages()
+      setTimeout(() => setSuccessModal({ isOpen: false, message: '' }), 3000)
     } catch (error) {
       const errorMsg = error.response?.data?.msg || error.message || '清理镜像失败'
       setError(errorMsg)
@@ -178,7 +191,7 @@ export function Images() {
                 const imagesToDelete = images.filter(img => img.tag === 'None' || img.tag === '<none>')
                 setPruneModal({ isOpen: true, type: 'dangling', images: imagesToDelete })
               }}
-              disabled={isLoading || cleanupTaskActive || images.filter(img => img.tag === 'None' || img.tag === '<none>').length === 0}
+              disabled={isLoading || images.filter(img => img.tag === 'None' || img.tag === '<none>').length === 0}
               className="flex items-center gap-2 px-4 py-2 bg-orange-100 text-orange-700 dark:bg-orange-900 dark:text-orange-200 rounded-lg hover:bg-orange-200 dark:hover:bg-orange-800 transition-colors disabled:opacity-50 text-sm font-medium"
             >
               <BrushCleaning className="h-4 w-4" />
@@ -189,7 +202,7 @@ export function Images() {
                 const imagesToDelete = images.filter(img => !img.inUsed)
                 setPruneModal({ isOpen: true, type: 'unused', images: imagesToDelete })
               }}
-              disabled={isLoading || cleanupTaskActive || images.filter(img => !img.inUsed).length === 0}
+              disabled={isLoading || images.filter(img => !img.inUsed).length === 0}
               className="flex items-center gap-2 px-4 py-2 bg-purple-100 text-purple-700 dark:bg-purple-900 dark:text-purple-200 rounded-lg hover:bg-purple-200 dark:hover:bg-purple-800 transition-colors disabled:opacity-50 text-sm font-medium"
             >
               <BrushCleaning className="h-4 w-4" />
@@ -397,7 +410,7 @@ export function Images() {
                   <div className="flex items-start gap-3 mb-4">
                     <div className="h-10 w-10 bg-gray-100 dark:bg-gray-700 rounded-lg flex items-center justify-center flex-shrink-0 overflow-hidden">
                       <SafeImage
-                        src={getImageLogo(`${image.name}:${image.tag}`, customIcons)}
+                        src={getImageLogo(image.name, customIcons)}
                         alt={image.name}
                         className="h-10 w-10 object-cover"
                         fallback={<HardDrive className="h-5 w-5 text-gray-500 dark:text-gray-400" />}
@@ -506,7 +519,7 @@ export function Images() {
                   <div key={img.id} className="flex items-center gap-3 p-3 bg-white dark:bg-gray-700 rounded-xl hover:shadow-md transition-all duration-200">
                     <div className="h-8 w-8 bg-gray-200 dark:bg-gray-600 rounded-lg flex items-center justify-center flex-shrink-0 overflow-hidden">
                       <SafeImage
-                        src={getImageLogo(`${img.name}:${img.tag}`, customIcons)}
+                        src={getImageLogo(img.name, customIcons)}
                         alt={img.name}
                         className="h-8 w-8 object-cover"
                         fallback={<HardDrive className="h-4 w-4 text-gray-500 dark:text-gray-400" />}
@@ -541,7 +554,7 @@ export function Images() {
                   handlePrune(pruneModal.type)
                   setPruneModal({ isOpen: false, type: null, images: [] })
                 }}
-                disabled={isLoading || cleanupTaskActive}
+                disabled={isLoading}
                 className="flex-1 px-4 py-2.5 text-sm font-semibold bg-gradient-to-r from-red-500 to-orange-500 hover:from-red-600 hover:to-orange-600 text-white rounded-xl transition-all duration-300 transform hover:shadow-lg hover:scale-105 active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed shadow-lg"
               >
                 {isLoading ? (

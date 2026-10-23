@@ -35,10 +35,7 @@ func TestImageUpdateDataConcurrentAccess(t *testing.T) {
 		ImageTag:  "latest",
 	}
 	images := []types.Image{img}
-	data, err := NewImageCheckWithOptions(ImageCheckOptions{Client: registry.Client()})
-	if err != nil {
-		t.Fatal(err)
-	}
+	data := NewImageCheck()
 
 	var wg sync.WaitGroup
 	for i := 0; i < 8; i++ {

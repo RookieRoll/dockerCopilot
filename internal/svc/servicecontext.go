@@ -1,244 +1,61 @@
 package svc
 
 import (
-	"context"
-	"fmt"
-	"sync"
-
 	"github.com/docker/docker/client"
-	backupService "github.com/onlyLTY/dockerCopilot/internal/backup"
 	"github.com/onlyLTY/dockerCopilot/internal/config"
-	containerService "github.com/onlyLTY/dockerCopilot/internal/container"
-	imageService "github.com/onlyLTY/dockerCopilot/internal/image"
-	"github.com/onlyLTY/dockerCopilot/internal/legacyprogress"
 	"github.com/onlyLTY/dockerCopilot/internal/module"
-	"github.com/onlyLTY/dockerCopilot/internal/operation"
-	"github.com/onlyLTY/dockerCopilot/internal/settings"
-	"github.com/onlyLTY/dockerCopilot/internal/task"
-	"github.com/onlyLTY/dockerCopilot/internal/types"
 	"github.com/zeromicro/go-zero/core/logx"
+	"github.com/zeromicro/go-zero/rest"
+	"sync"
 )
 
 type ServiceContext struct {
-	Config              config.Config
-	HubImageInfo        *module.ImageUpdateData
-	ProgressStore       ProgressStoreType
-	LegacyProgress      *legacyprogress.Store
-	DockerClient        *client.Client
-	Containers          *containerService.Service
-	Images              *imageService.Service
-	Backups             *backupService.Service
-	Ports               *settings.PortOverridesService
-	Icons               *settings.IconService
-	TaskRuntime         *TaskRuntime
-	TaskStore           *task.Store
-	TaskRunner          *task.Runner
-	TaskQuery           *task.QueryService
-	Mutations           *operation.MutationGate
-	ProgramShutdown     chan struct{}
-	pendingProgramDrain *operation.MutationDrain
-	mu                  sync.Mutex
-	programUpdateMu     sync.Mutex
-	programUpdateActive bool
+	Config                     config.Config
+	CookieCheckMiddleware      rest.Middleware
+	Jwtuuid                    string
+	BearerTokenCheckMiddleware rest.Middleware
+	JwtSecret                  string
+	PortainerJwt               string
+	HubImageInfo               *module.ImageUpdateData
+	IndexCheckMiddleware       rest.Middleware
+	ProgressStore              ProgressStoreType
+	DockerClient               *client.Client
+	mu                         sync.Mutex
 }
 
-type TaskProgress = types.TaskProgress
+type TaskProgress struct {
+	TaskID     string
+	Percentage int
+	Message    string
+	Name       string
+	DetailMsg  string
+	IsDone     bool
+}
 
-type ProgressStoreType map[string]types.TaskProgress
+type ProgressStoreType map[string]TaskProgress
 
 func NewServiceContext(c config.Config) *ServiceContext {
 	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 	if err != nil {
 		logx.Errorf("Unable to create docker client: %s", err)
 	}
-	ctx, buildErr := newServiceContext(c, cli)
-	if buildErr != nil {
-		logx.Errorf("Unable to build service context: %s", buildErr)
+	return &ServiceContext{
+		Config:        c,
+		HubImageInfo:  module.NewImageCheck(),
+		ProgressStore: make(ProgressStoreType),
+		DockerClient:  cli,
 	}
-	return ctx
-}
-
-// NewServiceContextChecked is the startup constructor. Unlike the legacy
-// constructor retained for direct logic tests, it never returns a context with
-// a missing Docker client or task runtime.
-func NewServiceContextChecked(c config.Config) (*ServiceContext, error) {
-	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
-	if err != nil {
-		return nil, fmt.Errorf("create docker client: %w", err)
-	}
-	ctx, err := newServiceContext(c, cli)
-	if err != nil {
-		if cli != nil {
-			_ = cli.Close()
-		}
-		return nil, err
-	}
-	workDir, err := c.ProgramWorkDir()
-	if err != nil {
-		if cli != nil {
-			_ = cli.Close()
-		}
-		return nil, fmt.Errorf("resolve program working directory: %w", err)
-	}
-	validator := newProgramInstallValidator(c, cli, workDir)
-	runtime, err := NewTaskRuntimeForConfigWithValidator(context.Background(), c, validator, workDir)
-	if err != nil {
-		if cli != nil {
-			_ = cli.Close()
-		}
-		return nil, err
-	}
-	ctx.TaskRuntime, ctx.TaskStore, ctx.TaskRunner, ctx.TaskQuery = runtime, runtime.Store, runtime.Runner, runtime.Query
-	if runtime.HasPendingInstall() {
-		drain, drainErr := ctx.MutationGate().BeginDrain("pending-program-install")
-		if drainErr != nil {
-			_ = runtime.Close()
-			_ = cli.Close()
-			return nil, fmt.Errorf("block mutations while confirming pending program install: %w", drainErr)
-		}
-		ctx.pendingProgramDrain = drain
-	}
-	return ctx, nil
-}
-
-func newServiceContext(c config.Config, cli *client.Client) (*ServiceContext, error) {
-	updates, err := module.NewImageCheckWithOptions(module.ImageCheckOptions{TrustedCAFile: c.UpdateSource().RegistryCAFile})
-	if err != nil {
-		return nil, fmt.Errorf("configure trusted registry certificate for application digest checks: %w", err)
-	}
-	containers := containerService.NewService(cli, updates)
-	ctx := &ServiceContext{
-		Config:          c,
-		HubImageInfo:    updates,
-		DockerClient:    cli,
-		Mutations:       operation.NewMutationGate(),
-		ProgramShutdown: make(chan struct{}, 1),
-		Containers:      containers,
-		Images:          imageService.NewService(cli),
-		Backups:         backupService.NewService(cli, c.BackupDirectory(), containers.Operations()),
-		Ports:           settings.NewPortOverridesService(c.PortOverridesFilePath()),
-	}
-	icons, err := settings.NewIconService(settings.IconOptions{ImageDir: settings.DefaultImageDir, MappingPath: settings.DefaultImageLogosPath})
-	if err != nil {
-		return ctx, fmt.Errorf("create icon service: %w", err)
-	}
-	ctx.Icons = icons
-	return ctx, nil
-}
-
-// RequestProgramShutdown sends a controlled, process-local handoff signal.
-// It fails when there is no listener or a signal is already pending.
-func (ctx *ServiceContext) RequestProgramShutdown() error {
-	if ctx == nil || ctx.ProgramShutdown == nil {
-		return fmt.Errorf("program shutdown signal is unavailable")
-	}
-	select {
-	case ctx.ProgramShutdown <- struct{}{}:
-		return nil
-	default:
-		return fmt.Errorf("program shutdown signal is already pending")
-	}
-}
-
-func (ctx *ServiceContext) ReserveProgramUpdate() bool {
-	if ctx == nil {
-		return false
-	}
-	ctx.programUpdateMu.Lock()
-	defer ctx.programUpdateMu.Unlock()
-	if ctx.programUpdateActive {
-		return false
-	}
-	ctx.programUpdateActive = true
-	return true
-}
-
-func (ctx *ServiceContext) ReleaseProgramUpdate() {
-	if ctx == nil {
-		return
-	}
-	ctx.programUpdateMu.Lock()
-	ctx.programUpdateActive = false
-	ctx.programUpdateMu.Unlock()
-}
-
-func (ctx *ServiceContext) ReleaseStartupProgramDrain() {
-	if ctx == nil {
-		return
-	}
-	ctx.mu.Lock()
-	drain := ctx.pendingProgramDrain
-	ctx.pendingProgramDrain = nil
-	ctx.mu.Unlock()
-	if drain != nil {
-		drain.Resume()
-	}
-}
-
-// MutationGate returns the process-wide gate used to coordinate writes with a
-// program handoff. Legacy literal contexts get one lazily under the context lock.
-func (ctx *ServiceContext) MutationGate() *operation.MutationGate {
-	if ctx == nil {
-		return nil
-	}
-	ctx.mu.Lock()
-	defer ctx.mu.Unlock()
-	if ctx.Mutations == nil {
-		ctx.Mutations = operation.NewMutationGate()
-	}
-	return ctx.Mutations
 }
 
 func (ctx *ServiceContext) UpdateProgress(taskID string, progress TaskProgress) {
-	ctx.ProgressService().Update(taskID, progress)
+	ctx.mu.Lock()
+	defer ctx.mu.Unlock()
+	ctx.ProgressStore[taskID] = progress
 }
 
 func (ctx *ServiceContext) GetProgress(taskID string) (TaskProgress, bool) {
-	return ctx.ProgressService().Get(taskID)
-}
-
-func (ctx *ServiceContext) ProgressService() *legacyprogress.Store {
 	ctx.mu.Lock()
 	defer ctx.mu.Unlock()
-	return ctx.progressServiceLocked()
-}
-
-// ContainerService returns the process-wide container service, constructing
-// and wiring it once for compatibility contexts used by legacy callers.
-func (ctx *ServiceContext) ContainerService() *containerService.Service {
-	ctx.mu.Lock()
-	defer ctx.mu.Unlock()
-	if ctx.Containers == nil {
-		ctx.Containers = containerService.NewService(ctx.DockerClient, ctx.HubImageInfo)
-		progress := ctx.progressServiceLocked()
-		ctx.Containers.SetProgressCallbacks(containerService.ProgressCallbacks{Update: progress.Update, Get: progress.Get})
-	}
-	return ctx.Containers
-}
-
-// BackupService returns the process-wide backup service, constructing and
-// wiring it once for compatibility contexts used by legacy callers.
-func (ctx *ServiceContext) BackupService() *backupService.Service {
-	ctx.mu.Lock()
-	defer ctx.mu.Unlock()
-	if ctx.Backups == nil {
-		if ctx.Containers == nil {
-			ctx.Containers = containerService.NewService(ctx.DockerClient, ctx.HubImageInfo)
-		}
-		ctx.Backups = backupService.NewService(ctx.DockerClient, ctx.Config.BackupDirectory(), ctx.Containers.Operations())
-		progress := ctx.progressServiceLocked()
-		ctx.Backups.SetProgressCallbacks(backupService.ProgressCallbacks{Update: progress.Update, Get: progress.Get})
-	}
-	return ctx.Backups
-}
-
-func (ctx *ServiceContext) progressServiceLocked() *legacyprogress.Store {
-	if ctx.LegacyProgress != nil {
-		return ctx.LegacyProgress
-	}
-	if ctx.ProgressStore == nil {
-		ctx.ProgressStore = make(ProgressStoreType)
-	}
-	ctx.LegacyProgress = legacyprogress.NewStore(ctx.ProgressStore)
-	return ctx.LegacyProgress
+	progress, ok := ctx.ProgressStore[taskID]
+	return progress, ok
 }

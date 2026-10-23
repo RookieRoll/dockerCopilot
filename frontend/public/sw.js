@@ -1,5 +1,4 @@
-const APP_CACHE_PREFIX = 'docker-copilot-';
-const CACHE_NAME = 'docker-copilot-v3';
+const CACHE_NAME = 'docker-copilot-v2';
 const BASE_PATH = new URL('.', self.registration.scope).pathname;
 const urlsToCache = [
   BASE_PATH,
@@ -28,7 +27,7 @@ self.addEventListener('activate', event => {
     caches.keys().then(cacheNames => {
       return Promise.all(
         cacheNames.map(cacheName => {
-          if (cacheName.startsWith(APP_CACHE_PREFIX) && cacheName !== CACHE_NAME) {
+          if (cacheName !== CACHE_NAME) {
             return caches.delete(cacheName);
           }
         })
@@ -41,19 +40,6 @@ self.addEventListener('activate', event => {
 // 获取事件
 self.addEventListener('fetch', event => {
   if (event.request.method !== 'GET') {
-    return;
-  }
-
-  const requestUrl = new URL(event.request.url);
-  const isApiRequest = requestUrl.pathname === '/api'
-    || requestUrl.pathname.startsWith('/api/')
-    || requestUrl.pathname === `${BASE_PATH}api`
-    || requestUrl.pathname.startsWith(`${BASE_PATH}api/`);
-  const hasAuthorization = event.request.headers.has('Authorization');
-  if (isApiRequest || hasAuthorization) {
-    // API and authenticated responses must preserve network semantics. In
-    // particular, never serve stale state or an HTML offline page as API data.
-    event.respondWith(fetch(event.request));
     return;
   }
 

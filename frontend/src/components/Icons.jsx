@@ -2,7 +2,8 @@ import React, { useState, useEffect } from 'react'
 import { Search, Copy, Eye, Star, Check, X } from 'lucide-react'
 import { cn } from '../utils/cn.js'
 import { builtInImageLogos, getSupportedImageNames } from '../config/imageLogos.js'
-import { useImageIcons } from '../hooks/useImageIcons.js'
+import { useQuery } from '@tanstack/react-query'
+import { imageAPI } from '../api/client.js'
 
 export function Icons() {
   const [searchTerm, setSearchTerm] = useState('')
@@ -12,7 +13,18 @@ export function Icons() {
   const [favorites, setFavorites] = useState([])
 
   // 获取自定义图标
-  const { data: customIcons = {} } = useImageIcons()
+  const { data: customIcons = {} } = useQuery({
+    queryKey: ['customIcons'],
+    queryFn: async () => {
+      const response = await imageAPI.getIcons()
+      if (response.data.code === 200 || response.data.code === 0) {
+        return response.data.data || {}
+      }
+      return {}
+    },
+    // 每次进入页面都刷新，保证是最新的
+    refetchOnMount: true,
+  })
 
   // 从localStorage加载收藏
   useEffect(() => {

@@ -18,13 +18,9 @@ import {
   Trash2,
   Save
 } from 'lucide-react'
-import { containerAPI, taskAPI } from '../api/client.js'
+import { containerAPI, progressAPI, imageAPI } from '../api/client.js'
 import { cn } from '../utils/cn.js'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
-import { useImageIcons, uploadImageIcon } from '../hooks/useImageIcons.js'
-import { useTask } from '../hooks/useTask.js'
-import { taskListPayload, validateTaskRecord } from '../hooks/taskPolling.js'
-import { startTaskRecoveryDiscovery } from './tasks/taskRecoveryDiscovery.js'
 import { getImageLogo } from '../config/imageLogos.js'
 import icons8Img from '../assets/icons8.png'
 import { formatContainerPort, getConfiguredPortUrl, getContainerPortTitle, getContainerPortUrl, isHostNetworkMode, normalizeConfiguredPorts, normalizeContainerPorts, stopContainerPortEvent } from '../utils/containerPorts.js'
@@ -87,213 +83,6 @@ const NO_CONFIGURED_PORTS_LABEL = '\u6682\u672a\u914d\u7f6e\u8bbf\u95ee\u7aef\u5
 const DECLARED_PORTS_LABEL = '\u955c\u50cf\u58f0\u660e'
 const CONTAINER_LABEL = '\u5bb9\u5668'
 const MAX_VISIBLE_PORTS = 4
-const CONTAINER_UPDATE_TASK_STORAGE_KEY = 'docker_copilot_container_update_task'
-const CONTAINER_UPDATE_TASKS_KEY = `${CONTAINER_UPDATE_TASK_STORAGE_KEY}:active-by-name`
-const CONTAINER_BATCH_TASK_STORAGE_KEY = 'docker_copilot_container_batch_task'
-const CONTAINER_BATCH_SUBMISSION_STORAGE_KEY = `${CONTAINER_BATCH_TASK_STORAGE_KEY}:pending`
-
-function readSavedBatchSubmission() {
-  try {
-    const value = JSON.parse(globalThis.localStorage?.getItem(CONTAINER_BATCH_SUBMISSION_STORAGE_KEY) || 'null')
-    if (!value || !['start', 'stop', 'restart', 'update'].includes(value.action) ||
-      !Array.isArray(value.containerIDs) || value.containerIDs.length === 0) return null
-    return { ...value, uncertain: true, nonce: value.nonce || submissionNonce() }
-  } catch { return null }
-}
-
-function saveBatchSubmission(submission) {
-  try {
-    if (submission) {
-      const { action, containerIDs, deleteOldContainer, nonce } = submission
-      globalThis.localStorage?.setItem(CONTAINER_BATCH_SUBMISSION_STORAGE_KEY, JSON.stringify({ action, containerIDs, deleteOldContainer, nonce }))
-    } else {
-      globalThis.localStorage?.removeItem(CONTAINER_BATCH_SUBMISSION_STORAGE_KEY)
-    }
-  } catch {
-    // A pending batch is still held in memory when browser storage is unavailable.
-  }
-}
-
-function readSavedUpdateTasks() {
-  try {
-    const value = JSON.parse(globalThis.localStorage?.getItem(CONTAINER_UPDATE_TASKS_KEY) || '{}')
-    if (!value || typeof value !== 'object' || Array.isArray(value)) return {}
-    return Object.fromEntries(Object.entries(value).filter(([, entry]) => entry && typeof entry === 'object' && typeof entry.taskID === 'string').map(([key, entry]) => [key, { ...entry, key }]))
-  } catch { return {} }
-}
-
-function saveUpdateTasksByName(tasks) {
-  const active = Object.fromEntries(Object.entries(tasks).flatMap(([key, value]) =>
-    value?.taskID && !value.terminal ? [[key, { name: value.name, taskID: value.taskID, containerId: value.containerId, createdAt: value.createdAt }]] : []))
-  try {
-    if (Object.keys(active).length) globalThis.localStorage?.setItem(CONTAINER_UPDATE_TASKS_KEY, JSON.stringify(active))
-    else globalThis.localStorage?.removeItem(CONTAINER_UPDATE_TASKS_KEY)
-  } catch {
-    // The page keeps tracking active tasks in memory when browser storage is unavailable.
-  }
-}
-
-function submissionNonce() {
-  return globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random()}`
-}
-
-function terminalFailureMessage(task, { batch = false } = {}) {
-  const status = String(task?.status || '').toLowerCase()
-  const items = Array.isArray(task?.items) ? task.items : []
-  const failedItems = items.filter((item) => ['failed', 'interrupted'].includes(String(item?.status || '').toLowerCase()))
-  const failedCount = Math.max(Number(task?.failedCount) || 0, failedItems.length)
-  const isFailure = ['failed', 'interrupted'].includes(status) || (batch && failedCount > 0)
-  if (!isFailure) return null
-
-  const label = status === 'interrupted' ? '任务中断' : (batch && failedCount > 0 ? '批量操作部分失败' : '任务失败')
-  const details = failedItems
-    .slice(0, 5)
-    .map((item) => {
-      const name = item.name || item.id || item.containerID || '容器'
-      const reason = item.error || item.detailMsg || item.message
-      return reason ? `${name}：${reason}` : name
-    })
-  const summary = task?.error || task?.detailMsg || task?.message
-  return [label, summary, ...details].filter(Boolean).join('\n')
-}
-
-function updateTaskKey(name, containerId) {
-  const stableName = String(name || '').trim().replace(/^\/+/, '')
-  return stableName ? `name:${stableName}` : `id:${containerId}`
-}
-
-async function listActiveContainerUpdateTasks({ signal } = {}) {
-  const records = []
-  for (const status of ['queued', 'running']) {
-    for (let page = 1; ; page += 1) {
-      const response = await taskAPI.listTasks({ status, type: 'container-update', page, limit: 100 }, { signal })
-      const items = taskListPayload(response).map((record) => validateTaskRecord(record, response))
-      records.push(...items.filter((record) => record.status === status && record.type === 'container-update'))
-      if (!response.data?.data?.hasMore && items.length < 100) break
-      if (!response.data?.data?.hasMore) break
-    }
-  }
-  records.sort((a, b) => Date.parse(b.createdAt || '') - Date.parse(a.createdAt || ''))
-  return records
-}
-
-async function findActiveBatchTask(submission, signal) {
-  const type = `container-batch-${submission.action}`
-  const expectedIDs = [...new Set(submission.containerIDs.map(String))].sort()
-  for (const status of ['queued', 'running']) {
-    for (let page = 1; ; page += 1) {
-      const response = await taskAPI.listTasks({ status, type, page, limit: 100 }, { signal })
-      const items = taskListPayload(response).map((record) => validateTaskRecord(record, response))
-      const match = items.find((record) => {
-        if (record.status !== status || record.type !== type) return false
-        const actualIDs = [...new Set([
-          ...(Array.isArray(record.containerIDs) ? record.containerIDs : []),
-          ...(Array.isArray(record.items) ? record.items.map((item) => item?.id).filter(Boolean) : []),
-        ].map(String))].sort()
-        return actualIDs.length === expectedIDs.length && actualIDs.every((id, index) => id === expectedIDs[index])
-      })
-      if (match) return match
-      if (!response.data?.data?.hasMore || items.length < 100) break
-    }
-  }
-  return null
-}
-
-function ContainerUpdateTaskTracker({ entry, onAccepted, onSubmissionError, onTaskUpdate, onTerminal }) {
-  const tracker = useTask({
-    taskId: entry.taskID || undefined,
-    containerName: entry.name || undefined,
-    storageKey: CONTAINER_UPDATE_TASK_STORAGE_KEY,
-    invalidateKeys: [['containers']],
-    onTerminal: (task) => onTerminal?.(entry.key, task),
-  })
-  const handledSubmissions = React.useRef(new Set())
-  const callbacks = React.useRef({ onAccepted, onSubmissionError, onTaskUpdate })
-  callbacks.current = { onAccepted, onSubmissionError, onTaskUpdate }
-
-  React.useEffect(() => {
-    if (!entry.submission || handledSubmissions.current.has(entry.submission.nonce)) return
-    handledSubmissions.current.add(entry.submission.nonce)
-    if (entry.submission.existingTaskID) {
-      tracker.track(entry.submission.existingTaskID)
-      callbacks.current.onAccepted?.(entry.key, entry.submission.existingTaskID)
-      return
-    }
-    tracker.submit(entry.submission.request).then(({ taskID }) => {
-      callbacks.current.onAccepted?.(entry.key, taskID)
-    }).catch((error) => {
-      callbacks.current.onSubmissionError?.(entry.key, entry.containerId, error)
-    })
-  }, [entry.key, entry.submission?.nonce, tracker.submit, tracker.track])
-
-  React.useEffect(() => {
-    if (tracker.task) callbacks.current.onTaskUpdate?.(entry.key, entry, tracker.task)
-  }, [entry.key, entry.containerId, tracker.task])
-
-  return null
-}
-
-function ContainerBatchTaskTracker({ submission, onAccepted, onSubmissionError, onTaskUpdate, onTerminal }) {
-  const tracker = useTask({
-    storageKey: CONTAINER_BATCH_TASK_STORAGE_KEY,
-    invalidateKeys: [['containers'], ['tasks']],
-    onTerminal,
-  })
-  const submitted = React.useRef(new Set())
-  const callbacks = React.useRef({ onAccepted, onSubmissionError, onTaskUpdate })
-  callbacks.current = { onAccepted, onSubmissionError, onTaskUpdate }
-
-  React.useEffect(() => {
-    if (!submission || submission.uncertain || submitted.current.has(submission.nonce)) return
-    submitted.current.add(submission.nonce)
-    tracker.submit(() => containerAPI.batchContainers(submission.action, submission.containerIDs, submission.deleteOldContainer))
-      .then(({ taskID }) => callbacks.current.onAccepted?.(taskID))
-      .catch((error) => callbacks.current.onSubmissionError?.(error))
-  }, [submission?.nonce, tracker.submit])
-
-  React.useEffect(() => {
-    if (!submission?.uncertain || tracker.taskId) return
-    let active = true
-    let timer = null
-    let attempt = 0
-    let controller = null
-    const discover = async () => {
-      if (!active) return
-      controller = new AbortController()
-      try {
-        const task = await findActiveBatchTask(submission, controller.signal)
-        if (!active) return
-        if (task) {
-          const taskID = task.taskID || task.taskId
-          if (taskID) {
-            tracker.track(taskID)
-            callbacks.current.onAccepted?.(taskID)
-            return
-          }
-        }
-      } catch {
-        // A query outage does not determine whether the original POST committed.
-      }
-      if (active) {
-        const delay = Math.min(1000 * (2 ** attempt), 30000)
-        attempt += 1
-        timer = setTimeout(discover, delay)
-      }
-    }
-    void discover()
-    return () => {
-      active = false
-      controller?.abort()
-      if (timer !== null) clearTimeout(timer)
-    }
-  }, [submission?.nonce, submission?.uncertain, tracker.taskId, tracker.track])
-
-  React.useEffect(() => {
-    if (tracker.task) callbacks.current.onTaskUpdate?.(tracker.task)
-  }, [tracker.task])
-
-  return null
-}
 
 function PortMappingTile({ port }) {
   const targetUrl = getContainerPortUrl(port)
@@ -462,10 +251,7 @@ export function Containers() {
   const [isBatchMode, setIsBatchMode] = useState(false)
   // 添加操作状态跟踪
   const [containerActions, setContainerActions] = useState({}) // 跟踪每个容器的操作状态
-  const [taskTrackers, setTaskTrackers] = useState(readSavedUpdateTasks)
-  const [batchSubmission, setBatchSubmission] = useState(readSavedBatchSubmission)
-  const [batchTask, setBatchTask] = useState(null)
-  const recoveryStarted = React.useRef(false)
+  const [updateTasks, setUpdateTasks] = useState({}) // 跟踪更新任务
   // 添加筛选状态
   const [filterStatus, setFilterStatus] = useState(null) // null 表示显示全部
 
@@ -500,38 +286,45 @@ export function Containers() {
     refetchInterval: 10000, // 每10秒自动刷新一次
   })
 
-  const containersRef = React.useRef(containers)
-  containersRef.current = containers
-
-  React.useEffect(() => {
-    if (isLoading || recoveryStarted.current) return
-    recoveryStarted.current = true
-    const cancelDiscovery = startTaskRecoveryDiscovery(listActiveContainerUpdateTasks, () => containersRef.current, (records, latestContainers) => {
-      setTaskTrackers((previous) => {
-        const next = { ...previous }
-        for (const task of records) {
-          const name = String(task.name || '').replace(/^\/+/, '')
-          const container = latestContainers.find((candidate) => candidate.name === name || (task.containerIDs || []).includes(candidate.id))
-          const key = updateTaskKey(name, task.oldContainerID || container?.id || task.taskID)
-          const existing = next[key]
-          if (existing?.submission || existing?.taskID === (task.taskID || task.taskId) || (existing?.taskID && !existing.terminal)) continue
-          next[key] = {
-            key, name, containerId: container?.id || task.oldContainerID || '',
-            taskID: task.taskID || task.taskId, createdAt: task.createdAt, recovered: true,
-          }
-        }
-        saveUpdateTasksByName(next)
-        return next
-      })
-    })
-    return () => {
-      cancelDiscovery()
-      recoveryStarted.current = false
-    }
-  }, [isLoading])
-
   // 获取自定义图标配置
-  const { data: customIcons = {} } = useImageIcons()
+  const { data: customIcons = {} } = useQuery({
+    queryKey: ['customIcons'],
+    queryFn: async () => {
+      console.log('[Debug] 开始从服务器获取图标配置...')
+      try {
+        const response = await imageAPI.getIcons()
+        console.log('[Debug] 图标API响应:', response.data)
+        if (response.data.code === 200 || response.data.code === 0) {
+          const icons = response.data.data || {}
+          console.log('[Debug] 获取到的图标数据:', icons)
+          // update localStorage
+          localStorage.setItem('docker_copilot_image_logos', JSON.stringify(icons))
+          return icons
+        }
+      } catch (err) {
+        console.error('[Debug] 获取图标失败:', err)
+      }
+      return {}
+    },
+    // 初始数据尝试从localStorage获取，避免闪烁
+    initialData: () => {
+      const saved = localStorage.getItem('docker_copilot_image_logos')
+      if (saved) {
+        try {
+          const parsed = JSON.parse(saved)
+          // 只有当有实际数据时才作为初始数据
+          if (Object.keys(parsed).length > 0) {
+            return parsed
+          }
+        } catch (e) {
+          console.error('解析本地图标配置失败:', e)
+        }
+      }
+      return undefined
+    },
+    // 即使有初始数据，也立即在后台刷新
+    refetchOnMount: true,
+  })
 
   const handleContainerAction = async (containerId, action) => {
     try {
@@ -613,96 +406,127 @@ export function Containers() {
 
   // 批量操作处理函数
   const handleBatchAction = async (action) => {
-    if (!selectedContainers.length || batchSubmission || (batchTask && ['queued', 'running'].includes(batchTask.status))) return
-    const request = {
-      nonce: submissionNonce(),
-      action,
-      containerIDs: [...selectedContainers],
-      // Preserve the established bulk-update behavior explicitly.
-      ...(action === 'update' ? { deleteOldContainer: true } : {}),
-    }
-    saveBatchSubmission(request)
-    setBatchSubmission(request)
-    setContainerActions((previous) => {
-      const next = { ...previous }
-      for (const id of request.containerIDs) {
-        next[id] = { action: 'batch', loading: true, progress: '正在提交批量操作', percentage: 0 }
-      }
-      return next
-    })
-  }
-
-  const handleBatchAccepted = () => {
-    saveBatchSubmission(null)
-    setSelectedContainers([])
-    setIsBatchMode(false)
-  }
-
-  const handleBatchSubmissionError = (error) => {
-    const status = Number(error?.status)
-    const definitelyRejected = status >= 400 && status < 500 && status !== 408 && status !== 429
-    if (definitelyRejected) {
-      const ids = batchSubmission?.containerIDs || []
-      setContainerActions((previous) => {
-        const next = { ...previous }
-        for (const id of ids) delete next[id]
-        return next
+    try {
+      // 为所有选中的容器设置加载状态
+      selectedContainers.forEach(containerId => {
+        setContainerActions(prev => ({
+          ...prev,
+          [containerId]: { action, loading: true }
+        }))
       })
-      saveBatchSubmission(null)
-      setBatchSubmission(null)
+
+      // 立即更新本地状态提供即时反馈
+      if (action === 'start' || action === 'stop' || action === 'restart') {
+        queryClient.setQueryData(['containers'], (oldData) => {
+          if (!oldData) return oldData
+
+          return oldData.map(container => {
+            if (selectedContainers.includes(container.id)) {
+              let newStatus = container.status
+              switch (action) {
+                case 'start':
+                  newStatus = 'running'
+                  break
+                case 'stop':
+                  newStatus = 'stopped'
+                  break
+                case 'restart':
+                  newStatus = 'running'
+                  break
+                default:
+                  break
+              }
+              return { ...container, status: newStatus }
+            }
+            return container
+          })
+        })
+      }
+
+      // 对每个选中的容器执行操作
+      for (const containerId of selectedContainers) {
+        try {
+          const container = containers.find(c => c.id === containerId)
+
+          switch (action) {
+            case 'start':
+              await containerAPI.startContainer(containerId)
+              break
+            case 'stop':
+              await containerAPI.stopContainer(containerId)
+              break
+            case 'restart':
+              await containerAPI.restartContainer(containerId)
+              break
+            case 'update':
+              if (container) {
+                const response = await containerAPI.updateContainer(
+                  containerId,
+                  container.name,
+                  container.usingImage,
+                  true
+                )
+
+                if (response.data.code === 200 || response.data.code === 0) {
+                  const taskID = response.data.data?.taskID
+                  if (taskID) {
+                    // 保存任务ID并开始轮询进度
+                    setUpdateTasks(prev => ({
+                      ...prev,
+                      [containerId]: taskID
+                    }))
+                    // 调用轮询进度函数
+                    pollProgress(containerId, taskID)
+                  }
+                }
+              }
+              break
+            default:
+              break
+          }
+        } finally {
+          // 对于非更新操作，立即清除操作状态
+          if (action !== 'update') {
+            setContainerActions(prev => {
+              const newState = { ...prev }
+              delete newState[containerId]
+              return newState
+            })
+          }
+        }
+      }
+
+      // 如果不是更新操作，延迟刷新以获取最新数据
+      if (action !== 'update') {
+        setTimeout(() => {
+          refetch()
+        }, 1500)
+      }
+
+      // 清除选中状态
+      setSelectedContainers([])
+      setIsBatchMode(false)
+    } catch (error) {
+      console.error('批量操作失败:', error)
+      // 清除所有操作状态
+      selectedContainers.forEach(containerId => {
+        setContainerActions(prev => {
+          const newState = { ...prev }
+          delete newState[containerId]
+          return newState
+        })
+      })
+
+      // 使用自定义弹窗显示错误信息
       setConfirmModal({
         isOpen: true,
         title: '操作失败',
         message: '批量操作失败: ' + (error.response?.data?.msg || error.message || '未知错误'),
         onConfirm: () => setConfirmModal({ isOpen: false }),
         onCancel: null,
-        type: 'danger',
-      })
-      return
+        type: 'danger'
+      });
     }
-
-    setBatchSubmission((previous) => previous ? { ...previous, uncertain: true } : previous)
-    setContainerActions((previous) => {
-      const next = { ...previous }
-      for (const id of batchSubmission?.containerIDs || []) {
-        next[id] = { action: 'batch', loading: true, progress: '提交结果待确认', percentage: 0 }
-      }
-      return next
-    })
-  }
-
-  const handleBatchTaskUpdate = (task) => {
-    setBatchTask(task)
-    const items = Array.isArray(task.items) ? task.items : []
-    setContainerActions((previous) => {
-      const next = { ...previous }
-      for (const item of items) {
-        const ids = [item.id, item.oldContainerID, item.newContainerID].filter(Boolean)
-        if (item.status === 'queued' || item.status === 'running') {
-          for (const id of ids) next[id] = { action: 'batch', loading: true, progress: item.stage || task.message || '批量任务执行中', percentage: task.percentage || 0 }
-        } else {
-          for (const id of ids) delete next[id]
-        }
-      }
-      return next
-    })
-  }
-
-  const handleBatchTerminal = (task) => {
-    handleBatchTaskUpdate(task)
-    setBatchTask(task)
-    const failure = terminalFailureMessage(task, { batch: true })
-    if (failure) {
-      setConfirmModal({
-        isOpen: true,
-        title: '批量操作未完全成功',
-        message: failure,
-        onConfirm: () => setConfirmModal({ isOpen: false }),
-        onCancel: null,
-        type: 'danger',
-      })
-    }
-    void refetch()
   }
 
   const handleRenameContainer = async (containerId, newName) => {
@@ -718,133 +542,230 @@ export function Containers() {
     }
   }
 
-  const handleUpdateContainer = (containerId, existingTaskID = null, requestedImage = null) => {
-    const container = containers.find(c => c.id === containerId)
-    if (!container) {
-      setConfirmModal({
-        isOpen: true,
-        title: '无法更新容器',
-        message: '容器当前不在列表中，请刷新列表后重试。',
-        onConfirm: () => setConfirmModal({ isOpen: false }),
-        onCancel: null,
-        type: 'danger',
-      })
-      return
-    }
-
-    const key = updateTaskKey(container.name, container.id)
-    setTaskTrackers((previous) => {
-      const next = {
-        ...previous,
-        [key]: {
-          key, name: container.name, containerId,
-          taskID: existingTaskID || '',
-          submission: existingTaskID ? null : {
-            nonce: submissionNonce(),
-            request: () => containerAPI.updateContainer(
-              containerId,
-              container.name,
-              requestedImage ?? container.usingImage,
-              true,
-            ),
-          },
-        },
+  const handleUpdateContainer = async (containerId, existingTaskID = null) => {
+    try {
+      const container = containers.find(c => c.id === containerId)
+      if (!container) {
+        console.error('容器未找到')
+        return
       }
-      saveUpdateTasksByName(next)
-      return next
-    })
-    setContainerActions(prev => ({
-      ...prev,
-      [containerId]: { action: 'update', loading: true, progress: '正在提交更新请求', percentage: 0 },
-    }))
-  }
 
-  const handleTaskAccepted = (key, taskID) => {
-    setTaskTrackers((previous) => {
-      const entry = previous[key]
-      if (!entry) return previous
-      const next = { ...previous, [key]: { ...entry, taskID, submission: null } }
-      saveUpdateTasksByName(next)
-      return next
-    })
-  }
+      console.log(`开始更新容器 "${container.name}"，使用镜像: ${container.usingImage}`)
 
-  const handleTaskSubmissionError = (key, containerId, error) => {
-    setTaskTrackers((previous) => {
-      const entry = previous[key]
-      if (!entry) return previous
-      const next = { ...previous, [key]: { ...entry, submission: null } }
-      saveUpdateTasksByName(next)
-      return next
-    })
-    const status = Number(error?.status)
-    const definitelyRejected = status >= 400 && status < 500 && status !== 408 && status !== 429
-    setContainerActions(prev => {
-      const next = { ...prev }
-      if (definitelyRejected) delete next[containerId]
-      else next[containerId] = { action: 'update', loading: true, progress: '提交结果待确认', percentage: 0 }
-      return next
-    })
-    if (definitelyRejected) {
-      setConfirmModal({
-        isOpen: true,
-        title: '更新失败',
-        message: error.response?.data?.msg || error.message || '更新失败',
-        onConfirm: () => setConfirmModal({ isOpen: false }),
-        onCancel: null,
-        type: 'danger',
+      setContainerActions(prev => ({
+        ...prev,
+        [containerId]: { action: 'update', loading: true, progress: '正在准备更新...', percentage: 0 }
+      }))
+
+      if (existingTaskID) {
+        console.log('复用已有更新任务, taskID:', existingTaskID)
+        setUpdateTasks(prev => ({
+          ...prev,
+          [containerId]: existingTaskID
+        }))
+        pollProgress(containerId, existingTaskID)
+        return
+      }
+
+      // 注意参数顺序: id, containerName, imageNameAndTag, delOldContainer
+      const response = await containerAPI.updateContainer(
+        containerId,
+        container.name,
+        container.usingImage,
+        true
+      )
+
+      console.log('更新容器响应:', response.data)
+
+      if (response.data.code === 200 || response.data.code === 0) {
+        const taskID = response.data.data?.taskID
+
+        if (taskID) {
+          console.log('开始轮询进度, taskID:', taskID)
+          // 保存任务ID并开始轮询进度
+          setUpdateTasks(prev => ({
+            ...prev,
+            [containerId]: taskID
+          }))
+
+          pollProgress(containerId, taskID)
+        } else {
+          // 如果没有返回taskID,说明更新可能立即完成
+          setContainerActions(prev => {
+            const newState = { ...prev }
+            delete newState[containerId]
+            return newState
+          })
+          await refetch()
+
+        }
+      } else {
+        throw new Error(response.data.msg || '更新失败')
+      }
+    } catch (error) {
+      console.error('更新容器失败:', error)
+      setContainerActions(prev => {
+        const newState = { ...prev }
+        delete newState[containerId]
+        return newState
       })
+
+      // 增加超时错误的处理
+      if (error.code === 'ECONNABORTED' || error.message.includes('timeout')) {
+        console.error(`更新操作已提交，但连接超时。请稍后手动刷新页面查看操作结果`)
+        // 即使超时也触发轮询，因为操作可能仍在进行中
+        // 这里我们不知道taskID，所以无法启动轮询，只能提示用户稍后查看
+      } else {
+        // 针对名称冲突提供特定的解决方案
+        let errorMessage = error.response?.data?.msg || error.message;
+        if (errorMessage.includes('重命名') || errorMessage.includes('name conflict') || errorMessage.includes('名称冲突')) {
+          errorMessage += '\n\n检测到容器名称冲突问题，建议解决方案：\n' +
+            '1. 手动删除或重命名冲突的容器\n' +
+            '2. 使用不同的容器名称进行更新\n' +
+            '3. 先停止并重命名当前容器，再进行更新操作';
+        }
+
+        // 使用自定义弹窗显示错误信息
+        setConfirmModal({
+          isOpen: true,
+          title: '更新失败',
+          message: errorMessage,
+          onConfirm: () => setConfirmModal({ isOpen: false }),
+          onCancel: null,
+          type: 'danger'
+        });
+      }
     }
   }
 
-  const handleTaskUpdate = (key, entry, task) => {
-    if (task.status !== 'queued' && task.status !== 'running') return
-    const taskID = task.taskID || task.taskId
-    if (taskID && taskID !== entry.taskID) {
-      setTaskTrackers((previous) => {
-        const current = previous[key]
-        if (!current || current.taskID === taskID) return previous
-        const next = { ...previous, [key]: { ...current, taskID, createdAt: task.createdAt || current.createdAt, submission: null } }
-        saveUpdateTasksByName(next)
-        return next
-      })
-    }
-    const ids = new Set([entry.containerId, task.oldContainerID, task.newContainerID, ...(task.containerIDs || [])].filter(Boolean))
-    const message = task.message || task.detailMsg || '更新任务正在执行'
-    const percentage = Math.max(0, Math.min(100, Number(task.percentage) || 0))
-    setContainerActions((previous) => {
-      const next = { ...previous }
-      for (const id of ids) next[id] = { action: 'update', loading: true, progress: message, percentage }
-      return next
-    })
-  }
+  // 轮询进度
+  const pollProgress = async (containerId, taskID) => {
+    const maxAttempts = 60 // 最多轮询60次 (2分钟)
+    let attempts = 0
+    let pollTimer = null
 
-  const handleTaskTerminal = (key, task) => {
-    const ids = new Set([taskTrackers[key]?.containerId, task.oldContainerID, task.newContainerID, ...(task.containerIDs || [])].filter(Boolean))
-    setContainerActions(prev => {
-      const next = { ...prev }
-      for (const id of ids) delete next[id]
-      return next
-    })
-    setTaskTrackers((previous) => {
-      const entry = previous[key]
-      if (!entry) return previous
-      const next = { ...previous, [key]: { ...entry, terminal: true, submission: null } }
-      saveUpdateTasksByName(next)
-      return next
-    })
-    const failure = terminalFailureMessage(task)
-    if (failure) {
-      setConfirmModal({
-        isOpen: true,
-        title: '容器更新未成功',
-        message: failure,
-        onConfirm: () => setConfirmModal({ isOpen: false }),
-        onCancel: null,
-        type: 'danger',
+    const clearPollState = () => {
+      if (pollTimer) {
+        clearTimeout(pollTimer)
+        pollTimer = null
+      }
+      setContainerActions(prev => {
+        const newState = { ...prev }
+        delete newState[containerId]
+        return newState
+      })
+      setUpdateTasks(prev => {
+        const newState = { ...prev }
+        delete newState[containerId]
+        return newState
       })
     }
-    void refetch()
+
+    const poll = async () => {
+      try {
+        attempts++
+        const response = await progressAPI.getProgress(taskID)
+        console.log(`进度查询[${attempts}/${maxAttempts}]:`, response.data)
+
+        const data = response.data
+
+        // 提取进度信息
+        let progressMsg = '处理中...'
+        let percentage = 0
+
+        if (data.data?.progress) {
+          progressMsg = data.data.progress
+        } else if (data.data?.message) {
+          progressMsg = data.data.message
+        } else if (data.msg) {
+          progressMsg = data.msg
+        }
+
+        // 提取百分比
+        if (data.data?.percentage !== undefined) {
+          percentage = Math.min(100, Math.max(0, parseFloat(data.data.percentage)))
+        } else if (data.data?.percent !== undefined) {
+          percentage = Math.min(100, Math.max(0, parseFloat(data.data.percent)))
+        } else {
+          // 尝试从进度消息中提取百分比
+          const percentMatch = progressMsg.match(/(\d+(?:\.\d+)?)\s*%/)
+          if (percentMatch) {
+            percentage = Math.min(100, Math.max(0, parseFloat(percentMatch[1])))
+          } else {
+            // 根据轮询次数估算进度
+            percentage = Math.min(95, (attempts / maxAttempts) * 100)
+          }
+        }
+
+        // 检查是否完成 - 兼容多种响应格式
+        const status = data.data?.status || data.status
+        const isDone = data.data?.isDone === true ||
+          status === 'completed' ||
+          status === 'success' ||
+          status === 'done' ||
+          status === 'finish' ||
+          status === 'finished'
+
+        // 检查是否失败
+        const isFailed = status === 'failed' ||
+          status === 'error' ||
+          progressMsg.includes('失败') ||
+          progressMsg.includes('错误') ||
+          data.code === 500 ||
+          data.code === 400
+
+        const isCompleted = isDone && !isFailed
+
+        if (isCompleted) {
+          // 任务完成 - 立即停止轮询
+          console.log('容器更新完成，停止轮询')
+          clearPollState()
+          await refetch()
+          console.log('✅ 容器更新完成!')
+          return // 确保不再继续执行
+        }
+
+        if (isFailed) {
+          // 任务失败 - 立即停止轮询
+          console.log('容器更新失败，停止轮询')
+          clearPollState()
+          // 添加更详细的错误信息
+          const errorMsg = data.data?.error || data.data?.message || data.msg || '更新失败'
+          console.error(`❌ 更新失败: ${errorMsg}`)
+
+          return // 确保不再继续执行
+        }
+
+        // 更新容器操作状态，显示进度
+        setContainerActions(prev => ({
+          ...prev,
+          [containerId]: {
+            action: 'update',
+            loading: true,
+            progress: progressMsg,
+            percentage: percentage
+          }
+        }))
+
+        // 继续轮询
+        if (attempts < maxAttempts) {
+          pollTimer = setTimeout(poll, 2000) // 2秒后再次查询
+        } else {
+          clearPollState()
+          console.error('⏱️ 更新超时，请检查容器状态')
+
+        }
+      } catch (error) {
+        console.error('查询进度失败:', error)
+        clearPollState()
+        console.error(`❌ 更新失败: ${error.response?.data?.msg || error.message}`)
+        // 显示网络错误或其他异常情况的友好提示
+
+      }
+    }
+
+    // 开始轮询
+    poll()
   }
 
   // 容器选择处理函数
@@ -1014,7 +935,7 @@ export function Containers() {
             </button>
             <button
               className={`btn-primary flex items-center justify-center px-3 sm:px-4 py-2 gap-1 sm:gap-2 ${selectedContainers.length === 0 ? 'opacity-50 cursor-not-allowed' : ''}`}
-              disabled={selectedContainers.length === 0 || Boolean(batchSubmission) || Boolean(batchTask && ['queued', 'running'].includes(batchTask.status))}
+              disabled={selectedContainers.length === 0}
               onClick={() => handleBatchAction('start')}
               title="启动"
             >
@@ -1023,7 +944,7 @@ export function Containers() {
             </button>
             <button
               className={`btn-secondary flex items-center justify-center px-3 sm:px-4 py-2 gap-1 sm:gap-2 ${selectedContainers.length === 0 ? 'opacity-50 cursor-not-allowed' : ''}`}
-              disabled={selectedContainers.length === 0 || Boolean(batchSubmission) || Boolean(batchTask && ['queued', 'running'].includes(batchTask.status))}
+              disabled={selectedContainers.length === 0}
               onClick={() => handleBatchAction('stop')}
               title="停止"
             >
@@ -1032,7 +953,7 @@ export function Containers() {
             </button>
             <button
               className={`btn-secondary flex items-center justify-center px-3 sm:px-4 py-2 gap-1 sm:gap-2 ${selectedContainers.length === 0 ? 'opacity-50 cursor-not-allowed' : ''}`}
-              disabled={selectedContainers.length === 0 || Boolean(batchSubmission) || Boolean(batchTask && ['queued', 'running'].includes(batchTask.status))}
+              disabled={selectedContainers.length === 0}
               onClick={() => handleBatchAction('restart')}
               title="重启"
             >
@@ -1041,7 +962,7 @@ export function Containers() {
             </button>
             <button
               className={`btn-secondary flex items-center justify-center px-3 sm:px-4 py-2 gap-1 sm:gap-2 ${selectedContainers.length === 0 ? 'opacity-50 cursor-not-allowed' : ''}`}
-              disabled={selectedContainers.length === 0 || Boolean(batchSubmission) || Boolean(batchTask && ['queued', 'running'].includes(batchTask.status))}
+              disabled={selectedContainers.length === 0}
               onClick={() => handleBatchAction('update')}
               title="更新"
             >
@@ -1061,28 +982,6 @@ export function Containers() {
           </div>
         )}
       </div>
-
-      {Object.values(taskTrackers).map((entry) => (
-        <ContainerUpdateTaskTracker
-          key={entry.key}
-          entry={entry}
-          onAccepted={handleTaskAccepted}
-          onSubmissionError={handleTaskSubmissionError}
-          onTaskUpdate={handleTaskUpdate}
-          onTerminal={handleTaskTerminal}
-        />
-      ))}
-      <ContainerBatchTaskTracker
-        submission={batchSubmission}
-        onAccepted={(taskID) => {
-          setBatchTask({ taskID, status: 'queued', items: [] })
-          setBatchSubmission(null)
-          handleBatchAccepted()
-        }}
-        onSubmissionError={handleBatchSubmissionError}
-        onTaskUpdate={handleBatchTaskUpdate}
-        onTerminal={handleBatchTerminal}
-      />
 
       {/* 统计信息 */}
       <div className="px-2 sm:px-6 py-4">
@@ -1259,7 +1158,7 @@ export function Containers() {
                       )}
                     >
                       {/* 背景进度条 */}
-                      {containerActions[container.id]?.loading && ['update', 'batch'].includes(containerActions[container.id]?.action) && (
+                      {containerActions[container.id]?.loading && containerActions[container.id]?.action === 'update' && (
                         <div className="absolute inset-0 pointer-events-none rounded-2xl overflow-hidden">
                           <div
                             className="absolute top-0 left-0 bottom-0 bg-gradient-to-r from-primary-500/30 via-primary-400/30 to-primary-500/30 transition-all duration-500 ease-out"
@@ -1295,7 +1194,26 @@ export function Containers() {
                         {/* 图标 */}
                         <div className="flex-shrink-0">
                           {(() => {
-                            const iconUrl = container.iconUrl || getImageLogo(container.usingImage, customIcons);
+                            let iconUrl = container.iconUrl;
+                            if (!iconUrl && container.usingImage) {
+                              const builtInLogo = getImageLogo(container.usingImage);
+                              if (builtInLogo) {
+                                iconUrl = builtInLogo;
+                              } else {
+                                // 如果没有内置logo，则尝试从用户自定义中查找
+                                // const imageLogos = JSON.parse(localStorage.getItem('docker_copilot_image_logos') || '{}');
+                                // 使用 React Query 获取的数据
+                                const imageLogos = customIcons;
+
+                                for (const [imageName, logoUrl] of Object.entries(imageLogos)) {
+                                  if (container.usingImage.startsWith(imageName) ||
+                                    container.usingImage.includes(`${imageName}:`)) {
+                                    iconUrl = logoUrl;
+                                    break;
+                                  }
+                                }
+                              }
+                            }
 
                             if (iconUrl) {
                               return (
@@ -1386,7 +1304,6 @@ export function Containers() {
                                 {containerActions[container.id].action === 'stop' && '停止中'}
                                 {containerActions[container.id].action === 'restart' && '重启中'}
                                 {containerActions[container.id].action === 'update' && `更新中${containerActions[container.id].percentage ? ` ${Math.round(containerActions[container.id].percentage)}%` : ''}`}
-                                {containerActions[container.id].action === 'batch' && '批量操作中'}
                               </span>
                             </div>
                           ) : (
@@ -1461,7 +1378,7 @@ export function Containers() {
           onClose={() => setPortConfigContainer(null)}
           onSaved={() => {
             setPortConfigContainer(null)
-            queryClient.invalidateQueries({ queryKey: ['containers'] })
+            queryClient.invalidateQueries(['containers'])
           }}
         />
       )}
@@ -1585,7 +1502,7 @@ function ConfiguredPortsModal({ container, onClose, onSaved }) {
                 {existingPortCount > 0 ? '\u7f16\u8f91 host \u7f51\u7edc\u7aef\u53e3' : '\u914d\u7f6e host \u7f51\u7edc\u7aef\u53e3'}
               </h3>
               <p className="mt-1 text-xs text-gray-500 dark:text-gray-400">
-                {container.name} · {'Docker \u65e0\u6cd5\u81ea\u52a8\u786e\u8ba4\u5b9e\u9645\u76d1\u542c\u7aef\u53e3'}
+                {container.name} \u00b7 {'Docker \u65e0\u6cd5\u81ea\u52a8\u786e\u8ba4\u5b9e\u9645\u76d1\u542c\u7aef\u53e3'}
               </p>
             </div>
             <button
@@ -1704,7 +1621,17 @@ function ContainerDetailModal({ container, onClose, onRename, onUpdate, onAction
   const [isUploadingIcon, setIsUploadingIcon] = useState(false)
 
   // 获取自定义图标配置
-  const { data: customIcons = {} } = useImageIcons()
+  const { data: customIcons = {} } = useQuery({
+    queryKey: ['customIcons'],
+    queryFn: async () => {
+      const response = await imageAPI.getIcons()
+      if (response.data.code === 200 || response.data.code === 0) {
+        return response.data.data || {}
+      }
+      return {}
+    },
+    initialData: () => JSON.parse(localStorage.getItem('docker_copilot_image_logos') || '{}'),
+  })
 
   // 当容器切换时，更新表单字段的值
   React.useEffect(() => {
@@ -1721,7 +1648,7 @@ function ContainerDetailModal({ container, onClose, onRename, onUpdate, onAction
         const updatedContainer = containers.find(c => c.id === container.id);
         if (updatedContainer) {
           // 检查是否有镜像图标
-          const imageLogos = customIcons;
+          const imageLogos = JSON.parse(localStorage.getItem('docker_copilot_image_logos') || '{}');
 
           // 如果容器没有自定义图标，则查找镜像图标
           if (!updatedContainer.iconUrl) {
@@ -1755,12 +1682,13 @@ function ContainerDetailModal({ container, onClose, onRename, onUpdate, onAction
     }, 3000); // 每3秒获取一次最新状态
 
     return () => clearInterval(interval);
-  }, [container.id, queryClient, customIcons]);
+  }, [container.id, queryClient]);
 
   const handleIconUpload = async (event) => {
     const file = event.target.files[0]
     if (!file) return
 
+    // 限制文件大小 (例如 2MB)
     if (file.size > 2 * 1024 * 1024) {
       setConfirmModal({
         isOpen: true,
@@ -1773,21 +1701,44 @@ function ContainerDetailModal({ container, onClose, onRename, onUpdate, onAction
       event.target.value = '' // 重置 input
       return
     }
+
     try {
       setIsUploadingIcon(true)
       // 使用容器当前的镜像名作为 Key
       // 如果有自定义镜像名配置(容器更新时可能改变)，优先使用新的
       const targetImageName = imageNameAndTag || currentContainer.usingImage
 
-      const { url: newPath } = await uploadImageIcon({
-        file,
-        imageName: targetImageName,
-        containerName: currentContainer.name,
-        queryClient,
-      })
-      setCurrentContainer(prev => ({ ...prev, iconUrl: newPath }))
-      await queryClient.invalidateQueries({ queryKey: ['containers'] })
-      console.log('✅ 图标上传成功并已应用')
+      const response = await imageAPI.uploadIcon(file, targetImageName, currentContainer.name)
+
+      if (response.data.code === 200 || response.data.code === 0) {
+        // 上传成功，更新 localStorage
+        const filename = response.data.data // 后端返回的文件名
+        if (filename) {
+          const newPath = `/src/config/image/${filename}`
+          const imageLogos = JSON.parse(localStorage.getItem('docker_copilot_image_logos') || '{}')
+
+          // 更新映射: 镜像名 -> 新路径
+          imageLogos[targetImageName] = newPath
+          localStorage.setItem('docker_copilot_image_logos', JSON.stringify(imageLogos))
+
+          // 强制更新当前容器视图
+          setCurrentContainer(prev => ({
+            ...prev,
+            iconUrl: newPath
+          }))
+
+          // 触发全局事件以便其他组件（如列表）更新
+          window.dispatchEvent(new Event('storage'))
+
+          // 无效化查询以刷新列表和图标
+          await queryClient.invalidateQueries(['containers'])
+          await queryClient.invalidateQueries(['customIcons'])
+
+          console.log('✅ 图标上传成功并已应用')
+        }
+      } else {
+        throw new Error(response.data.msg || '上传失败')
+      }
     } catch (error) {
       console.error('图标上传失败:', error)
       setConfirmModal({
@@ -1865,11 +1816,50 @@ function ContainerDetailModal({ container, onClose, onRename, onUpdate, onAction
         console.log(`原镜像: ${currentContainer.usingImage}`)
         console.log(`新镜像: ${imageNameAndTag}`)
 
-        await onUpdate(container.id, null, imageNameAndTag)
-        onClose()
+        // 直接调用API更新容器
+        const response = await containerAPI.updateContainer(
+          container.id,
+          container.name,
+          imageNameAndTag,
+          true // 删除旧容器
+        )
+
+        console.log('更新容器响应:', response.data)
+
+        if (response.data.code === 200 || response.data.code === 0) {
+          const taskID = response.data.data?.taskID
+
+          if (taskID) {
+            // 如果返回了taskID，我们需要触发进度轮询
+            console.log('更新任务已创建，taskID:', taskID)
+
+            // 关闭弹窗
+            onClose()
+
+            // 触发父组件中的进度轮询
+            onUpdate(container.id, taskID)
+
+            console.log('✅ 容器更新任务已启动，请在列表中查看进度')
+          } else {
+            // 没有taskID，更新完成
+            await queryClient.invalidateQueries(['containers'])
+            setImageNameAndTag(imageNameAndTag) // 更新本地状态
+            console.log('✅ 容器镜像更新完成')
+          }
+        } else {
+          throw new Error(response.data.msg || '更新失败')
+        }
+
         setIsUpdating(false)
       } catch (error) {
         console.error('更新容器镜像失败:', error)
+        // 增加超时错误的处理
+        if (error.code === 'ECONNABORTED' || error.message.includes('timeout')) {
+          console.error(`更新操作已提交，但连接超时。请稍后手动刷新页面查看操作结果`)
+          // 即使超时也关闭弹窗并触发轮询，因为操作可能仍在进行中
+          onClose()
+          onUpdate(container.id)
+        }
         setIsUpdating(false)
       }
     }
@@ -1897,7 +1887,29 @@ function ContainerDetailModal({ container, onClose, onRename, onUpdate, onAction
 
     // 如果容器没有自定义图标，则查找镜像图标
     if (!iconUrl && currentContainer.usingImage) {
-      iconUrl = getImageLogo(currentContainer.usingImage, customIcons)
+      // 优先使用内置logo配置（不依赖localStorage）
+      const builtInLogo = getImageLogo(currentContainer.usingImage);
+      if (builtInLogo) {
+        iconUrl = builtInLogo;
+      } else {
+        // 如果没有内置logo，则尝试从用户自定义中查找
+        // const imageLogos = JSON.parse(localStorage.getItem('docker_copilot_image_logos') || '{}');
+        const imageLogos = customIcons;
+        const imageFullName = currentContainer.usingImage;
+
+        if (imageLogos[imageFullName]) {
+          iconUrl = imageLogos[imageFullName];
+        } else {
+          // 降级匹配逻辑
+          const imageName = imageFullName.split(':')[0];
+          for (const [imageId, logoUrl] of Object.entries(imageLogos)) {
+            if (imageId === imageName || imageFullName.startsWith(imageId)) {
+              iconUrl = logoUrl;
+              break;
+            }
+          }
+        }
+      }
     }
 
     const IconContent = () => {

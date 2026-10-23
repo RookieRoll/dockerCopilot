@@ -1,27 +1,26 @@
 package main
 
 import (
-	"context"
 	"embed"
 	"flag"
 	"fmt"
+	"go/types"
 	"io/fs"
 	"log"
 	"net/http"
 	"os"
-	"time"
 
-	"github.com/google/uuid"
 	"github.com/onlyLTY/dockerCopilot/internal/config"
 	"github.com/onlyLTY/dockerCopilot/internal/handler"
-	"github.com/onlyLTY/dockerCopilot/internal/observability"
 	"github.com/onlyLTY/dockerCopilot/internal/svc"
 	"github.com/onlyLTY/dockerCopilot/internal/utiles"
 	"github.com/robfig/cron/v3"
+	"github.com/zeromicro/go-zero/core/conf"
 	"github.com/zeromicro/go-zero/core/logx"
-	"github.com/zeromicro/go-zero/core/proc"
 	"github.com/zeromicro/go-zero/rest"
 	"github.com/zeromicro/go-zero/rest/httpx"
+	"github.com/zeromicro/x/errors"
+	xhttp "github.com/zeromicro/x/http"
 )
 
 //go:embed front/*
@@ -29,38 +28,40 @@ var embeddedFront embed.FS
 
 var configFile = flag.String("f", "etc/dockerCopilot.yaml", "the config file")
 
+type UnauthorizedResponse struct {
+	Code int                    `json:"code"`
+	Msg  string                 `json:"msg"`
+	Data map[string]interface{} `json:"data"`
+}
+
 func main() {
+	logDir := "./logs"
+	ErrSetupLog := SetupLog(logDir)
+	if ErrSetupLog != nil {
+		logx.Errorf("failed to setup log: %v", ErrSetupLog)
+		os.Exit(1)
+	}
+	logx.SetLevel(logx.InfoLevel)
+
 	flag.Parse()
-	c, err := config.LoadFile(*configFile, true)
+	var c config.Config
+	err := conf.Load(*configFile, &c, conf.UseEnv())
 	if err != nil {
-		log.Printf("无法加载配置文件: %s", observability.RedactText(err.Error()))
-		log.Printf("请确认secretKey设置正确，要求非纯数字且大于八位")
+		logx.Errorf("无法加载配置文件出错: %v", err)
+		logx.Errorf("请确认secretKey设置正确，要求非纯数字且大于八位")
 		os.Exit(1)
 	}
-	if err := SetupLogWithOptions(c.LogOptions()); err != nil {
-		log.Printf("failed to setup log: %s", observability.RedactText(err.Error()))
-		os.Exit(1)
-	}
-	disableDefaultRequestLogging(&c)
-	server := rest.MustNewServer(c.RestConf, rest.WithCors("*"), rest.WithUnauthorizedCallback(unauthorizedCallback))
-	server.Use(observability.RequestIDMiddleware)
-	server.Use(observability.MutationResultMiddleware)
-	defer server.Stop()
-	ctx, err := svc.NewServiceContextChecked(c)
-	if err != nil {
-		log.Printf("无法初始化服务: %s", observability.RedactText(err.Error()))
-		os.Exit(1)
-	}
-	defer func() {
-		if err := ctx.TaskRuntime.Close(); err != nil {
-			logx.Errorf("关闭任务运行时失败: %v", err)
-		}
-		if ctx.DockerClient != nil {
-			if err := ctx.DockerClient.Close(); err != nil {
-				logx.Errorf("关闭Docker客户端失败: %v", err)
+	server := rest.MustNewServer(c.RestConf, rest.WithCors("*"), rest.WithUnauthorizedCallback(
+		func(w http.ResponseWriter, r *http.Request, err error) {
+			response := UnauthorizedResponse{
+				Code: http.StatusUnauthorized, // 401
+				Msg:  "未授权",
+				Data: map[string]interface{}{},
 			}
-		}
-	}()
+			httpx.WriteJson(w, http.StatusUnauthorized, response)
+		}))
+	defer server.Stop()
+	ctx := svc.NewServiceContext(c)
 
 	// Ensure data directory and config exist (Auto-init)
 	dataDir := "/data/config/image"
@@ -103,57 +104,25 @@ export const customImageLogos = {
 	corndanmu.Start()
 	defer corndanmu.Stop()
 	httpx.SetErrorHandler(func(err error) (int, any) {
-		status, response := observability.HTTPError(err, nil)
-		return status, response
+		switch e := err.(type) {
+		case *errors.CodeMsg:
+			return http.StatusOK, xhttp.BaseResponse[types.Nil]{
+				Code: e.Code,
+				Msg:  e.Msg,
+			}
+		default:
+			return http.StatusOK, xhttp.BaseResponse[types.Nil]{
+				Code: 50000,
+				Msg:  err.Error(),
+			}
+		}
 	})
-	probeToken := uuid.NewString()
-	instanceReady := make(chan struct{}, 1)
-	server.Use(readinessMiddleware(probeToken, instanceReady))
 	handler.RegisterHandlers(server, ctx)
 	RegisterHandlers(server)
 	fmt.Printf("Starting server at %s:%d...\n", c.Host, c.Port)
 	logx.Info("程序版本" + config.Version)
-	serverDone := make(chan struct{})
-	go func() {
-		defer close(serverDone)
-		server.Start()
-	}()
-	if ctx.TaskRuntime.HasPendingInstall() {
-		probeCtx, cancelProbe := context.WithTimeout(context.Background(), 45*time.Second)
-		probeErr := waitForInstanceReady(probeCtx, c.Host, c.Port, probeToken, instanceReady)
-		cancelProbe()
-		if probeErr != nil {
-			logx.Errorf("pending program install did not reach HTTP readiness: %v", probeErr)
-		} else {
-			confirmCtx, cancelConfirm := context.WithTimeout(context.Background(), 10*time.Second)
-			confirmErr := ctx.TaskRuntime.ConfirmPendingInstalls(confirmCtx)
-			cancelConfirm()
-			if confirmErr != nil {
-				logx.Errorf("pending program install task confirmation remains pending: %v", confirmErr)
-			} else {
-				ctx.ReleaseStartupProgramDrain()
-			}
-		}
-	}
-	select {
-	case <-ctx.ProgramShutdown:
-		proc.Shutdown()
-		<-serverDone
-	case <-serverDone:
-	}
+	server.Start()
 }
-
-func unauthorizedCallback(w http.ResponseWriter, r *http.Request, _ error) {
-	observability.WriteUnauthorized(w, r)
-}
-
-// disableDefaultRequestLogging leaves HTTP diagnostics to the redacted
-// application middleware so go-zero cannot dump full requests or bodies.
-func disableDefaultRequestLogging(c *config.Config) {
-	c.Middlewares.Log = false
-	c.Verbose = false
-}
-
 func RegisterHandlers(engine *rest.Server) {
 	frontFS, err := fs.Sub(embeddedFront, "front")
 	if err != nil {
@@ -212,12 +181,29 @@ func RegisterHandlers(engine *rest.Server) {
 	)
 }
 
-// SetupLog 初始化日志设置
-func SetupLog(logDir string) error {
-	return SetupLogWithOptions(config.LogOptions{Directory: logDir, Level: "info", RetentionDays: 7, MaxFileSizeMiB: 20, MaxTotalSizeMiB: 200})
+// 检查并创建日志目录
+func ensureLogDirectory(logDir string) error {
+	if _, err := os.Stat(logDir); os.IsNotExist(err) {
+		return os.MkdirAll(logDir, 0755) // 创建目录并设置权限
+	}
+	return nil
 }
 
-func SetupLogWithOptions(options config.LogOptions) error {
-	const mib = int64(1024 * 1024)
-	return observability.Setup(options.Directory, options.Level, options.RetentionDays, options.MaxFileSizeMiB*mib, options.MaxTotalSizeMiB*mib)
+// SetupLog 初始化日志设置
+func SetupLog(logDir string) error {
+	// 检查日志目录是否存在
+	if err := ensureLogDirectory(logDir); err != nil {
+		return fmt.Errorf("failed to create log directory: %v", err)
+	}
+
+	logConf := logx.LogConf{
+		Path:     logDir,
+		Level:    "info",
+		KeepDays: 7,
+		Compress: true,
+		Mode:     "file",
+	}
+	logx.MustSetup(logConf)
+	logx.AddWriter(logx.NewWriter(os.Stdout))
+	return nil
 }

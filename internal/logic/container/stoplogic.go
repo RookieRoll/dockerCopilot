@@ -2,38 +2,31 @@ package container
 
 import (
 	"context"
-	containerService "github.com/onlyLTY/dockerCopilot/internal/container"
-	"github.com/onlyLTY/dockerCopilot/internal/observability"
+	"github.com/onlyLTY/dockerCopilot/internal/utiles"
+
 	"github.com/onlyLTY/dockerCopilot/internal/svc"
 	"github.com/onlyLTY/dockerCopilot/internal/types"
-	"time"
 
 	"github.com/zeromicro/go-zero/core/logx"
 )
 
 type StopLogic struct {
 	logx.Logger
-	ctx     context.Context
-	service *containerService.Service
+	ctx    context.Context
+	svcCtx *svc.ServiceContext
 }
 
 func NewStopLogic(ctx context.Context, svcCtx *svc.ServiceContext) *StopLogic {
 	return &StopLogic{
-		Logger:  logx.WithContext(ctx),
-		ctx:     ctx,
-		service: serviceFromContext(svcCtx),
+		Logger: logx.WithContext(ctx),
+		ctx:    ctx,
+		svcCtx: svcCtx,
 	}
 }
 
 func (l *StopLogic) Stop(req *types.IdReq) (resp *types.Resp, err error) {
 	resp = &types.Resp{}
-	started := time.Now()
-	err = l.service.Stop(l.ctx, req.Id)
-	if err != nil {
-		observability.LogOperationResultWithDuration(l.ctx, "container.stop", req.Id, "failed", time.Since(started), err)
-	} else {
-		observability.LogOperationResultWithDuration(l.ctx, "container.stop", req.Id, "succeeded", time.Since(started))
-	}
+	err = utiles.StopContainer(l.svcCtx, req.Id)
 	if err != nil {
 		resp.Code = 400
 		resp.Msg = err.Error()

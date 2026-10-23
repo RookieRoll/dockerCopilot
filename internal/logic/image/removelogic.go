@@ -2,10 +2,9 @@ package image
 
 import (
 	"context"
-	"errors"
-	"net/http"
+	"github.com/onlyLTY/dockerCopilot/internal/utiles"
+	"strings"
 
-	imageService "github.com/onlyLTY/dockerCopilot/internal/image"
 	"github.com/onlyLTY/dockerCopilot/internal/svc"
 	"github.com/onlyLTY/dockerCopilot/internal/types"
 
@@ -14,37 +13,30 @@ import (
 
 type RemoveLogic struct {
 	logx.Logger
-	ctx     context.Context
-	service *imageService.Service
+	ctx    context.Context
+	svcCtx *svc.ServiceContext
 }
 
 func NewRemoveLogic(ctx context.Context, svcCtx *svc.ServiceContext) *RemoveLogic {
 	return &RemoveLogic{
-		Logger:  logx.WithContext(ctx),
-		ctx:     ctx,
-		service: svcCtx.ImageService(),
+		Logger: logx.WithContext(ctx),
+		ctx:    ctx,
+		svcCtx: svcCtx,
 	}
 }
 
 func (l *RemoveLogic) Remove(req *types.RemoveImageReq) (resp *types.Resp, err error) {
 	resp = &types.Resp{}
-	if req == nil {
-		return &types.Resp{Code: http.StatusBadRequest, Msg: "image ID is required", Data: map[string]any{}}, errors.New("image ID is required")
+	var imageId = req.Id
+	if strings.HasPrefix(imageId, "sha256:") {
+		imageId = strings.TrimPrefix(imageId, "sha256:")
 	}
-	err = l.service.Remove(l.ctx, req.Id, req.Force)
+	err = utiles.RemoveImage(l.svcCtx, req.Id, req.Force)
 	if err != nil {
-		resp.Code = http.StatusInternalServerError
-		var statusError interface{ HTTPStatus() int }
-		if errors.As(err, &statusError) {
-			resp.Code = statusError.HTTPStatus()
-		}
+		resp.Code = 409
 		resp.Msg = err.Error()
 		resp.Data = map[string]interface{}{}
-		var conflict *imageService.ConflictError
-		if errors.As(err, &conflict) && conflict.TaskID != "" {
-			resp.Data = map[string]string{"taskID": conflict.TaskID}
-		}
-		return resp, err
+		return resp, nil
 	}
 	resp.Code = 200
 	resp.Msg = "success"

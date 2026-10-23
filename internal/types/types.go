@@ -16,7 +16,6 @@ type ContainerUpdateReq struct {
 	IdReq
 	ImageNameAndTag string `form:"imageNameAndTag"`
 	ContainerName   string `form:"containerName"`
-	DelOldContainer *bool  `form:"delOldContainer,optional"`
 }
 
 type ConfiguredPort struct {
@@ -76,11 +75,9 @@ type RenameContainerReq struct {
 }
 
 type Resp struct {
-	Code      int         `json:"code"`
-	Msg       string      `json:"msg"`
-	Data      interface{} `json:"data"`
-	ErrorCode string      `json:"errorCode,omitempty"`
-	RequestID string      `json:"requestId,omitempty"`
+	Code int         `json:"code"`
+	Msg  string      `json:"msg"`
+	Data interface{} `json:"data"`
 }
 
 type StartContainerReq struct {
