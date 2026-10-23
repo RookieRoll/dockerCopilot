@@ -4,12 +4,12 @@ JSON 和 Compose 导出保存容器配置，包括环境变量、挂载声明和
 
 `POST /api/container/backup` 和 `POST /api/container/backup2compose` 接受后台任务并返回 `taskID`。任务接受后仍可能失败；页面根据任务终态显示结果，并在导出成功后刷新文件列表。旧 GET 入口保持同步语义，只有文件完整写入后才返回成功。
 
-![JSON 备份任务完成后的状态与文件列表](screenshots/backup-task-succeeded.png)
+页面保持原有备份列表、操作入口和成功/失败提示，不增加任务面板。原[备份任务截图](screenshots/backup-task-succeeded.png)仅作历史验收证据。
 
 JSON 恢复先校验整个文件，再逐项拉取镜像和创建容器，不覆盖重名容器，不自动启动容器。任务记录保留成功、失败和跳过项目及计数，部分失败时总任务失败，已创建的成功项目仍保留。恢复前请检查配置是否适用于当前主机，恢复后按应用要求启动并验证。
 
 文件列表和删除接口支持 `.json`、`.yaml` 和 `.yml`；恢复仅支持 JSON。文件名必须是备份目录内的单个合法文件名，不能使用路径穿越或符号链接。已接受的恢复任务从排队开始持有文件占用，直到后台执行实际结束才释放；期间删除返回 HTTP 409，任务超时但后台尚未返回时也不会提前释放。
 
-遇到失败时记录页面中的任务 ID 和请求 ID，并查询 `/api/progress/:taskid` 的错误、分项结果和恢复说明；查看 `/data/logs` 或容器标准输出日志。网络中断仅表示结果尚未确认，应继续查询既有任务，避免重复提交恢复。
+遇到失败时，按操作时间和文件名从 `/data/logs` 或容器标准输出日志取得任务 ID 和请求 ID，再查询 `/api/progress/:taskid` 的错误、分项结果和恢复说明。页面不提供新增的 ID 复制区。网络中断仅表示结果尚未确认，应继续查询既有任务，避免重复提交恢复。
 
-![恢复任务完成及逐项结果](screenshots/backup-restore-succeeded.png)
+原[恢复任务逐项展示截图](screenshots/backup-restore-succeeded.png)仅作历史证据，当前界面以[页面兼容边界](ui-compatibility.md)为准。

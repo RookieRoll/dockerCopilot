@@ -1,5 +1,7 @@
 # 容器任务页面本地 mock 验收
 
+> 历史验收：下述任务面板和发现失败重试区已按 2026-10-23 的[页面兼容边界](ui-compatibility.md)撤回。旧截图保留为历史证据，不代表当前页面。
+
 本次使用 Playwright 启动本地 Vite 前端和独立 mock HTTP API；所有浏览器 API 请求均指向本机 mock 服务，未连接真实 Docker daemon 或管理服务。端口链接的目标导航在浏览器中被拦截，不访问目标端口服务。任务状态由 mock 顺序返回 queued、running、succeeded，页面行为按真实接受响应与轮询流程验证。
 
 | 验收项 | 结果 |
