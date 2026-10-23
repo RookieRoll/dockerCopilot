@@ -5,8 +5,6 @@ import { cn } from '../utils/cn.js'
 import { getImageLogo } from '../config/imageLogos.js'
 import { useImageIcons } from '../hooks/useImageIcons.js'
 import { useTask } from '../hooks/useTask.js'
-import { TaskStatusPanel } from './tasks/TaskStatusPanel.jsx'
-import { imageUpdatePresentation } from './imageStatus.js'
 
 // 安全的图片组件
 function SafeImage({ src, alt, className, fallback }) {
@@ -37,7 +35,7 @@ export function Images() {
   const [successModal, setSuccessModal] = useState({ isOpen: false, message: '' })
 
   // 获取自定义图标配置
-  const { data: customIcons = {}, isError: customIconsError, error: customIconsQueryError } = useImageIcons()
+  const { data: customIcons = {} } = useImageIcons()
 
   const fetchImages = useCallback(async () => {
     try {
@@ -62,20 +60,38 @@ export function Images() {
     }
   }, [])
 
-  const onCleanupTerminal = useCallback((task) => {
-    if (task.status === 'succeeded') {
-      setSuccess(`镜像清理完成：成功 ${task.successCount || 0}，跳过 ${task.skippedCount || 0}`)
-    } else {
-      setError(task.error || task.detailMsg || `镜像清理任务结束，状态：${task.status}`)
+  const onCleanupTerminal = (task) => {
+    setIsLoading(false)
+    const failedCount = Number(task.failedCount) || 0
+    if (task.status === 'succeeded' && failedCount === 0) {
+      setError(null)
+      setSuccessModal({ isOpen: true, message: '镜像清理成功' })
+      setTimeout(() => setSuccessModal({ isOpen: false, message: '' }), 3000)
+      void fetchImages()
+      return
     }
-    void fetchImages()
-  }, [fetchImages])
-
+    const message = task.error || task.detailMsg || (failedCount > 0 ? '部分镜像清理失败' : `镜像清理失败，状态：${task.status}`)
+    void fetchImages().finally(() => setError(message))
+  }
   const cleanupTask = useTask({
     taskType: 'image-cleanup', discoverTaskType: true,
     storageKey: 'docker_copilot_image_cleanup_task', onTerminal: onCleanupTerminal,
   })
-  const cleanupTaskActive = cleanupTask.task?.status === 'queued' || cleanupTask.task?.status === 'running' || (cleanupTask.isTracking && Boolean(cleanupTask.taskId))
+  const cleanupTaskActive = cleanupTask.task?.status === 'queued' || cleanupTask.task?.status === 'running' ||
+    (cleanupTask.isTracking && Boolean(cleanupTask.taskId)) || (Boolean(cleanupTask.taskId) && cleanupTask.unauthorized)
+
+  useEffect(() => {
+    if (cleanupTask.isTracking && cleanupTask.taskId) setIsLoading(true)
+    if (cleanupTask.unauthorized) setIsLoading(false)
+  }, [cleanupTask.isTracking, cleanupTask.taskId, cleanupTask.unauthorized])
+
+  useEffect(() => {
+    const unavailable = cleanupTask.unauthorized || cleanupTask.connectionError
+    if (!unavailable) return
+    setError(cleanupTask.unauthorized
+      ? '任务查询未授权，请重新登录后查看清理结果'
+      : cleanupTask.connectionError?.message || '任务查询连接中断，正在重试')
+  }, [cleanupTask.unauthorized, cleanupTask.connectionError])
 
   useEffect(() => {
     void fetchImages()
@@ -102,12 +118,18 @@ export function Images() {
     try {
       setIsLoading(true)
       setError(null)
-      const accepted = await cleanupTask.submit(() => imageAPI.cleanupImages(type))
-      setSuccess(`镜像清理任务已接受（${accepted.taskID}），请查看下方任务汇总。`)
+      const candidates = type === 'dangling'
+        ? images.filter(img => img.tag === 'None' || img.tag === '<none>')
+        : images.filter(img => !img.inUsed)
+      if (candidates.length === 0) {
+        setError('没有找到需要清理的镜像')
+        setIsLoading(false)
+        return
+      }
+      await cleanupTask.submit(() => imageAPI.cleanupImages(type))
     } catch (error) {
       const errorMsg = error.response?.data?.msg || error.message || '清理镜像失败'
       setError(errorMsg)
-    } finally {
       setIsLoading(false)
     }
   }
@@ -199,12 +221,6 @@ export function Images() {
         </div>
       )}
 
-      {customIconsError && (
-        <div role="alert" className="mx-4 sm:mx-6 mt-4 rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-800 dark:border-red-900 dark:bg-red-900/20 dark:text-red-200">
-          图标映射加载失败：{customIconsQueryError?.message || '请检查服务后重试'}
-        </div>
-      )}
-
       {success && (
         <div className="mx-4 sm:mx-6 mt-4 p-4 bg-green-50 dark:bg-green-900/20 border border-green-200 dark:border-green-900 rounded-lg flex items-start gap-3">
           <CheckCircle className="h-5 w-5 text-green-500 dark:text-green-400 flex-shrink-0 mt-0.5" />
@@ -215,19 +231,6 @@ export function Images() {
           >
             <X className="h-4 w-4" />
           </button>
-        </div>
-      )}
-
-      {(cleanupTask.task || cleanupTask.connectionError || cleanupTask.unauthorized || cleanupTask.submitError || cleanupTask.isTracking) && (
-        <div className="mx-4 sm:mx-6">
-          <TaskStatusPanel
-            task={cleanupTask.task}
-            taskId={cleanupTask.taskId}
-            connectionError={cleanupTask.connectionError}
-            unauthorized={cleanupTask.unauthorized}
-            submitError={cleanupTask.submitError}
-            isTracking={cleanupTask.isTracking}
-          />
         </div>
       )}
 
@@ -445,22 +448,6 @@ export function Images() {
                         {image.id}
                       </span>
                     </div>
-                    {(() => {
-                      const check = image.updateCheck
-                      const presentation = imageUpdatePresentation(check)
-                      const checkTone = presentation.kind === 'stale' || presentation.kind === 'unknown'
-                        ? 'bg-amber-50 text-amber-800 dark:bg-amber-900/20 dark:text-amber-200'
-                        : presentation.kind === 'update'
-                          ? 'bg-blue-50 text-blue-800 dark:bg-blue-900/20 dark:text-blue-200'
-                          : 'bg-green-50 text-green-800 dark:bg-green-900/20 dark:text-green-200'
-                      return (
-                        <div className={`rounded-md px-2 py-1.5 ${checkTone}`} data-testid={`image-check-${image.id}`}>
-                          <p>{presentation.label}</p>
-                          {presentation.detail && <p className="mt-1 break-words">检查失败：{presentation.detail}</p>}
-                          {check?.lastSuccessAt && <p className="mt-1">上次成功：{new Date(check.lastSuccessAt).toLocaleString()}</p>}
-                        </div>
-                      )
-                    })()}
                   </div>
 
                   {/* 操作按钮 */}
@@ -506,7 +493,7 @@ export function Images() {
                     {pruneModal.type === 'dangling' ? '删除无Tag镜像' : '删除未使用的镜像'}
                   </h3>
                   <p className="text-sm text-gray-600 dark:text-gray-400 mt-2">
-                    将永久删除 <span className="font-semibold text-orange-600 dark:text-orange-400">{pruneModal.images.length} 个</span> 镜像，此操作不可恢复。服务端会再次检查使用状态，任务会逐项汇总结果。
+                    将永久删除 <span className="font-semibold text-orange-600 dark:text-orange-400">{pruneModal.images.length} 个</span> 镜像，此操作不可恢复
                   </p>
                 </div>
               </div>
@@ -554,7 +541,7 @@ export function Images() {
                   handlePrune(pruneModal.type)
                   setPruneModal({ isOpen: false, type: null, images: [] })
                 }}
-                disabled={isLoading}
+                disabled={isLoading || cleanupTaskActive}
                 className="flex-1 px-4 py-2.5 text-sm font-semibold bg-gradient-to-r from-red-500 to-orange-500 hover:from-red-600 hover:to-orange-600 text-white rounded-xl transition-all duration-300 transform hover:shadow-lg hover:scale-105 active:scale-95 disabled:opacity-50 disabled:cursor-not-allowed shadow-lg"
               >
                 {isLoading ? (

@@ -12,7 +12,7 @@ export function Icons() {
   const [favorites, setFavorites] = useState([])
 
   // 获取自定义图标
-  const { data: customIcons = {}, isError: customIconsError, error: customIconsQueryError } = useImageIcons()
+  const { data: customIcons = {} } = useImageIcons()
 
   // 从localStorage加载收藏
   useEffect(() => {
@@ -94,12 +94,6 @@ export function Icons() {
         <h2 className="text-2xl font-bold text-gray-900 dark:text-white mb-1">图标库</h2>
         <p className="text-gray-600 dark:text-gray-400">浏览和管理Docker镜像图标</p>
       </div>
-
-      {customIconsError && (
-        <div role="alert" className="mx-4 sm:mx-6 mb-4 rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-800 dark:border-red-900 dark:bg-red-900/20 dark:text-red-200">
-          图标映射加载失败：{customIconsQueryError?.message || '请检查服务后重试'}
-        </div>
-      )}
 
       {/* 搜索和过滤 */}
       <div className="px-4 sm:px-6 py-4 space-y-4 border-b border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-800/50">
@@ -321,7 +315,7 @@ export function Icons() {
         )}
 
         {/* 无结果提示 */}
-        {filteredCustomIcons.length === 0 && filteredBuiltInIcons.length === 0 && !customIconsError && (
+        {filteredCustomIcons.length === 0 && filteredBuiltInIcons.length === 0 && (
           <div className="text-center py-12">
             <div className="h-16 w-16 bg-gray-100 dark:bg-gray-700 rounded-full flex items-center justify-center mx-auto mb-4">
               <Search className="h-8 w-8 text-gray-400" />
