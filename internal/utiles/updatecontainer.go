@@ -43,18 +43,21 @@ func UpdateContainer(serviceContext *svc.ServiceContext, id string, name string,
 	oldTaskProgress.DetailMsg = "正在拉取新镜像"
 	serviceContext.UpdateProgress(taskID, oldTaskProgress)
 	serviceContext.DockerClient.NegotiateAPIVersion(ctx)
-	reader, err := serviceContext.DockerClient.ImagePull(ctx, imageNameAndTag, image.PullOptions{})
-	if err != nil {
-		oldTaskProgress.Message = "拉取镜像失败"
-		oldTaskProgress.DetailMsg = err.Error()
-		oldTaskProgress.IsDone = true
-		serviceContext.UpdateProgress(taskID, oldTaskProgress)
-		logx.Errorf("Failed to pull image: %s", err)
-		return err
-	}
-	err = decodePullResp(reader, serviceContext, taskID)
-	if closeErr := reader.Close(); closeErr != nil {
-		logx.Error("关闭镜像拉取响应失败: " + closeErr.Error())
+	var expectedID string
+	var err error
+	if serviceContext.Config.ProxyImageUpdates {
+		proxyUpdateLock.Lock()
+		defer proxyUpdateLock.Unlock()
+		expectedID, err = loadProxyImage(ctx, serviceContext, id, imageNameAndTag, taskID)
+	} else {
+		var reader io.ReadCloser
+		reader, err = serviceContext.DockerClient.ImagePull(ctx, imageNameAndTag, image.PullOptions{})
+		if err == nil {
+			err = decodePullResp(reader, serviceContext, taskID)
+			if closeErr := reader.Close(); closeErr != nil {
+				logx.Error(closeErr)
+			}
+		}
 	}
 	if err != nil {
 		oldTaskProgress.Message = "拉取镜像失败"
@@ -160,6 +163,19 @@ func UpdateContainer(serviceContext *svc.ServiceContext, id string, name string,
 		oldTaskProgress.IsDone = true
 		serviceContext.UpdateProgress(taskID, oldTaskProgress)
 		return err
+	}
+	if expectedID != "" {
+		current, checkErr := serviceContext.DockerClient.ContainerInspect(ctx, containerName)
+		if checkErr == nil && current.Image != expectedID {
+			checkErr = fmt.Errorf("新容器镜像与目标不符: %s", current.Image)
+		}
+		if checkErr != nil {
+			oldTaskProgress.Message = "校验新容器失败"
+			oldTaskProgress.DetailMsg = checkErr.Error()
+			oldTaskProgress.IsDone = true
+			serviceContext.UpdateProgress(taskID, oldTaskProgress)
+			return checkErr
+		}
 	}
 	if delOldContainer {
 		err = serviceContext.DockerClient.ContainerRemove(context.Background(), id, container.RemoveOptions{})

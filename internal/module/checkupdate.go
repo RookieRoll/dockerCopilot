@@ -21,10 +21,13 @@ import (
 // ImageCheckList 检查更新处理后的镜像列表
 type ImageCheckList struct {
 	NeedUpdate bool
+	Reference  string
+	Digest     string
 }
 type ImageUpdateData struct {
-	mu   sync.RWMutex
-	Data map[string]ImageCheckList
+	ProxyStateDir string
+	mu            sync.RWMutex
+	Data          map[string]ImageCheckList
 }
 
 const ContentDigestHeader = "Docker-Content-Digest"
@@ -54,6 +57,10 @@ func (i *ImageUpdateData) CheckUpdate(imageList []types.Image) {
 }
 
 func (i *ImageUpdateData) checkSingleImage(image types.Image) {
+	if i.ProxyStateDir != "" {
+		i.checkProxyImage(image)
+		return
+	}
 	token, err := GetToken(image, "")
 	if err != nil {
 		logx.Error("获取token失败或者无需获取token，继续尝试检查" + err.Error())

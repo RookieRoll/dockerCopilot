@@ -39,9 +39,13 @@ func NewServiceContext(c config.Config) *ServiceContext {
 	if err != nil {
 		logx.Errorf("Unable to create docker client: %s", err)
 	}
+	checks := module.NewImageCheck()
+	if c.ProxyImageUpdates {
+		checks.ProxyStateDir = "/data/config/proxy-image-updates"
+	}
 	return &ServiceContext{
 		Config:        c,
-		HubImageInfo:  module.NewImageCheck(),
+		HubImageInfo:  checks,
 		ProgressStore: make(ProgressStoreType),
 		DockerClient:  cli,
 	}
