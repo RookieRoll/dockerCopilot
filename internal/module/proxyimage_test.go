@@ -46,7 +46,7 @@ func TestProxyCheckUsesPersistedDigestForLoadedImage(t *testing.T) {
 		t.Fatal(err)
 	}
 	after := NewImageCheck()
-	after.ProxyStateDir = dir
+	after.InitSettings(dir, false)
 	after.CheckUpdate([]types.Image{img})
 	result, ok := after.Get(img.ID)
 	if !ok || result.NeedUpdate || result.Digest != digest.String() || result.Reference != tag.Name() {
@@ -60,14 +60,14 @@ func TestProxyCheckUsesPersistedDigestForLoadedImage(t *testing.T) {
 	}
 }
 
-func TestProxyOptionsRequireProxy(t *testing.T) {
+func TestProxyOptionsAllowDirectAndRejectInvalid(t *testing.T) {
 	t.Setenv("HTTPS_PROXY", "")
 	t.Setenv("https_proxy", "")
-	if _, err := ProxyOptions(context.Background()); err == nil {
-		t.Fatal("missing proxy accepted")
+	if _, err := ProxyOptions(context.Background(), EnvProxy()); err != nil {
+		t.Fatal("direct connection rejected")
 	}
 	t.Setenv("HTTPS_PROXY", "file://secret-password")
-	if _, err := ProxyOptions(context.Background()); err == nil || strings.Contains(err.Error(), "secret-password") {
+	if _, err := ProxyOptions(context.Background(), EnvProxy()); err == nil || strings.Contains(err.Error(), "secret-password") {
 		t.Fatal("invalid proxy must fail without exposing credentials")
 	}
 }

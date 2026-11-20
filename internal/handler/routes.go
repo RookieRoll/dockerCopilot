@@ -42,6 +42,10 @@ func RegisterHandlers(server *rest.Server, serverCtx *svc.ServiceContext) {
 	server.AddRoutes(
 		[]rest.Route{
 			{
+				Method: http.MethodGet, Path: "/settings/proxy", Handler: proxySettingsHandler(serverCtx),
+			},
+			{Method: http.MethodPut, Path: "/settings/proxy", Handler: proxySettingsHandler(serverCtx)},
+			{
 				Method:  http.MethodPost,
 				Path:    "/container/:id/rename",
 				Handler: container.RenameHandler(serverCtx),

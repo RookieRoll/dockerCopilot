@@ -98,6 +98,27 @@ type VersionMsgResp {
 	BuildDate string `json:"build_date"`
 }
 
+type ProxySettingsReq {
+    Enabled bool `json:"enabled"`
+    Address *string `json:"address,optional"`
+}
+type ProxySettingsView {
+    Enabled bool `json:"enabled"`
+    Endpoint string `json:"endpoint"`
+}
+
+@server(
+    prefix: /api/settings
+    jwt: Auth
+)
+service dockerCopilot {
+    @handler getProxySettings
+    get /proxy returns (ProxySettingsView)
+
+    @handler saveProxySettings
+    put /proxy (ProxySettingsReq) returns (ProxySettingsView)
+}
+
 type VersionReq {
 	Type string `form:"type"`
 }

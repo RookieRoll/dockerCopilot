@@ -18,17 +18,23 @@ import (
 )
 
 // ProxyOptions routes registry authentication, manifests and layers through the service proxy.
-func ProxyOptions(ctx context.Context) ([]remote.Option, error) {
+func EnvProxy() string {
 	raw := os.Getenv("HTTPS_PROXY")
 	if raw == "" {
 		raw = os.Getenv("https_proxy")
 	}
-	u, err := url.Parse(raw)
-	if err != nil || u.Hostname() == "" || (u.Scheme != "http" && u.Scheme != "https" && u.Scheme != "socks5") {
-		return nil, fmt.Errorf("代理镜像更新需要有效的 HTTPS_PROXY")
-	}
+	return raw
+}
+func ProxyOptions(ctx context.Context, raw string) ([]remote.Option, error) {
 	transport := remote.DefaultTransport.(*http.Transport).Clone()
-	transport.Proxy = http.ProxyURL(u)
+	transport.Proxy = nil
+	if raw != "" {
+		u, err := url.Parse(raw)
+		if err != nil || u.Hostname() == "" || (u.Scheme != "http" && u.Scheme != "https" && u.Scheme != "socks5") {
+			return nil, fmt.Errorf("代理镜像更新需要有效的 HTTPS_PROXY")
+		}
+		transport.Proxy = http.ProxyURL(u)
+	}
 	return []remote.Option{remote.WithContext(ctx), remote.WithAuthFromKeychain(authn.DefaultKeychain), remote.WithTransport(transport)}, nil
 }
 
@@ -56,14 +62,14 @@ func (i *ImageUpdateData) Remember(tag name.Tag, id, digest string) error {
 	}
 	return os.Rename(f.Name(), i.recordPath(tag))
 }
-func (i *ImageUpdateData) checkProxyImage(img types.Image) {
+func (i *ImageUpdateData) checkProxyImage(img types.Image, address string) {
 	tag, err := name.NewTag(img.ImageName + ":" + img.ImageTag)
 	if err != nil {
 		return
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	opts, err := ProxyOptions(ctx)
+	opts, err := ProxyOptions(ctx, address)
 	if err != nil {
 		logx.Error(err)
 		return

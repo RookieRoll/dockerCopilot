@@ -45,10 +45,10 @@ func UpdateContainer(serviceContext *svc.ServiceContext, id string, name string,
 	serviceContext.DockerClient.NegotiateAPIVersion(ctx)
 	var expectedID string
 	var err error
-	if serviceContext.Config.ProxyImageUpdates {
+	if settings := serviceContext.HubImageInfo.Settings(); settings.Enabled {
 		proxyUpdateLock.Lock()
 		defer proxyUpdateLock.Unlock()
-		expectedID, err = loadProxyImage(ctx, serviceContext, id, imageNameAndTag, taskID)
+		expectedID, err = loadProxyImage(ctx, serviceContext, id, imageNameAndTag, taskID, settings.Address)
 	} else {
 		var reader io.ReadCloser
 		reader, err = serviceContext.DockerClient.ImagePull(ctx, imageNameAndTag, image.PullOptions{})

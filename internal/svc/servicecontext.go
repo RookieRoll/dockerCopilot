@@ -40,8 +40,8 @@ func NewServiceContext(c config.Config) *ServiceContext {
 		logx.Errorf("Unable to create docker client: %s", err)
 	}
 	checks := module.NewImageCheck()
-	if c.ProxyImageUpdates {
-		checks.ProxyStateDir = "/data/config/proxy-image-updates"
+	if err := checks.InitSettings("/data/config/proxy-image-updates", c.ProxyImageUpdates); err != nil {
+		logx.Errorf("读取代理设置失败: %v", err)
 	}
 	return &ServiceContext{
 		Config:        c,

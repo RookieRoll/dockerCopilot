@@ -5,6 +5,7 @@ import { Containers } from './components/Containers.jsx'
 import { Images } from './components/Images.jsx'
 import { Backups } from './components/Backups.jsx'
 import { Icons } from './components/Icons.jsx'
+import { SettingsDialog } from './components/SettingsDialog.jsx'
 import { About } from './components/About.jsx'
 import { ThemeProvider } from './hooks/useTheme.jsx'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
@@ -24,6 +25,7 @@ const queryClient = new QueryClient({
 
 function AppContent() {
   const [isAuthenticated, setIsAuthenticated] = useState(false)
+  const [settingsOpen,setSettingsOpen] = useState(false)
   const [activeTab, setActiveTab] = useState('#containers')
   const [windowWidth, setWindowWidth] = useState(typeof window !== 'undefined' ? window.innerWidth : 1024)
   const [userPreferredCollapsed, setUserPreferredCollapsed] = useState(false)
@@ -119,6 +121,7 @@ function AppContent() {
   }
 
   const handleTabChange = (tab) => {
+    if (tab === '#settings') { setSettingsOpen(true); return }
     setActiveTab(tab)
   }
 
@@ -152,6 +155,7 @@ function AppContent() {
 
   return (
     <div className="flex min-h-screen bg-gray-50 dark:bg-gray-900 transition-colors duration-300 flex-col lg:flex-row">
+      {settingsOpen && <SettingsDialog onClose={() => setSettingsOpen(false)} />}
       <Sidebar
         activeTab={activeTab}
         onTabChange={handleTabChange}

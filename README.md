@@ -72,6 +72,6 @@ go test ./...
 
 ## 容器镜像代理更新
 
-默认由 NAS 的 Docker 引擎拉取镜像。要让 DockerCopilot 自行通过代理检查和下载镜像，在服务使用的 `etc/dockerCopilot.yaml` 中设置 `ProxyImageUpdates: true`，并给 DockerCopilot 进程配置 `HTTPS_PROXY`（例如 `http://proxy.example:3128`）。重新启动服务后，所有容器更新请求统一生效。设回 `false` 并重启即可恢复 Docker 原生拉取。
+打开导航栏的「设置」，分别填写代理地址和选择镜像下载方式。检查更新和 Go 下载使用服务端代理地址，留空则直连。选择 Docker 引擎时，拉取使用 NAS 引擎的网络配置。保存后对后续任务生效。设置保存在持久卷的 `/data/config/proxy-image-updates/settings.json` 中。首次部署且尚未通过界面保存时，沿用 YAML 的 `ProxyImageUpdates`（默认关闭）和环境变量 `HTTPS_PROXY`。
 
 代理模式按目标摘要及原容器的平台下载，将临时镜像包导入 Docker，通过镜像 ID 校验后再替换容器。请为临时目录（可用 `TMPDIR` 指定）和 Docker 镜像库预留空间。临时包在导入结束或失败后释放。请持久化 `/data`，其中 `/data/config/proxy-image-updates` 保存导入镜像的摘要记录。

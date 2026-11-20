@@ -17,7 +17,7 @@ import (
 
 var proxyUpdateLock sync.Mutex
 
-func loadProxyImage(ctx context.Context, s *svc.ServiceContext, id, reference, task string) (string, error) {
+func loadProxyImage(ctx context.Context, s *svc.ServiceContext, id, reference, task, address string) (string, error) {
 	progress, _ := s.GetProgress(task)
 	stage := func(msg string) {
 		progress.Message = msg
@@ -37,7 +37,7 @@ func loadProxyImage(ctx context.Context, s *svc.ServiceContext, id, reference, t
 	if err != nil {
 		return "", err
 	}
-	opts, err := module.ProxyOptions(ctx)
+	opts, err := module.ProxyOptions(ctx, address)
 	if err != nil {
 		return "", err
 	}

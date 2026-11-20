@@ -94,7 +94,7 @@ func TestLoadProxyImageUsesCheckedDigest(t *testing.T) {
 	checks.ProxyStateDir = t.TempDir()
 	checks.Data["old"] = module.ImageCheckList{Reference: tag.Name(), Digest: digest.String(), NeedUpdate: true}
 	s := &svc.ServiceContext{DockerClient: cli, HubImageInfo: checks, ProgressStore: make(svc.ProgressStoreType)}
-	got, err := loadProxyImage(context.Background(), s, "ctr", tag.Name(), "test")
+	got, err := loadProxyImage(context.Background(), s, "ctr", tag.Name(), "test", server.URL)
 	if err != nil || got != expected.String() {
 		t.Fatalf("load returned %q, %v", got, err)
 	}

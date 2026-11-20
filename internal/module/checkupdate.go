@@ -26,6 +26,7 @@ type ImageCheckList struct {
 }
 type ImageUpdateData struct {
 	ProxyStateDir string
+	settings      ProxySettings
 	mu            sync.RWMutex
 	Data          map[string]ImageCheckList
 }
@@ -57,8 +58,8 @@ func (i *ImageUpdateData) CheckUpdate(imageList []types.Image) {
 }
 
 func (i *ImageUpdateData) checkSingleImage(image types.Image) {
-	if i.ProxyStateDir != "" {
-		i.checkProxyImage(image)
+	if settings := i.Settings(); i.ProxyStateDir != "" {
+		i.checkProxyImage(image, settings.Address)
 		return
 	}
 	token, err := GetToken(image, "")
