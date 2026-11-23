@@ -1,4 +1,4 @@
-module github.com/onlyLTY/dockerCopilot
+module github.com/RookieRoll/dockerCopilot
 
 go 1.24.0
 

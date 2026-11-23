@@ -8,7 +8,7 @@ import (
 	"testing"
 
 	dockerImage "github.com/docker/docker/api/types/image"
-	"github.com/onlyLTY/dockerCopilot/internal/types"
+	"github.com/RookieRoll/dockerCopilot/internal/types"
 )
 
 func TestImageUpdateDataConcurrentAccess(t *testing.T) {

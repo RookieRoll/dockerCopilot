@@ -18,8 +18,8 @@ import (
 	"github.com/google/go-containerregistry/pkg/v1/mutate"
 	"github.com/google/go-containerregistry/pkg/v1/remote"
 	"github.com/google/go-containerregistry/pkg/v1/tarball"
-	"github.com/onlyLTY/dockerCopilot/internal/module"
-	"github.com/onlyLTY/dockerCopilot/internal/svc"
+	"github.com/RookieRoll/dockerCopilot/internal/module"
+	"github.com/RookieRoll/dockerCopilot/internal/svc"
 )
 
 func TestLoadProxyImageUsesCheckedDigest(t *testing.T) {

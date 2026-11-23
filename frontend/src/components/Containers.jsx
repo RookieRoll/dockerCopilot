@@ -81,8 +81,8 @@ const EDIT_PORTS_LABEL = '\u7f16\u8f91\u7aef\u53e3'
 const NO_PORTS_LABEL = '\u672a\u53d1\u73b0\u5df2\u53d1\u5e03\u6216\u58f0\u660e\u7684\u7aef\u53e3'
 const NO_CONFIGURED_PORTS_LABEL = '\u6682\u672a\u914d\u7f6e\u8bbf\u95ee\u7aef\u53e3'
 const DECLARED_PORTS_LABEL = '\u955c\u50cf\u58f0\u660e'
-const CONTAINER_LABEL = '\u5bb9\u5668'
-const MAX_VISIBLE_PORTS = 4
+const statusLabels = { running: '运行中', exited: '已停止', paused: '已暂停', restarting: '重启中', created: '已创建', removing: '移除中', dead: '异常' }
+const MAX_VISIBLE_PORTS = 2
 
 function PortMappingTile({ port }) {
   const targetUrl = getContainerPortUrl(port)
@@ -96,10 +96,10 @@ function PortMappingTile({ port }) {
         <>
           <span className="rounded bg-white/70 px-1.5 py-0.5 font-semibold dark:bg-gray-900/40">{hostPort}</span>
           <ArrowRight className="h-3 w-3 flex-shrink-0 opacity-60" aria-hidden="true" />
-          <span className="truncate">{containerPort}</span>
+          <span>{containerPort}</span>
         </>
       ) : (
-        <span className="truncate">{CONTAINER_LABEL} {containerPort}</span>
+        <span>{port.containerPort ? containerPort + " · 未发布" : "端口信息不可用"}</span>
       )}
       {targetUrl && <ExternalLink className="ml-auto h-3 w-3 flex-shrink-0" aria-hidden="true" />}
     </>
@@ -177,14 +177,18 @@ function ContainerPorts({ ports, configuredPorts, networkMode, onConfigure }) {
   const manualPorts = normalizeConfiguredPorts(configuredPorts)
   const hostNetwork = isHostNetworkMode(networkMode)
   const displayPorts = hostNetwork ? manualPorts : detectedPorts
+  const [expanded, setExpanded] = useState(false)
+  const dialog = React.useRef(null)
   const visiblePorts = displayPorts.slice(0, MAX_VISIBLE_PORTS)
-  const hiddenPortCount = Math.max(0, displayPorts.length - visiblePorts.length)
+  const portTile = port => hostNetwork
+    ? <ConfiguredPortTile key={`${port.port}-${port.protocol}`} port={port} />
+    : <PortMappingTile key={`${port.hostPort}-${port.containerPort}-${port.protocol}`} port={port} />
   const declaration = hostNetwork && detectedPorts.length > 0
     ? detectedPorts.slice(0, 3).map(formatContainerPort).join(' \u00b7 ')
     : ''
 
   return (
-    <div className="mt-3 min-h-[118px] pt-3 border-t border-gray-100 dark:border-gray-700/50">
+    <div className="my-3 pt-3 border-t border-gray-100 dark:border-gray-700/50">
       <div className="flex items-center justify-between gap-2 mb-2">
         <div className="flex min-w-0 items-center gap-2">
           {hostNetwork && <Network className="h-3.5 w-3.5 flex-shrink-0 text-amber-500" aria-hidden="true" />}
@@ -210,35 +214,46 @@ function ContainerPorts({ ports, configuredPorts, networkMode, onConfigure }) {
         )}
       </div>
 
-      <div className="h-[68px]">
+      <div>
         {visiblePorts.length > 0 ? (
-          <div className="grid h-full grid-cols-2 content-start gap-1.5">
-            {visiblePorts.map((port) => hostNetwork ? (
-              <ConfiguredPortTile key={`${port.port}-${port.protocol}`} port={port} />
-            ) : (
-              <PortMappingTile key={`${port.hostPort}-${port.containerPort}-${port.protocol}`} port={port} />
-            ))}
+          <div className="grid grid-cols-1 gap-1.5">
+            {visiblePorts.map(portTile)}
           </div>
-        ) : hostNetwork ? (
-          <button
-            type="button"
-            onClick={(event) => { stopContainerPortEvent(event); onConfigure?.() }}
-            className="flex h-[68px] w-full items-center rounded-md border border-dashed border-amber-200 px-2.5 text-left text-xs text-amber-700 transition-colors hover:bg-amber-50 dark:border-amber-800 dark:text-amber-300 dark:hover:bg-amber-900/20"
-          >
-            <Plus className="mr-1.5 h-3.5 w-3.5 flex-shrink-0" aria-hidden="true" />
-            {NO_CONFIGURED_PORTS_LABEL}
-          </button>
         ) : (
-          <div className="flex h-[68px] items-center rounded-md border border-dashed border-gray-200 px-2.5 text-xs text-gray-400 dark:border-gray-700 dark:text-gray-500">
-            {NO_PORTS_LABEL}
-          </div>
+          <p className="text-xs text-gray-500 dark:text-gray-400">
+            {hostNetwork ? NO_CONFIGURED_PORTS_LABEL : NO_PORTS_LABEL}
+          </p>
         )}
       </div>
-
-      <div className="mt-1.5 flex h-4 items-center justify-between gap-2 text-[10px] text-gray-400 dark:text-gray-500">
-        <span className="min-w-0 truncate">{hostNetwork && declaration ? `${DECLARED_PORTS_LABEL}\uff1a${declaration}` : ''}</span>
-        {hiddenPortCount > 0 && <span className="flex-shrink-0">+{hiddenPortCount}</span>}
-      </div>
+      {declaration && <p className="mt-2 break-words text-xs text-gray-500 dark:text-gray-400">{DECLARED_PORTS_LABEL}：{declaration}</p>}
+      {displayPorts.length > MAX_VISIBLE_PORTS && (
+        <>
+          <button type="button" aria-haspopup="dialog"
+            onClick={event => {
+              stopContainerPortEvent(event)
+              setExpanded(true)
+              dialog.current.showModal()
+            }}
+            className="mt-2 text-xs font-medium text-primary-700 hover:underline dark:text-primary-300">
+            查看全部 {displayPorts.length} 个端口
+          </button>
+          <dialog ref={dialog} aria-label="全部端口" onClose={() => setExpanded(false)}
+            onClick={stopContainerPortEvent}
+            className="w-[calc(100%-2rem)] max-w-sm rounded-xl p-0 shadow-xl backdrop:bg-black/40 dark:bg-gray-800 dark:text-gray-100">
+            <div className="flex max-h-[75dvh] flex-col p-4">
+              <header className="mb-3 flex items-center justify-between">
+                <h2 className="font-semibold">全部端口（{displayPorts.length}）</h2>
+                <button type="button" aria-label="关闭" onClick={() => dialog.current.close()} className="rounded p-2">
+                  <X className="h-4 w-4" />
+                </button>
+              </header>
+              <div className="grid gap-1.5 overflow-y-auto overscroll-contain">
+                {expanded && displayPorts.map(portTile)}
+              </div>
+            </div>
+          </dialog>
+        </>
+      )}
     </div>
   )
 }
@@ -831,7 +846,7 @@ export function Containers() {
   }
 
   return (
-    <div className="max-w-7xl mx-auto px-4 sm:px-6 py-4">
+    <div className="max-w-7xl mx-auto">
       <style>{`
         @keyframes shimmer {
           0% { background-position: -200% 0; }
@@ -893,7 +908,7 @@ export function Containers() {
       )}
 
       {/* 页面标题和操作 */}
-      <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center mb-4 space-y-4 sm:space-y-0 pt-4 sm:pt-0">
+      <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center px-2 sm:px-6 py-4 space-y-4 sm:space-y-0">
         <div>
           <h2 className="text-2xl font-bold text-gray-900 dark:text-white">容器管理</h2>
           <p className="text-gray-600 dark:text-gray-400 mt-1">
@@ -1175,21 +1190,6 @@ export function Containers() {
                         </div>
                       )}
 
-                      {/* NEW (有更新时显示) */}
-                      {container.haveUpdate && (
-                        <div className="absolute -top-[2px] -right-[2px] w-[80px] h-[80px] pointer-events-none overflow-hidden z-20 rounded-tr-2xl">
-                          <div className="absolute top-0 right-0 w-full h-full flex items-center justify-center">
-                            <div className="absolute transform rotate-45 translate-x-[26px] -translate-y-[26px] w-[120px] h-[24px] bg-gradient-to-r from-yellow-400 to-yellow-500 dark:from-yellow-500 dark:to-yellow-600 shadow-sm flex items-center justify-center">
-                              <span className="relative text-[10px] font-bold text-white tracking-widest uppercase w-full text-center">
-                                NEW
-                                {/* 流光效果 */}
-                                <div className="absolute top-0 left-0 animate-flow-light"></div>
-                              </span>
-                            </div>
-                          </div>
-                        </div>
-                      )}
-
                       <div className="relative z-10 flex items-center gap-3">
                         {/* 图标 */}
                         <div className="flex-shrink-0">
@@ -1243,24 +1243,19 @@ export function Containers() {
                           })()}
                         </div>
 
-                        {/* 状态指示器（放在图标和信息之间） */}
-                        <div className="flex-shrink-0 flex items-center">
-                          <div className={cn(
-                            "w-1 h-8 rounded-full",
-                            getStatusIndicatorColor(container.status)
-                          )} />
-                        </div>
-
                         {/* 容器信息 */}
                         <div className="flex-1 min-w-0">
                           <div className="flex items-start justify-between gap-2">
                             <div className="flex-1 min-w-0">
-                              <div className="flex items-center">
-                                <h3 className="font-semibold text-gray-900 dark:text-white truncate text-base group-hover:text-primary-600 dark:group-hover:text-primary-400 transition-colors">
+                              <div className="flex items-center justify-between gap-2">
+                                <h3 title={container.name} className="font-semibold text-gray-900 dark:text-white truncate text-base group-hover:text-primary-600 dark:group-hover:text-primary-400 transition-colors">
                                   {container.name}
                                 </h3>
+                                {isBatchMode && <input type="checkbox" checked={isSelected}
+                                  aria-label={`选择 ${container.name}`} onClick={e => e.stopPropagation()}
+                                  onChange={() => toggleContainerSelection(container.id)} />}
                               </div>
-                              <p className="text-xs text-gray-500 dark:text-gray-400 truncate mt-0.5">
+                              <p title={container.usingImage} className="text-xs text-gray-500 dark:text-gray-400 truncate mt-0.5">
                                 {container.usingImage}
                               </p>
                             </div>
@@ -1273,13 +1268,12 @@ export function Containers() {
                                 <RefreshCw className="h-3 w-3 animate-spin flex-shrink-0" />
                                 <span>{containerActions[container.id].progress}</span>
                               </p>
-                            ) : container.status === 'running' ? (
-                              <div className="text-xs text-gray-500 dark:text-gray-400">
-                                运行: {formatRunningTime(container.runningTime)}
-                              </div>
                             ) : (
-                              <div className="text-xs text-gray-500 dark:text-gray-400">
-                                状态: 已停止
+                              <div className="flex items-center gap-1.5 text-xs text-gray-600 dark:text-gray-300">
+                                <span className={cn("h-2 w-2 shrink-0 rounded-full", getStatusIndicatorColor(container.status))} />
+                                <span>{statusLabels[container.status] || container.status || '未知状态'}</span>
+                                {container.status === 'running' && <span className="truncate">· {formatRunningTime(container.runningTime)}</span>}
+                                {container.haveUpdate && <span className="shrink-0 rounded bg-amber-100 px-1.5 text-amber-800 dark:bg-amber-900 dark:text-amber-200">有更新</span>}
                               </div>
                             )}
                           </div>
@@ -1297,7 +1291,7 @@ export function Containers() {
                       {!isBatchMode && (
                         <div className="mt-auto flex gap-1 pt-3 border-t border-gray-100 dark:border-gray-700/50">
                           {containerActions[container.id]?.loading ? (
-                            <div className="flex-1 flex items-center justify-center space-x-2 px-1 py-1.5 bg-primary-50 dark:bg-primary-900/20 rounded-lg border border-primary-200 dark:border-primary-800 whitespace-nowrap">
+                            <div className="flex-1 flex items-center justify-center space-x-2 px-1 py-2 bg-primary-50 dark:bg-primary-900/20 rounded-lg border border-primary-200 dark:border-primary-800 whitespace-nowrap">
                               <RefreshCw className="h-4 w-4 animate-spin text-primary-600 dark:text-primary-400" />
                               <span className="text-xs font-medium text-primary-600 dark:text-primary-400">
                                 {containerActions[container.id].action === 'start' && '启动中'}
@@ -1312,7 +1306,7 @@ export function Containers() {
                                 <>
                                   <button
                                     onClick={(e) => { e.stopPropagation(); handleContainerAction(container.id, 'stop') }}
-                                    className="flex-1 flex items-center justify-center gap-1 px-1 py-1.5 text-red-600 dark:text-red-400 bg-white dark:bg-gray-800 hover:bg-red-50 dark:hover:bg-red-900/20 border border-gray-200 dark:border-gray-700 hover:border-red-200 dark:hover:border-red-800 rounded-lg transition-all duration-200 shadow-sm hover:shadow active:scale-95 text-xs font-medium whitespace-nowrap"
+                                    className="flex-1 flex items-center justify-center gap-1 px-1 py-2 text-red-600 dark:text-red-400 bg-white dark:bg-gray-800 hover:bg-red-50 dark:hover:bg-red-900/20 border border-gray-200 dark:border-gray-700 hover:border-red-200 dark:hover:border-red-800 rounded-lg transition-all duration-200 shadow-sm hover:shadow active:scale-95 text-xs font-medium whitespace-nowrap"
                                     title="停止"
                                   >
                                     <Square className="h-4 w-4" />
@@ -1320,7 +1314,7 @@ export function Containers() {
                                   </button>
                                   <button
                                     onClick={(e) => { e.stopPropagation(); handleContainerAction(container.id, 'restart') }}
-                                    className="flex-1 flex items-center justify-center gap-1 px-1 py-1.5 text-blue-600 dark:text-blue-400 bg-white dark:bg-gray-800 hover:bg-blue-50 dark:hover:bg-blue-900/20 border border-gray-200 dark:border-gray-700 hover:border-blue-200 dark:hover:border-blue-800 rounded-lg transition-all duration-200 shadow-sm hover:shadow active:scale-95 text-xs font-medium whitespace-nowrap"
+                                    className="flex-1 flex items-center justify-center gap-1 px-1 py-2 text-blue-600 dark:text-blue-400 bg-white dark:bg-gray-800 hover:bg-blue-50 dark:hover:bg-blue-900/20 border border-gray-200 dark:border-gray-700 hover:border-blue-200 dark:hover:border-blue-800 rounded-lg transition-all duration-200 shadow-sm hover:shadow active:scale-95 text-xs font-medium whitespace-nowrap"
                                     title="重启"
                                   >
                                     <RotateCcw className="h-4 w-4" />
@@ -1330,7 +1324,7 @@ export function Containers() {
                               ) : (
                                 <button
                                   onClick={(e) => { e.stopPropagation(); handleContainerAction(container.id, 'start') }}
-                                  className="flex-1 flex items-center justify-center gap-1 px-1 py-1.5 text-green-600 dark:text-green-400 bg-white dark:bg-gray-800 hover:bg-green-50 dark:hover:bg-green-900/20 border border-gray-200 dark:border-gray-700 hover:border-green-200 dark:hover:border-green-800 rounded-lg transition-all duration-200 shadow-sm hover:shadow active:scale-95 text-xs font-medium whitespace-nowrap"
+                                  className="flex-1 flex items-center justify-center gap-1 px-1 py-2 text-green-600 dark:text-green-400 bg-white dark:bg-gray-800 hover:bg-green-50 dark:hover:bg-green-900/20 border border-gray-200 dark:border-gray-700 hover:border-green-200 dark:hover:border-green-800 rounded-lg transition-all duration-200 shadow-sm hover:shadow active:scale-95 text-xs font-medium whitespace-nowrap"
                                   title="启动"
                                 >
                                   <Play className="h-4 w-4" />
@@ -1341,7 +1335,7 @@ export function Containers() {
                               <button
                                 onClick={(e) => { e.stopPropagation(); handleUpdateContainer(container.id) }}
                                 className={cn(
-                                  "flex-1 flex items-center justify-center gap-1 px-1 py-1.5 bg-white dark:bg-gray-800 border rounded-lg transition-all duration-200 shadow-sm hover:shadow active:scale-95 text-xs font-medium whitespace-nowrap",
+                                  "flex-1 flex items-center justify-center gap-1 px-1 py-2 bg-white dark:bg-gray-800 border rounded-lg transition-all duration-200 shadow-sm hover:shadow active:scale-95 text-xs font-medium whitespace-nowrap",
                                   container.haveUpdate
                                     ? "text-yellow-600 dark:text-yellow-400 border-yellow-400 dark:border-yellow-600 hover:bg-yellow-50 dark:hover:bg-yellow-900/20"
                                     : "text-purple-600 dark:text-purple-400 border-gray-200 dark:border-gray-700 hover:bg-purple-50 dark:hover:bg-purple-900/20 hover:border-purple-200 dark:hover:border-purple-800"

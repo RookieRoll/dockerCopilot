@@ -2,8 +2,8 @@ package svc
 
 import (
 	"github.com/docker/docker/client"
-	"github.com/onlyLTY/dockerCopilot/internal/config"
-	"github.com/onlyLTY/dockerCopilot/internal/module"
+	"github.com/RookieRoll/dockerCopilot/internal/config"
+	"github.com/RookieRoll/dockerCopilot/internal/module"
 	"github.com/zeromicro/go-zero/core/logx"
 	"github.com/zeromicro/go-zero/rest"
 	"sync"

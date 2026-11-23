@@ -7,7 +7,7 @@ import (
 
 	dockerTypes "github.com/docker/docker/api/types"
 	"github.com/docker/go-connections/nat"
-	"github.com/onlyLTY/dockerCopilot/internal/types"
+	"github.com/RookieRoll/dockerCopilot/internal/types"
 )
 
 func TestMapContainerPorts(t *testing.T) {

@@ -36,7 +36,7 @@ function shouldUpdate(currentVersion, latestVersion) {
 function parseVersion(version) {
   if (!version || typeof version !== 'string') return null
   
-  const match = version.match(/^(\d+)\.(\d+)\.(\d+)(?:-.+)?$/)
+  const match = version.match(/^v?(\d+)\.(\d+)\.(\d+)(?:-.+)?$/)
   if (!match) return null
   
   return {

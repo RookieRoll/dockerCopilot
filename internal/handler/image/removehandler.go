@@ -3,9 +3,9 @@ package image
 import (
 	"net/http"
 
-	"github.com/onlyLTY/dockerCopilot/internal/logic/image"
-	"github.com/onlyLTY/dockerCopilot/internal/svc"
-	"github.com/onlyLTY/dockerCopilot/internal/types"
+	"github.com/RookieRoll/dockerCopilot/internal/logic/image"
+	"github.com/RookieRoll/dockerCopilot/internal/svc"
+	"github.com/RookieRoll/dockerCopilot/internal/types"
 	"github.com/zeromicro/go-zero/rest/httpx"
 )
 

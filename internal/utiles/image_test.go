@@ -4,7 +4,7 @@ import (
 	"testing"
 
 	"github.com/docker/docker/api/types/image"
-	MyType "github.com/onlyLTY/dockerCopilot/internal/types"
+	MyType "github.com/RookieRoll/dockerCopilot/internal/types"
 )
 
 func TestSplitImageNameAndTag(t *testing.T) {

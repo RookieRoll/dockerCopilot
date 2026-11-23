@@ -71,7 +71,7 @@ jobs:
 
       - name: Build for ${{ matrix.arch }}
         run: |
-          CGO_ENABLED=0 GOOS=linux GOARCH=${{ matrix.arch }} go build -a --trimpath -ldflags="-w -s -X 'github.com/onlyLTY/dockerCopilot/internal/config.Version=${{ env.version }}' -X 'github.com/onlyLTY/dockerCopilot/internal/config.BuildDate=$(date)'" -o dist/linux/${{ matrix.arch }}/dockerCopilot .
+          CGO_ENABLED=0 GOOS=linux GOARCH=${{ matrix.arch }} go build -a --trimpath -ldflags="-w -s -X 'github.com/RookieRoll/dockerCopilot/internal/config.Version=${{ env.version }}' -X 'github.com/RookieRoll/dockerCopilot/internal/config.BuildDate=$(date)'" -o dist/linux/${{ matrix.arch }}/dockerCopilot .
 
       - name: Prepare Files
         run: |

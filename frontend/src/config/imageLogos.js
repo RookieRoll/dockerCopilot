@@ -38,7 +38,6 @@ export const builtInImageLogos = {
   "xylplm/media-saber": MediaSaberLogo,
   "xylplm/bm-simulate-xunlei-api-to-media-saber": MediaSaberLogo,
   "jxxghp/moviepilot-v2": MoviepilotLogo,
-  "0nlylty/dockercopilot": DockerCopilotLogo,
   "2807645688/dockercopilot": DockerCopilotLogo,
   "mtphotos/mt-photos": MTPhotos,
   "kqstone/mt-photos-insightface-unofficial": MTPhotos,

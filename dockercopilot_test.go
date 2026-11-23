@@ -18,10 +18,10 @@ import (
 	"time"
 
 	dockerClient "github.com/docker/docker/client"
-	"github.com/onlyLTY/dockerCopilot/internal/config"
-	apphandler "github.com/onlyLTY/dockerCopilot/internal/handler"
-	"github.com/onlyLTY/dockerCopilot/internal/module"
-	"github.com/onlyLTY/dockerCopilot/internal/svc"
+	"github.com/RookieRoll/dockerCopilot/internal/config"
+	apphandler "github.com/RookieRoll/dockerCopilot/internal/handler"
+	"github.com/RookieRoll/dockerCopilot/internal/module"
+	"github.com/RookieRoll/dockerCopilot/internal/svc"
 	"github.com/zeromicro/go-zero/rest"
 )
 

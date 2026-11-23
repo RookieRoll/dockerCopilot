@@ -6,8 +6,8 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/onlyLTY/dockerCopilot/internal/svc"
-	"github.com/onlyLTY/dockerCopilot/internal/types"
+	"github.com/RookieRoll/dockerCopilot/internal/svc"
+	"github.com/RookieRoll/dockerCopilot/internal/types"
 )
 
 func TestDelRestoreRejectsTraversalFilename(t *testing.T) {

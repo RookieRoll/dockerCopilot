@@ -10,7 +10,7 @@ import (
 	dockerImage "github.com/docker/docker/api/types/image"
 	"github.com/google/go-containerregistry/pkg/name"
 	"github.com/google/go-containerregistry/pkg/v1/empty"
-	"github.com/onlyLTY/dockerCopilot/internal/types"
+	"github.com/RookieRoll/dockerCopilot/internal/types"
 )
 
 func TestProxyCheckUsesPersistedDigestForLoadedImage(t *testing.T) {

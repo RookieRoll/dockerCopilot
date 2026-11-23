@@ -3,8 +3,8 @@ package handler
 import (
 	"encoding/json"
 	"errors"
-	"github.com/onlyLTY/dockerCopilot/internal/module"
-	"github.com/onlyLTY/dockerCopilot/internal/svc"
+	"github.com/RookieRoll/dockerCopilot/internal/module"
+	"github.com/RookieRoll/dockerCopilot/internal/svc"
 	"net/http"
 	"net/url"
 )

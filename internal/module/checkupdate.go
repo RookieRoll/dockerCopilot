@@ -5,8 +5,8 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"github.com/RookieRoll/dockerCopilot/internal/types"
 	ref "github.com/distribution/reference"
-	"github.com/onlyLTY/dockerCopilot/internal/types"
 	"github.com/zeromicro/go-zero/core/logx"
 	"io"
 	"net"
@@ -42,8 +42,8 @@ func NewImageCheck() *ImageUpdateData {
 	}
 }
 func isDockerCopilotImage(imageName string) bool {
-	return strings.Contains(imageName, "0nlylty/dockercopilot") ||
-		strings.Contains(imageName, "2807645688/dockercopilot")
+	named, err := ref.ParseNormalizedNamed(imageName)
+	return err == nil && named.Name() == "docker.io/2807645688/dockercopilot"
 }
 func (i *ImageUpdateData) CheckUpdate(imageList []types.Image) {
 	for _, image := range imageList {

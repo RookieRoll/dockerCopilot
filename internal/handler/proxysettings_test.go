@@ -6,8 +6,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/onlyLTY/dockerCopilot/internal/module"
-	"github.com/onlyLTY/dockerCopilot/internal/svc"
+	"github.com/RookieRoll/dockerCopilot/internal/module"
+	"github.com/RookieRoll/dockerCopilot/internal/svc"
 )
 
 func TestProxySettingsPersistAndHideCredentials(t *testing.T) {

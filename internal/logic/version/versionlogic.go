@@ -3,11 +3,11 @@ package version
 import (
 	"context"
 
-	"github.com/onlyLTY/dockerCopilot/internal/config"
+	"github.com/RookieRoll/dockerCopilot/internal/config"
 
-	"github.com/onlyLTY/dockerCopilot/internal/svc"
-	"github.com/onlyLTY/dockerCopilot/internal/types"
-	"github.com/onlyLTY/dockerCopilot/internal/utiles"
+	"github.com/RookieRoll/dockerCopilot/internal/svc"
+	"github.com/RookieRoll/dockerCopilot/internal/types"
+	"github.com/RookieRoll/dockerCopilot/internal/utiles"
 	"github.com/zeromicro/go-zero/core/logx"
 )
 

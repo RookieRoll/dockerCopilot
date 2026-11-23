@@ -1,6 +1,6 @@
 FROM alpine
 
-LABEL authors="onlyLTY" \
+LABEL org.opencontainers.image.source="https://github.com/RookieRoll/dockerCopilot" \
       org.opencontainers.image.title="Docker Copilot" \
       org.opencontainers.image.ref.name="2807645688/dockercopilot"
 

@@ -1,6 +1,7 @@
 package utiles
 
 import (
+	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -8,16 +9,23 @@ import (
 	"sync"
 	"time"
 
-	"github.com/onlyLTY/dockerCopilot/internal/config"
+	"github.com/RookieRoll/dockerCopilot/internal/config"
 	"github.com/zeromicro/go-zero/core/logx"
 )
 
-func GetRemoteVersion() (remoteVersion string, err error) {
-	githubProxy := os.Getenv("githubProxy")
-	if githubProxy != "" {
-		githubProxy = strings.TrimRight(githubProxy, "/") + "/"
+const updateRepository = "RookieRoll/dockerCopilot"
+const programVersionURL = "https://raw.githubusercontent.com/" + updateRepository + "/latest/version"
+const programReleaseURL = "https://github.com/" + updateRepository + "/releases/download"
+
+func githubUpdateURL(target string) string {
+	if proxy := strings.TrimRight(os.Getenv("githubProxy"), "/"); proxy != "" {
+		return proxy + "/" + target
 	}
-	versionURL := githubProxy + "https://raw.githubusercontent.com/onlyLTY/dockerCopilot/latest/version"
+	return target
+}
+
+func GetRemoteVersion() (remoteVersion string, err error) {
+	versionURL := githubUpdateURL(programVersionURL)
 	remoteVersion, err = fetchVersionFromURL(versionURL)
 	if err != nil {
 		return "0.0.0", err
@@ -32,7 +40,7 @@ func GetRemoteVersion() (remoteVersion string, err error) {
 		logx.Info("版本一致:", localVersion)
 		return remoteVersion, nil
 	} else {
-		logx.Infof("版本不一致! 本地: %s, 远程: %s\n", localVersion, remoteVersion)
+		logx.Infof("版本不一致! 仓库: %s, 本地: %s, 远程: %s", updateRepository, localVersion, remoteVersion)
 		return remoteVersion, nil
 	}
 
@@ -70,6 +78,9 @@ func fetchVersionFromURL(url string) (string, error) {
 		}
 	}(resp.Body)
 
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("读取 %s 版本失败: %s", updateRepository, resp.Status)
+	}
 	versionData, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return "", err
