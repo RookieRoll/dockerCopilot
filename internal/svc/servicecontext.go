@@ -1,9 +1,9 @@
 package svc
 
 import (
-	"github.com/docker/docker/client"
 	"github.com/RookieRoll/dockerCopilot/internal/config"
 	"github.com/RookieRoll/dockerCopilot/internal/module"
+	"github.com/docker/docker/client"
 	"github.com/zeromicro/go-zero/core/logx"
 	"github.com/zeromicro/go-zero/rest"
 	"sync"
@@ -40,7 +40,7 @@ func NewServiceContext(c config.Config) *ServiceContext {
 		logx.Errorf("Unable to create docker client: %s", err)
 	}
 	checks := module.NewImageCheck()
-	if err := checks.InitSettings("/data/config/proxy-image-updates", c.ProxyImageUpdates); err != nil {
+	if err := checks.InitSettings("/data/config/proxy-image-updates"); err != nil {
 		logx.Errorf("读取代理设置失败: %v", err)
 	}
 	return &ServiceContext{

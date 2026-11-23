@@ -70,8 +70,8 @@ go test ./...
 ```
 
 
-## 容器镜像代理更新
+## 镜像更新检查代理
 
-打开导航栏的「设置」，分别填写代理地址和选择镜像下载方式。检查更新和 Go 下载使用服务端代理地址，留空则直连。选择 Docker 引擎时，拉取使用 NAS 引擎的网络配置。保存后对后续任务生效。设置保存在持久卷的 `/data/config/proxy-image-updates/settings.json` 中。首次部署且尚未通过界面保存时，沿用 YAML 的 `ProxyImageUpdates`（默认关闭）和环境变量 `HTTPS_PROXY`。
+在「设置」中填写代理地址，保存后对后续镜像更新检查生效。留空时直连镜像仓库。设置保存在 `/data/config/proxy-image-updates/settings.json`，首次配置前默认读取环境变量 `HTTPS_PROXY`。
 
-代理模式按目标摘要及原容器的平台下载，将临时镜像包导入 Docker，通过镜像 ID 校验后再替换容器。请为临时目录（可用 `TMPDIR` 指定）和 Docker 镜像库预留空间。临时包在导入结束或失败后释放。请持久化 `/data`，其中 `/data/config/proxy-image-updates` 保存导入镜像的摘要记录。
+更新容器时，Docker 引擎使用自身的网络配置拉取镜像。

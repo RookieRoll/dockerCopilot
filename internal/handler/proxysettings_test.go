@@ -14,7 +14,7 @@ func TestProxySettingsPersistAndHideCredentials(t *testing.T) {
 	dir := t.TempDir()
 	checks := module.NewImageCheck()
 	t.Setenv("HTTPS_PROXY", "")
-	if err := checks.InitSettings(dir, false); err != nil {
+	if err := checks.InitSettings(dir); err != nil {
 		t.Fatal(err)
 	}
 	h := proxySettingsHandler(&svc.ServiceContext{HubImageInfo: checks})
@@ -26,20 +26,20 @@ func TestProxySettingsPersistAndHideCredentials(t *testing.T) {
 		}
 		return w.Code
 	}
-	if send(`{"enabled":true,"address":"bad"}`) != 400 || checks.Settings().Enabled {
+	if send(`{"address":"bad"}`) != 400 || checks.Settings().Address != "" {
 		t.Fatal("invalid settings accepted")
 	}
-	if send(`{"enabled":true,"address":"http://user:password@proxy:3128"}`) != 200 {
+	if send(`{"address":"http://user:password@proxy:3128"}`) != 200 {
 		t.Fatal("save failed")
 	}
-	if send(`{"enabled":false}`) != 200 {
-		t.Fatal("disable failed")
+	if send(`{}`) != 200 {
+		t.Fatal("saving unchanged address failed")
 	}
 	fresh := module.NewImageCheck()
-	if err := fresh.InitSettings(dir, true); err != nil {
+	if err := fresh.InitSettings(dir); err != nil {
 		t.Fatal(err)
 	}
-	if got := fresh.Settings(); got.Enabled || got.Address != "http://user:password@proxy:3128" {
+	if got := fresh.Settings(); got.Address != "http://user:password@proxy:3128" {
 		t.Fatal("settings did not survive restart")
 	}
 }

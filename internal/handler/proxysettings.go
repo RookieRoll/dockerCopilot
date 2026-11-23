@@ -14,14 +14,13 @@ func proxySettingsHandler(s *svc.ServiceContext) http.HandlerFunc {
 		w.Header().Set("Cache-Control", "no-store")
 		if r.Method == http.MethodPut {
 			var req struct {
-				Enabled *bool   `json:"enabled"`
 				Address *string `json:"address"`
 			}
-			if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8192)).Decode(&req); err != nil || req.Enabled == nil {
+			if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8192)).Decode(&req); err != nil {
 				http.Error(w, "设置格式错误", 400)
 				return
 			}
-			if err := s.HubImageInfo.SaveSettings(*req.Enabled, req.Address); err != nil {
+			if err := s.HubImageInfo.SaveSettings(req.Address); err != nil {
 				if errors.Is(err, module.ErrProxyAddress) {
 					http.Error(w, err.Error(), 400)
 				} else {
@@ -36,6 +35,6 @@ func proxySettingsHandler(s *svc.ServiceContext) http.HandlerFunc {
 			endpoint = u.Scheme + "://" + u.Host
 		}
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]any{"enabled": cfg.Enabled, "endpoint": endpoint})
+		json.NewEncoder(w).Encode(map[string]any{"endpoint": endpoint})
 	}
 }

@@ -99,11 +99,9 @@ type VersionMsgResp {
 }
 
 type ProxySettingsReq {
-    Enabled bool `json:"enabled"`
     Address *string `json:"address,optional"`
 }
 type ProxySettingsView {
-    Enabled bool `json:"enabled"`
     Endpoint string `json:"endpoint"`
 }
 

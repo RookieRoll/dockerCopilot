@@ -21,8 +21,6 @@ import (
 // ImageCheckList 检查更新处理后的镜像列表
 type ImageCheckList struct {
 	NeedUpdate bool
-	Reference  string
-	Digest     string
 }
 type ImageUpdateData struct {
 	ProxyStateDir string

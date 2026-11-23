@@ -9,13 +9,12 @@ import (
 )
 
 type ProxySettings struct {
-	Enabled bool   `json:"enabled"`
 	Address string `json:"address"`
 }
 
-func (i *ImageUpdateData) InitSettings(dir string, enabled bool) error {
+func (i *ImageUpdateData) InitSettings(dir string) error {
 	i.ProxyStateDir = dir
-	i.settings = ProxySettings{Enabled: enabled, Address: EnvProxy()}
+	i.settings = ProxySettings{Address: EnvProxy()}
 	data, err := os.ReadFile(filepath.Join(dir, "settings.json"))
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
@@ -38,15 +37,14 @@ func (i *ImageUpdateData) Settings() ProxySettings {
 
 var ErrProxyAddress = errors.New("请输入有效的 HTTP、HTTPS 或 SOCKS5 代理地址")
 
-func (i *ImageUpdateData) SaveSettings(enabled bool, address *string) error {
+func (i *ImageUpdateData) SaveSettings(address *string) error {
 	i.mu.Lock()
 	defer i.mu.Unlock()
 	next := i.settings
-	next.Enabled = enabled
 	if address != nil {
 		next.Address = *address
 	}
-	if enabled || (address != nil && next.Address != "") {
+	if address != nil && next.Address != "" {
 		if _, err := ProxyOptions(context.Background(), next.Address); err != nil {
 			return ErrProxyAddress
 		}

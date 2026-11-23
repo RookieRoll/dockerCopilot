@@ -7,4 +7,3 @@ Log:
 Auth:
   AccessSecret: ${secretKey}
   AccessExpire: 7257600
-ProxyImageUpdates: false

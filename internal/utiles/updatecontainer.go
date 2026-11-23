@@ -4,11 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/RookieRoll/dockerCopilot/internal/svc"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/api/types/network"
 	dockerMsgType "github.com/docker/docker/pkg/jsonmessage"
-	"github.com/RookieRoll/dockerCopilot/internal/svc"
 	"github.com/zeromicro/go-zero/core/logx"
 	"io"
 	"time"
@@ -43,20 +43,11 @@ func UpdateContainer(serviceContext *svc.ServiceContext, id string, name string,
 	oldTaskProgress.DetailMsg = "正在拉取新镜像"
 	serviceContext.UpdateProgress(taskID, oldTaskProgress)
 	serviceContext.DockerClient.NegotiateAPIVersion(ctx)
-	var expectedID string
-	var err error
-	if settings := serviceContext.HubImageInfo.Settings(); settings.Enabled {
-		proxyUpdateLock.Lock()
-		defer proxyUpdateLock.Unlock()
-		expectedID, err = loadProxyImage(ctx, serviceContext, id, imageNameAndTag, taskID, settings.Address)
-	} else {
-		var reader io.ReadCloser
-		reader, err = serviceContext.DockerClient.ImagePull(ctx, imageNameAndTag, image.PullOptions{})
-		if err == nil {
-			err = decodePullResp(reader, serviceContext, taskID)
-			if closeErr := reader.Close(); closeErr != nil {
-				logx.Error(closeErr)
-			}
+	reader, err := serviceContext.DockerClient.ImagePull(ctx, imageNameAndTag, image.PullOptions{})
+	if err == nil {
+		err = decodePullResp(reader, serviceContext, taskID)
+		if closeErr := reader.Close(); closeErr != nil {
+			logx.Error(closeErr)
 		}
 	}
 	if err != nil {
@@ -163,19 +154,6 @@ func UpdateContainer(serviceContext *svc.ServiceContext, id string, name string,
 		oldTaskProgress.IsDone = true
 		serviceContext.UpdateProgress(taskID, oldTaskProgress)
 		return err
-	}
-	if expectedID != "" {
-		current, checkErr := serviceContext.DockerClient.ContainerInspect(ctx, containerName)
-		if checkErr == nil && current.Image != expectedID {
-			checkErr = fmt.Errorf("新容器镜像与目标不符: %s", current.Image)
-		}
-		if checkErr != nil {
-			oldTaskProgress.Message = "校验新容器失败"
-			oldTaskProgress.DetailMsg = checkErr.Error()
-			oldTaskProgress.IsDone = true
-			serviceContext.UpdateProgress(taskID, oldTaskProgress)
-			return checkErr
-		}
 	}
 	if delOldContainer {
 		err = serviceContext.DockerClient.ContainerRemove(context.Background(), id, container.RemoveOptions{})

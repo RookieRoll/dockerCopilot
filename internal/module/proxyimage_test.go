@@ -7,13 +7,12 @@ import (
 	"strings"
 	"testing"
 
-	dockerImage "github.com/docker/docker/api/types/image"
-	"github.com/google/go-containerregistry/pkg/name"
-	"github.com/google/go-containerregistry/pkg/v1/empty"
 	"github.com/RookieRoll/dockerCopilot/internal/types"
+	dockerImage "github.com/docker/docker/api/types/image"
+	"github.com/google/go-containerregistry/pkg/v1/empty"
 )
 
-func TestProxyCheckUsesPersistedDigestForLoadedImage(t *testing.T) {
+func TestProxyCheckComparesRegistryDigest(t *testing.T) {
 	manifest, err := empty.Image.RawManifest()
 	if err != nil {
 		t.Fatal(err)
@@ -35,28 +34,21 @@ func TestProxyCheckUsesPersistedDigestForLoadedImage(t *testing.T) {
 	defer proxy.Close()
 	t.Setenv("HTTPS_PROXY", proxy.URL)
 	img := types.Image{Summary: dockerImage.Summary{ID: "loaded"}, ImageName: "localhost:54321/example/app", ImageTag: "latest"}
-	tag, err := name.NewTag(img.ImageName + ":latest")
-	if err != nil {
-		t.Fatal(err)
-	}
-	dir := t.TempDir()
-	before := NewImageCheck()
-	before.ProxyStateDir = dir
-	if err = before.Remember(tag, img.ID, digest.String()); err != nil {
-		t.Fatal(err)
-	}
+	img.RepoDigests = []string{img.ImageName + "@" + digest.String()}
 	after := NewImageCheck()
-	after.InitSettings(dir, false)
+	if err := after.InitSettings(t.TempDir()); err != nil {
+		t.Fatal(err)
+	}
 	after.CheckUpdate([]types.Image{img})
 	result, ok := after.Get(img.ID)
-	if !ok || result.NeedUpdate || result.Digest != digest.String() || result.Reference != tag.Name() {
-		t.Fatalf("unexpected check after restart: %+v", result)
+	if !ok || result.NeedUpdate {
+		t.Fatalf("unexpected digest check: %+v", result)
 	}
-	img.ID = "manually-replaced"
+	img.RepoDigests = nil
 	after.CheckUpdate([]types.Image{img})
 	result, ok = after.Get(img.ID)
 	if !ok || !result.NeedUpdate {
-		t.Fatal("record for previous image was reused")
+		t.Fatal("missing local digest should indicate an update")
 	}
 }
 
